@@ -4,6 +4,7 @@ mod settings;
 mod store;
 mod ui;
 
+use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
@@ -114,17 +115,21 @@ fn cmd_rm(name: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+pub struct ProjectSession {
+    pub claude: Option<PtyPane>,
+    pub shell: Option<PtyPane>,
+}
+
 pub struct App {
     pub store: ProjectStore,
     pub settings: Settings,
     pub sidebar: ui::projects::ProjectSidebar,
     pub focus: Focus,
-    pub claude: Option<PtyPane>,
-    pub shell: Option<PtyPane>,
-    pub active_index: Option<usize>,
+    pub sessions: HashMap<String, ProjectSession>,
+    pub active_project_name: Option<String>,
     pub modal: Option<ModalState>,
     pub should_quit: bool,
-    pub last_size: (u16, u16),
     pub error: Option<String>,
     pub last_click: Option<(Instant, usize)>,
 }
@@ -138,54 +143,101 @@ impl App {
             settings,
             sidebar,
             focus: Focus::Projects,
-            claude: None,
-            shell: None,
-            active_index: None,
+            sessions: HashMap::new(),
+            active_project_name: None,
             modal: None,
             should_quit: false,
-            last_size: (0, 0),
             error: None,
             last_click: None,
         }
     }
 
     pub fn active_project(&self) -> Option<&Project> {
-        self.active_index.and_then(|i| self.store.projects.get(i))
+        let name = self.active_project_name.as_ref()?;
+        self.store.projects.iter().find(|p| &p.name == name)
     }
 
-    fn open_selected(&mut self, claude_size: (u16, u16), shell_size: (u16, u16)) {
+    pub fn active_session(&self) -> Option<&ProjectSession> {
+        let name = self.active_project_name.as_ref()?;
+        self.sessions.get(name)
+    }
+
+    pub fn active_session_mut(&mut self) -> Option<&mut ProjectSession> {
+        let name = self.active_project_name.as_ref()?.clone();
+        self.sessions.get_mut(&name)
+    }
+
+    pub fn active_claude(&self) -> Option<&PtyPane> {
+        self.active_session().and_then(|s| s.claude.as_ref())
+    }
+
+    pub fn active_shell(&self) -> Option<&PtyPane> {
+        self.active_session().and_then(|s| s.shell.as_ref())
+    }
+
+    fn open_selected(&mut self, body: Rect) {
         let Some(idx) = self.sidebar.selected_store_index() else {
             return;
         };
         let project = self.store.projects[idx].clone();
-        self.active_index = Some(idx);
+        self.active_project_name = Some(project.name.clone());
         self.sidebar.active = Some(project.name.clone());
         self.error = None;
 
-        match PtyPane::spawn(
-            &self.settings.claude_command,
-            &project.path,
-            claude_size.1,
-            claude_size.0,
-        ) {
-            Ok(p) => self.claude = Some(p),
-            Err(e) => {
-                self.claude = None;
-                self.error = Some(format!("claude spawn failed: {e}"));
-            }
+        let (claude_inner, shell_inner) = pane_inner_sizes(body);
+
+        let session = self
+            .sessions
+            .entry(project.name.clone())
+            .or_default();
+
+        // Spawn claude if missing or its child has died.
+        let claude_dead = session
+            .claude
+            .as_mut()
+            .is_some_and(|p| p.child_finished());
+        if session.claude.is_none() || claude_dead {
+            session.claude = match PtyPane::spawn(
+                &self.settings.claude_command,
+                &project.path,
+                claude_inner.height,
+                claude_inner.width,
+            ) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    push_error(&mut self.error, format!("claude spawn failed: {e}"));
+                    None
+                }
+            };
         }
 
-        let shell_cmd = self.settings.shell();
-        match PtyPane::spawn(&shell_cmd, &project.path, shell_size.1, shell_size.0) {
-            Ok(p) => self.shell = Some(p),
-            Err(e) => {
-                self.shell = None;
-                let msg = format!("shell spawn failed: {e}");
-                self.error = Some(match self.error.take() {
-                    Some(prev) => format!("{prev}; {msg}"),
-                    None => msg,
-                });
-            }
+        // Spawn shell if missing or dead.
+        let shell_dead = session
+            .shell
+            .as_mut()
+            .is_some_and(|p| p.child_finished());
+        if session.shell.is_none() || shell_dead {
+            let cmd = self.settings.shell();
+            session.shell = match PtyPane::spawn(
+                &cmd,
+                &project.path,
+                shell_inner.height,
+                shell_inner.width,
+            ) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    push_error(&mut self.error, format!("shell spawn failed: {e}"));
+                    None
+                }
+            };
+        }
+
+        // Resize live panes to current geometry (covers terminal resize while inactive).
+        if let Some(p) = session.claude.as_mut() {
+            let _ = p.resize(claude_inner.height, claude_inner.width);
+        }
+        if let Some(p) = session.shell.as_mut() {
+            let _ = p.resize(shell_inner.height, shell_inner.width);
         }
 
         self.focus = Focus::Claude;
@@ -194,16 +246,27 @@ impl App {
     fn reload_store(&mut self) -> Result<()> {
         self.store = store::load()?;
         self.sidebar.refresh(&self.store);
-        if let Some(idx) = self.active_index
-            && self.store.projects.get(idx).is_none()
+
+        // Drop sessions whose project is no longer in the store.
+        let known: std::collections::HashSet<&str> =
+            self.store.projects.iter().map(|p| p.name.as_str()).collect();
+        self.sessions.retain(|name, _| known.contains(name.as_str()));
+
+        if let Some(name) = &self.active_project_name
+            && !known.contains(name.as_str())
         {
-            self.active_index = None;
+            self.active_project_name = None;
             self.sidebar.active = None;
-            self.claude = None;
-            self.shell = None;
         }
         Ok(())
     }
+}
+
+fn push_error(slot: &mut Option<String>, msg: String) {
+    *slot = Some(match slot.take() {
+        Some(prev) => format!("{prev}; {msg}"),
+        None => msg,
+    });
 }
 
 fn run_tui() -> Result<()> {
@@ -273,22 +336,19 @@ fn event_loop(
     while !app.should_quit {
         terminal.draw(|frame| ui::draw(frame, app))?;
 
-        // Resize embedded panes to match the current layout.
-        let area = terminal.size().context("terminal size")?;
-        let body_area = Rect {
-            x: 0,
-            y: 0,
-            width: area.width,
-            height: area.height.saturating_sub(1),
-        };
-        let (claude_inner, shell_inner) = pane_inner_sizes(body_area);
-        if let Some(p) = app.claude.as_mut() {
-            let _ = p.resize(claude_inner.height, claude_inner.width);
+        let area: Rect = terminal.size().context("terminal size")?.into();
+        let body = body_rect(area);
+        let (claude_inner, shell_inner) = pane_inner_sizes(body);
+
+        // Resize only the active session's panes; inactive sessions keep their grids.
+        if let Some(session) = app.active_session_mut() {
+            if let Some(p) = session.claude.as_mut() {
+                let _ = p.resize(claude_inner.height, claude_inner.width);
+            }
+            if let Some(p) = session.shell.as_mut() {
+                let _ = p.resize(shell_inner.height, shell_inner.width);
+            }
         }
-        if let Some(p) = app.shell.as_mut() {
-            let _ = p.resize(shell_inner.height, shell_inner.width);
-        }
-        app.last_size = (claude_inner.width, claude_inner.height);
 
         // Drain external file watcher events.
         let mut reload = false;
@@ -301,8 +361,10 @@ fn event_loop(
 
         if event::poll(Duration::from_millis(33))? {
             match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(app, key)?,
-                Event::Mouse(m) => handle_mouse(app, m, area.into()),
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    handle_key(app, key, body)?
+                }
+                Event::Mouse(m) => handle_mouse(app, m, area),
                 Event::Resize(_, _) => {
                     // Next loop iteration re-resizes.
                 }
@@ -310,15 +372,18 @@ fn event_loop(
             }
         }
 
-        if let Some(p) = app.claude.as_mut()
-            && p.child_finished()
-        {
-            app.claude = None;
-        }
-        if let Some(p) = app.shell.as_mut()
-            && p.child_finished()
-        {
-            app.shell = None;
+        // Reap dead children on the active session so the placeholder shows.
+        if let Some(session) = app.active_session_mut() {
+            if let Some(p) = session.claude.as_mut()
+                && p.child_finished()
+            {
+                session.claude = None;
+            }
+            if let Some(p) = session.shell.as_mut()
+                && p.child_finished()
+            {
+                session.shell = None;
+            }
         }
     }
     Ok(())
@@ -360,9 +425,9 @@ fn inset(r: Rect) -> Rect {
     }
 }
 
-fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
+fn handle_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
     if app.modal.is_some() {
-        return handle_modal_key(app, key);
+        return handle_modal_key(app, key, body);
     }
 
     // Global keys (work from any pane, including inside a PTY).
@@ -393,9 +458,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     }
 
     match app.focus {
-        Focus::Projects => handle_projects_key(app, key),
+        Focus::Projects => handle_projects_key(app, key, body),
         Focus::Claude => {
-            if let Some(pane) = app.claude.as_mut() {
+            if let Some(session) = app.active_session_mut()
+                && let Some(pane) = session.claude.as_mut()
+            {
                 let bytes = pane::key_to_bytes(key);
                 if !bytes.is_empty() {
                     let _ = pane.write(&bytes);
@@ -404,7 +471,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             Ok(())
         }
         Focus::Shell => {
-            if let Some(pane) = app.shell.as_mut() {
+            if let Some(session) = app.active_session_mut()
+                && let Some(pane) = session.shell.as_mut()
+            {
                 let bytes = pane::key_to_bytes(key);
                 if !bytes.is_empty() {
                     let _ = pane.write(&bytes);
@@ -415,17 +484,16 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     }
 }
 
-fn handle_projects_key(app: &mut App, key: KeyEvent) -> Result<()> {
+fn handle_projects_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
     if app.sidebar.filter.is_some() {
-        return handle_filter_key(app, key);
+        return handle_filter_key(app, key, body);
     }
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('j') | KeyCode::Down => app.sidebar.select_next(),
         KeyCode::Char('k') | KeyCode::Up => app.sidebar.select_prev(),
         KeyCode::Enter => {
-            let area = current_pane_sizes(app);
-            app.open_selected(area.0, area.1);
+            app.open_selected(body);
         }
         KeyCode::Char('+') => {
             app.modal = Some(ModalState::Add(AddProjectModal::default()));
@@ -451,7 +519,7 @@ fn handle_projects_key(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
-fn handle_filter_key(app: &mut App, key: KeyEvent) -> Result<()> {
+fn handle_filter_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
     let filter = app.sidebar.filter.as_mut().expect("filter active");
     match key.code {
         KeyCode::Esc => {
@@ -459,9 +527,7 @@ fn handle_filter_key(app: &mut App, key: KeyEvent) -> Result<()> {
             app.sidebar.refresh(&app.store);
         }
         KeyCode::Enter => {
-            // Keep filter applied; selection already at top.
-            let area = current_pane_sizes(app);
-            app.open_selected(area.0, area.1);
+            app.open_selected(body);
             app.sidebar.filter = None;
             app.sidebar.refresh(&app.store);
         }
@@ -480,7 +546,7 @@ fn handle_filter_key(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
-fn handle_modal_key(app: &mut App, key: KeyEvent) -> Result<()> {
+fn handle_modal_key(app: &mut App, key: KeyEvent, _body: Rect) -> Result<()> {
     let mut consumed_modal = None;
     match app.modal.as_mut().unwrap() {
         ModalState::Add(m) => match key.code {
@@ -550,11 +616,6 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
-fn current_pane_sizes(_app: &App) -> ((u16, u16), (u16, u16)) {
-    // (cols, rows) defaults; the next draw cycle will resize to actual dims.
-    ((80, 24), (80, 24))
-}
-
 const DOUBLE_CLICK_MS: u128 = 350;
 
 fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
@@ -571,7 +632,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
     let pos_y = m.row;
 
     if rect_contains(sidebar_rect, pos_x, pos_y) {
-        handle_sidebar_click(app, sidebar_rect, pos_y);
+        handle_sidebar_click(app, sidebar_rect, pos_y, body);
         return;
     }
     if rect_contains(claude_rect, pos_x, pos_y) {
@@ -583,15 +644,14 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
     }
 }
 
-fn handle_sidebar_click(app: &mut App, sidebar: Rect, row: u16) {
+fn handle_sidebar_click(app: &mut App, sidebar: Rect, row: u16, body: Rect) {
     app.focus = Focus::Projects;
     let inner_top = sidebar.y + 1;
     let inner_bottom = sidebar.y + sidebar.height.saturating_sub(1);
     if row < inner_top || row >= inner_bottom {
         return;
     }
-    let visible_idx =
-        (row - inner_top) as usize + app.sidebar.state.offset();
+    let visible_idx = (row - inner_top) as usize + app.sidebar.state.offset();
     if visible_idx >= app.sidebar.filtered_indices.len() {
         return;
     }
@@ -605,8 +665,7 @@ fn handle_sidebar_click(app: &mut App, sidebar: Rect, row: u16) {
     app.sidebar.state.select(Some(visible_idx));
     app.last_click = Some((now, visible_idx));
     if is_double {
-        let area = current_pane_sizes(app);
-        app.open_selected(area.0, area.1);
+        app.open_selected(body);
         app.last_click = None;
     }
 }

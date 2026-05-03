@@ -36,12 +36,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.sidebar.focused = app.focus == Focus::Projects;
     app.sidebar.render(sidebar_area, frame.buffer_mut(), &app.store);
 
+    let claude_pane = app.active_claude();
+    let shell_pane = app.active_shell();
+
     draw_terminal_pane(
         frame,
         claude_area,
         " claude ",
         app.focus == Focus::Claude,
-        app.claude.as_ref(),
+        claude_pane,
         "no project selected — press Enter on a project",
     );
     draw_terminal_pane(
@@ -49,7 +52,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         shell_area,
         " shell ",
         app.focus == Focus::Shell,
-        app.shell.as_ref(),
+        shell_pane,
         "no project selected — press Enter on a project",
     );
 
@@ -69,30 +72,24 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     // Position the cursor inside the focused terminal pane.
-    if app.modal.is_none() {
-        match app.focus {
-            Focus::Claude => {
-                if let Some(pane) = &app.claude {
-                    let inner = inner_area(claude_area);
-                    if let Some(pos) =
-                        crate::pane::terminal::cursor_position(pane, inner)
-                    {
-                        frame.set_cursor_position(pos);
-                    }
+    match app.focus {
+        Focus::Claude => {
+            if let Some(pane) = claude_pane {
+                let inner = inner_area(claude_area);
+                if let Some(pos) = crate::pane::terminal::cursor_position(pane, inner) {
+                    frame.set_cursor_position(pos);
                 }
             }
-            Focus::Shell => {
-                if let Some(pane) = &app.shell {
-                    let inner = inner_area(shell_area);
-                    if let Some(pos) =
-                        crate::pane::terminal::cursor_position(pane, inner)
-                    {
-                        frame.set_cursor_position(pos);
-                    }
-                }
-            }
-            _ => {}
         }
+        Focus::Shell => {
+            if let Some(pane) = shell_pane {
+                let inner = inner_area(shell_area);
+                if let Some(pos) = crate::pane::terminal::cursor_position(pane, inner) {
+                    frame.set_cursor_position(pos);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -142,6 +139,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         Focus::Claude => "claude",
         Focus::Shell => "shell",
     };
+    let session_count = app.sessions.len();
     let mut spans = vec![
         Span::styled(
             format!(" {project} "),
@@ -151,6 +149,10 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(
             format!("[{focus}] "),
             Style::default().fg(Color::Yellow),
+        ),
+        Span::styled(
+            format!("({session_count} live) "),
+            Style::default().fg(Color::DarkGray),
         ),
     ];
     if let Some(err) = &app.error {
