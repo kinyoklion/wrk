@@ -64,7 +64,7 @@ impl ProjectSidebar {
                         parsed.score(haystack, &mut matcher).map(|s| (i, s))
                     })
                     .collect();
-                scored.sort_by(|a, b| b.1.cmp(&a.1));
+                scored.sort_by_key(|&(_, score)| std::cmp::Reverse(score));
                 scored.into_iter().map(|(i, _)| i).collect()
             }
         };
