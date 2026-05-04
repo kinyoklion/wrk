@@ -549,7 +549,7 @@ fn handle_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
             if let Some(session) = app.active_session_mut()
                 && let Some(pane) = session.claude.as_mut()
             {
-                let bytes = pane::key_to_bytes(key);
+                let bytes = pane::key_to_bytes(key, pane.app_cursor_mode());
                 if !bytes.is_empty() {
                     let _ = pane.write(&bytes);
                 }
@@ -560,7 +560,7 @@ fn handle_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
             if let Some(session) = app.active_session_mut()
                 && let Some(pane) = session.shell.as_mut()
             {
-                let bytes = pane::key_to_bytes(key);
+                let bytes = pane::key_to_bytes(key, pane.app_cursor_mode());
                 if !bytes.is_empty() {
                     let _ = pane.write(&bytes);
                 }

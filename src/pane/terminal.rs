@@ -4,10 +4,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use alacritty_terminal::Term;
-use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::term::Config;
 use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::{Config, TermMode};
 use anyhow::{Context, Result};
 use portable_pty::PtySize;
 use ratatui::buffer::Buffer;
@@ -36,10 +36,28 @@ impl Dimensions for TermSize {
     }
 }
 
+type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+
+#[derive(Clone)]
+struct PtyEventListener {
+    writer: SharedWriter,
+}
+
+impl EventListener for PtyEventListener {
+    fn send_event(&self, event: Event) {
+        if let Event::PtyWrite(s) = event
+            && let Ok(mut w) = self.writer.lock()
+        {
+            let _ = w.write_all(s.as_bytes());
+            let _ = w.flush();
+        }
+    }
+}
+
 pub struct PtyPane {
-    term: Arc<Mutex<Term<VoidListener>>>,
+    term: Arc<Mutex<Term<PtyEventListener>>>,
     pty: Pty,
-    writer: Box<dyn Write + Send>,
+    writer: SharedWriter,
     reader_thread: Option<JoinHandle<()>>,
     rows: u16,
     cols: u16,
@@ -56,11 +74,17 @@ impl PtyPane {
             cols: cols as usize,
             screen_lines: rows as usize,
         };
-        let term = Term::new(Config::default(), &size, VoidListener);
+
+        let raw_writer = pty.master.take_writer().context("taking pty writer")?;
+        let writer: SharedWriter = Arc::new(Mutex::new(raw_writer));
+
+        let listener = PtyEventListener {
+            writer: Arc::clone(&writer),
+        };
+        let term = Term::new(Config::default(), &size, listener);
         let term = Arc::new(Mutex::new(term));
 
         let mut reader = pty.master.try_clone_reader().context("cloning pty reader")?;
-        let writer = pty.master.take_writer().context("taking pty writer")?;
 
         let term_for_reader = Arc::clone(&term);
         let reader_thread = thread::spawn(move || {
@@ -90,8 +114,12 @@ impl PtyPane {
     }
 
     pub fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        self.writer.write_all(bytes).context("writing to pty")?;
-        self.writer.flush().ok();
+        let mut w = self
+            .writer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("writer mutex poisoned"))?;
+        w.write_all(bytes).context("writing to pty")?;
+        w.flush().ok();
         Ok(())
     }
 
@@ -133,6 +161,16 @@ impl PtyPane {
 
     pub fn child_finished(&mut self) -> bool {
         matches!(self.pty.child.try_wait(), Ok(Some(_)))
+    }
+
+    /// True when the embedded program has switched the terminal into
+    /// "application cursor key" mode (DECCKM). When set, arrow keys and
+    /// Home/End must be sent as `ESC O X` instead of `ESC [ X`.
+    pub fn app_cursor_mode(&self) -> bool {
+        self.term
+            .lock()
+            .map(|t| t.mode().contains(TermMode::APP_CURSOR))
+            .unwrap_or(false)
     }
 }
 

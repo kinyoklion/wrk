@@ -30,10 +30,23 @@ impl Focus {
 /// Encode a crossterm KeyEvent into the byte sequence a PTY child process expects.
 /// Covers the common subset: printable chars, Enter/Tab/Backspace/Esc, arrows,
 /// Home/End/PgUp/PgDn, F1-F12, and basic Ctrl-letter combos.
-pub fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
+///
+/// `app_cursor` selects between CSI form (`ESC [ X`) and SS3 form (`ESC O X`)
+/// for the cursor keys (arrows, Home, End). ncurses-based programs like htop
+/// flip the terminal into application-cursor mode (DECCKM) and only recognize
+/// the SS3 form while it's set.
+pub fn key_to_bytes(key: KeyEvent, app_cursor: bool) -> Vec<u8> {
     let mods = key.modifiers;
     let ctrl = mods.contains(KeyModifiers::CONTROL);
     let alt = mods.contains(KeyModifiers::ALT);
+
+    let cursor = |c: char| -> Vec<u8> {
+        if app_cursor {
+            format!("\x1bO{c}").into_bytes()
+        } else {
+            format!("\x1b[{c}").into_bytes()
+        }
+    };
 
     let base: Vec<u8> = match key.code {
         KeyCode::Char(c) => {
@@ -67,12 +80,12 @@ pub fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Esc => vec![0x1b],
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
+        KeyCode::Left => cursor('D'),
+        KeyCode::Right => cursor('C'),
+        KeyCode::Up => cursor('A'),
+        KeyCode::Down => cursor('B'),
+        KeyCode::Home => cursor('H'),
+        KeyCode::End => cursor('F'),
         KeyCode::PageUp => b"\x1b[5~".to_vec(),
         KeyCode::PageDown => b"\x1b[6~".to_vec(),
         KeyCode::Delete => b"\x1b[3~".to_vec(),
