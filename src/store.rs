@@ -5,12 +5,24 @@ use anyhow::{Context, Result, anyhow};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LayoutMode {
+    #[default]
+    Split,
+    Tabbed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Project {
     pub name: String,
     pub path: PathBuf,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Per-project preferred layout mode (split panes vs tabbed). Persisted
+    /// in projects.toml as `layout = "split"` / `"tabbed"`. None → default.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "layout")]
+    pub layout_mode: Option<LayoutMode>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -110,6 +122,7 @@ mod tests {
                 name: "alpha".into(),
                 path: PathBuf::from("/tmp/alpha"),
                 tags: vec![],
+                layout_mode: None,
             })
             .unwrap();
         store
@@ -117,6 +130,7 @@ mod tests {
                 name: "beta".into(),
                 path: PathBuf::from("/tmp/beta"),
                 tags: vec!["work".into()],
+                layout_mode: Some(LayoutMode::Tabbed),
             })
             .unwrap();
         save_to(&store, &path).unwrap();
@@ -131,6 +145,7 @@ mod tests {
             name: "x".into(),
             path: PathBuf::from("/x"),
             tags: vec![],
+            layout_mode: None,
         };
         store.add(p.clone()).unwrap();
         assert!(store.add(p).is_err());

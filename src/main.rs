@@ -29,7 +29,7 @@ use ratatui::layout::Rect;
 use crate::pane::Focus;
 use crate::pane::terminal::PtyPane;
 use crate::settings::Settings;
-use crate::store::{Project, ProjectStore};
+use crate::store::{LayoutMode, Project, ProjectStore};
 use crate::ui::ModalState;
 use crate::ui::modal::{AddProjectModal, ConfirmDeleteModal};
 
@@ -124,6 +124,7 @@ fn cmd_add(path: &Path, name: Option<String>) -> Result<()> {
         name: resolved_name.clone(),
         path: abs,
         tags: vec![],
+        layout_mode: None,
     })?;
     store::save(&store)?;
     println!("added '{resolved_name}'");
@@ -142,12 +143,6 @@ fn cmd_rm(name: &str) -> Result<()> {
 pub struct ProjectSession {
     pub claude: Option<PtyPane>,
     pub shell: Option<PtyPane>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LayoutMode {
-    Split,
-    Tabbed,
 }
 
 pub struct App {
@@ -218,6 +213,7 @@ impl App {
         let project = self.store.projects[idx].clone();
         self.active_project_name = Some(project.name.clone());
         self.sidebar.active = Some(project.name.clone());
+        self.layout_mode = project.layout_mode.unwrap_or_default();
         self.error = None;
 
         let layout = compute_layout(body, self);
@@ -303,7 +299,33 @@ impl App {
             self.active_project_name = None;
             self.sidebar.active = None;
         }
+
+        // Re-sync layout from the active project (its layout may have been
+        // edited externally).
+        if let Some(p) = self.active_project() {
+            self.layout_mode = p.layout_mode.unwrap_or_default();
+        }
         Ok(())
+    }
+
+    /// Set the current layout mode and persist it on the active project.
+    fn set_layout_mode(&mut self, mode: LayoutMode) {
+        self.layout_mode = mode;
+        let Some(name) = self.active_project_name.clone() else {
+            return;
+        };
+        let mut changed = false;
+        if let Some(p) = self.store.projects.iter_mut().find(|p| p.name == name) {
+            if p.layout_mode != Some(mode) {
+                p.layout_mode = Some(mode);
+                changed = true;
+            }
+        }
+        if changed
+            && let Err(e) = store::save(&self.store)
+        {
+            push_error(&mut self.error, format!("save failed: {e}"));
+        }
     }
 }
 
@@ -559,10 +581,11 @@ fn handle_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                 return Ok(());
             }
             KeyCode::Char('t') => {
-                app.layout_mode = match app.layout_mode {
+                let new_mode = match app.layout_mode {
                     LayoutMode::Split => LayoutMode::Tabbed,
                     LayoutMode::Tabbed => LayoutMode::Split,
                 };
+                app.set_layout_mode(new_mode);
                 if app.layout_mode == LayoutMode::Tabbed
                     && app.focus == Focus::Projects
                 {
@@ -700,6 +723,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, _body: Rect) -> Result<()> {
                         name,
                         path: abs,
                         tags: vec![],
+                        layout_mode: None,
                     })?;
                     store::save(&store)?;
                     Ok(())

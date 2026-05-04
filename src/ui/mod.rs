@@ -14,8 +14,9 @@ use crate::ProjectSession;
 use crate::pane::Focus;
 use crate::pane::terminal::PtyPaneWidget;
 use crate::status::{self, HookEvent};
+use crate::store::LayoutMode;
 use crate::ui::projects::ProjectStatus;
-use crate::{App, LayoutMode, compute_layout};
+use crate::{App, compute_layout};
 
 const WAITING_THRESHOLD: Duration = Duration::from_millis(500);
 
