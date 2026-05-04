@@ -121,6 +121,12 @@ pub struct ProjectSession {
     pub shell: Option<PtyPane>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutMode {
+    Split,
+    Tabbed,
+}
+
 pub struct App {
     pub store: ProjectStore,
     pub settings: Settings,
@@ -132,6 +138,10 @@ pub struct App {
     pub should_quit: bool,
     pub error: Option<String>,
     pub last_click: Option<(Instant, usize)>,
+    pub layout_mode: LayoutMode,
+    pub sidebar_hidden: bool,
+    /// Width of the claude pane as a percentage of the content area in Split mode.
+    pub claude_pct: u16,
 }
 
 impl App {
@@ -149,6 +159,9 @@ impl App {
             should_quit: false,
             error: None,
             last_click: None,
+            layout_mode: LayoutMode::Split,
+            sidebar_hidden: false,
+            claude_pct: 50,
         }
     }
 
@@ -184,7 +197,9 @@ impl App {
         self.sidebar.active = Some(project.name.clone());
         self.error = None;
 
-        let (claude_inner, shell_inner) = pane_inner_sizes(body);
+        let layout = compute_layout(body, self);
+        let claude_inner = layout.claude_inner();
+        let shell_inner = layout.shell_inner();
 
         let session = self
             .sessions
@@ -338,7 +353,9 @@ fn event_loop(
 
         let area: Rect = terminal.size().context("terminal size")?.into();
         let body = body_rect(area);
-        let (claude_inner, shell_inner) = pane_inner_sizes(body);
+        let layout = compute_layout(body, app);
+        let claude_inner = layout.claude_inner();
+        let shell_inner = layout.shell_inner();
 
         // Resize only the active session's panes; inactive sessions keep their grids.
         if let Some(session) = app.active_session_mut() {
@@ -389,22 +406,64 @@ fn event_loop(
     Ok(())
 }
 
-fn pane_inner_sizes(body: Rect) -> (Rect, Rect) {
-    let (_, claude, shell) = pane_outer_rects(body);
-    (inset(claude), inset(shell))
+#[derive(Debug, Clone, Copy)]
+pub struct LayoutRects {
+    pub sidebar: Option<Rect>,
+    pub claude: Rect,
+    pub shell: Rect,
+    /// Tab strip rect (Tabbed mode only). Inside: left half = claude tab, right = shell.
+    pub tab_strip: Option<Rect>,
 }
 
-fn pane_outer_rects(body: Rect) -> (Rect, Rect, Rect) {
+impl LayoutRects {
+    pub fn claude_inner(&self) -> Rect {
+        inset(self.claude)
+    }
+    pub fn shell_inner(&self) -> Rect {
+        inset(self.shell)
+    }
+}
+
+pub fn compute_layout(body: Rect, app: &App) -> LayoutRects {
     use ratatui::layout::{Constraint, Direction, Layout};
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(24),
-            Constraint::Percentage(50),
-            Constraint::Min(20),
-        ])
-        .split(body);
-    (cols[0], cols[1], cols[2])
+
+    let (sidebar_rect, content) = if app.sidebar_hidden {
+        (None, body)
+    } else {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(24), Constraint::Min(20)])
+            .split(body);
+        (Some(cols[0]), cols[1])
+    };
+
+    match app.layout_mode {
+        LayoutMode::Split => {
+            let pct = app.claude_pct.clamp(10, 90);
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(pct), Constraint::Min(10)])
+                .split(content);
+            LayoutRects {
+                sidebar: sidebar_rect,
+                claude: cols[0],
+                shell: cols[1],
+                tab_strip: None,
+            }
+        }
+        LayoutMode::Tabbed => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(0)])
+                .split(content);
+            LayoutRects {
+                sidebar: sidebar_rect,
+                claude: rows[1],
+                shell: rows[1],
+                tab_strip: Some(rows[0]),
+            }
+        }
+    }
 }
 
 fn body_rect(area: Rect) -> Rect {
@@ -451,6 +510,33 @@ fn handle_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
             }
             KeyCode::Char('3') => {
                 app.focus = Focus::Shell;
+                return Ok(());
+            }
+            KeyCode::Char('0') => {
+                app.sidebar_hidden = !app.sidebar_hidden;
+                if app.sidebar_hidden && app.focus == Focus::Projects {
+                    app.focus = Focus::Claude;
+                }
+                return Ok(());
+            }
+            KeyCode::Char('h') | KeyCode::Char(',') | KeyCode::Char('-') => {
+                app.claude_pct = app.claude_pct.saturating_sub(5).max(10);
+                return Ok(());
+            }
+            KeyCode::Char('l') | KeyCode::Char('.') | KeyCode::Char(']') => {
+                app.claude_pct = (app.claude_pct + 5).min(90);
+                return Ok(());
+            }
+            KeyCode::Char('t') => {
+                app.layout_mode = match app.layout_mode {
+                    LayoutMode::Split => LayoutMode::Tabbed,
+                    LayoutMode::Tabbed => LayoutMode::Split,
+                };
+                if app.layout_mode == LayoutMode::Tabbed
+                    && app.focus == Focus::Projects
+                {
+                    app.focus = Focus::Claude;
+                }
                 return Ok(());
             }
             _ => {}
@@ -627,20 +713,48 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
     };
 
     let body = body_rect(area);
-    let (sidebar_rect, claude_rect, shell_rect) = pane_outer_rects(body);
+    let layout = compute_layout(body, app);
     let pos_x = m.column;
     let pos_y = m.row;
 
-    if rect_contains(sidebar_rect, pos_x, pos_y) {
+    if let Some(sidebar_rect) = layout.sidebar
+        && rect_contains(sidebar_rect, pos_x, pos_y)
+    {
         handle_sidebar_click(app, sidebar_rect, pos_y, body);
         return;
     }
-    if rect_contains(claude_rect, pos_x, pos_y) {
-        app.focus = Focus::Claude;
+
+    // Tab strip click (only in Tabbed mode).
+    if let Some(strip) = layout.tab_strip
+        && rect_contains(strip, pos_x, pos_y)
+    {
+        let half = strip.width / 2;
+        if pos_x < strip.x + half {
+            app.focus = Focus::Claude;
+        } else {
+            app.focus = Focus::Shell;
+        }
         return;
     }
-    if rect_contains(shell_rect, pos_x, pos_y) {
-        app.focus = Focus::Shell;
+
+    match app.layout_mode {
+        LayoutMode::Split => {
+            if rect_contains(layout.claude, pos_x, pos_y) {
+                app.focus = Focus::Claude;
+            } else if rect_contains(layout.shell, pos_x, pos_y) {
+                app.focus = Focus::Shell;
+            }
+        }
+        LayoutMode::Tabbed => {
+            // claude == shell in tabbed mode; click in content keeps current focus
+            // (or focuses whichever is currently visible). Just leave focus as-is
+            // unless it's still on Projects.
+            if rect_contains(layout.claude, pos_x, pos_y)
+                && app.focus == Focus::Projects
+            {
+                app.focus = Focus::Claude;
+            }
+        }
     }
 }
 
