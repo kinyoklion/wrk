@@ -583,6 +583,7 @@ fn handle_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                 let bytes = pane::key_to_bytes(key, pane.app_cursor_mode());
                 if !bytes.is_empty() {
                     let _ = pane.write(&bytes);
+                    pane.scroll_to_bottom();
                 }
             }
             Ok(())
@@ -594,6 +595,7 @@ fn handle_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                 let bytes = pane::key_to_bytes(key, pane.app_cursor_mode());
                 if !bytes.is_empty() {
                     let _ = pane.write(&bytes);
+                    pane.scroll_to_bottom();
                 }
             }
             Ok(())
@@ -735,19 +737,39 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, _body: Rect) -> Result<()> {
 
 const DOUBLE_CLICK_MS: u128 = 350;
 
+const SCROLL_LINES: i32 = 3;
+
 fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
     if app.modal.is_some() {
         return;
     }
-    let MouseEventKind::Down(MouseButton::Left) = m.kind else {
-        return;
-    };
 
     let body = body_rect(area);
     let layout = compute_layout(body, app);
     let pos_x = m.column;
     let pos_y = m.row;
 
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            handle_left_click(app, &layout, body, pos_x, pos_y);
+        }
+        MouseEventKind::ScrollUp => {
+            scroll_at(app, &layout, pos_x, pos_y, SCROLL_LINES);
+        }
+        MouseEventKind::ScrollDown => {
+            scroll_at(app, &layout, pos_x, pos_y, -SCROLL_LINES);
+        }
+        _ => {}
+    }
+}
+
+fn handle_left_click(
+    app: &mut App,
+    layout: &LayoutRects,
+    body: Rect,
+    pos_x: u16,
+    pos_y: u16,
+) {
     if let Some(sidebar_rect) = layout.sidebar
         && rect_contains(sidebar_rect, pos_x, pos_y)
     {
@@ -777,15 +799,43 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
             }
         }
         LayoutMode::Tabbed => {
-            // claude == shell in tabbed mode; click in content keeps current focus
-            // (or focuses whichever is currently visible). Just leave focus as-is
-            // unless it's still on Projects.
             if rect_contains(layout.claude, pos_x, pos_y)
                 && app.focus == Focus::Projects
             {
                 app.focus = Focus::Claude;
             }
         }
+    }
+}
+
+fn scroll_at(app: &App, layout: &LayoutRects, x: u16, y: u16, delta: i32) {
+    let Some(session) = app.active_session() else {
+        return;
+    };
+    let pane = match app.layout_mode {
+        LayoutMode::Split => {
+            if rect_contains(layout.claude, x, y) {
+                session.claude.as_ref()
+            } else if rect_contains(layout.shell, x, y) {
+                session.shell.as_ref()
+            } else {
+                None
+            }
+        }
+        LayoutMode::Tabbed => {
+            if !rect_contains(layout.claude, x, y) {
+                None
+            } else {
+                match app.focus {
+                    Focus::Claude => session.claude.as_ref(),
+                    Focus::Shell => session.shell.as_ref(),
+                    _ => None,
+                }
+            }
+        }
+    };
+    if let Some(p) = pane {
+        p.scroll(delta);
     }
 }
 

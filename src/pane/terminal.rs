@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use alacritty_terminal::Term;
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, TermMode};
 use anyhow::{Context, Result};
@@ -172,6 +172,9 @@ impl PtyPane {
         if content.cursor.shape == alacritty_terminal::vte::ansi::CursorShape::Hidden {
             return None;
         }
+        if content.display_offset > 0 {
+            return None;
+        }
         let p = content.cursor.point;
         Some((p.column.0 as u16, p.line.0 as u16))
     }
@@ -196,6 +199,23 @@ impl PtyPane {
             .lock()
             .map(|t| t.elapsed())
             .unwrap_or_default()
+    }
+
+    /// Scroll the display by `delta` lines. Positive scrolls back into
+    /// scrollback (older content), negative scrolls toward live output.
+    pub fn scroll(&self, delta: i32) {
+        if delta == 0 {
+            return;
+        }
+        if let Ok(mut t) = self.term.lock() {
+            t.scroll_display(Scroll::Delta(delta));
+        }
+    }
+
+    pub fn scroll_to_bottom(&self) {
+        if let Ok(mut t) = self.term.lock() {
+            t.scroll_display(Scroll::Bottom);
+        }
     }
 }
 
