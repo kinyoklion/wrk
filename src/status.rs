@@ -78,7 +78,13 @@ fn sanitize(name: &str) -> String {
 }
 
 fn hook_command(event: &str) -> String {
-    format!(r#"[ -n "$WRK_STATUS_FILE" ] && printf '{event}' > "$WRK_STATUS_FILE""#)
+    // The trailing `; true` ensures we exit 0 even when WRK_STATUS_FILE is
+    // unset (i.e. the session wasn't launched by wrk) — otherwise the failed
+    // `[ -n "" ]` test would propagate as exit 1 and Claude Code would log a
+    // hook error.
+    format!(
+        r#"[ -n "$WRK_STATUS_FILE" ] && printf '{event}' > "$WRK_STATUS_FILE"; true"#
+    )
 }
 
 fn settings_path() -> Result<PathBuf> {
@@ -142,19 +148,40 @@ pub fn install_hooks() -> Result<PathBuf> {
             ));
         }
         let arr = arr_entry.as_array_mut().unwrap();
+        let new_cmd = hook_command(payload);
 
-        // Skip if a wrk hook is already present (matched by marker substring).
-        let already = arr.iter().any(entry_has_marker);
-        if already {
-            continue;
+        // If a wrk-marked entry exists, refresh its command (so re-running
+        // install-hooks picks up bug fixes). Otherwise append a new entry.
+        let mut found = false;
+        for entry in arr.iter_mut() {
+            if !entry_has_marker(entry) {
+                continue;
+            }
+            found = true;
+            if let Some(hooks) = entry
+                .get_mut("hooks")
+                .and_then(|h| h.as_array_mut())
+            {
+                for h in hooks.iter_mut() {
+                    let is_ours = h
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|c| c.contains(HOOK_MARKER));
+                    if is_ours {
+                        h["command"] = json!(new_cmd.clone());
+                    }
+                }
+            }
         }
-        arr.push(json!({
-            "matcher": "",
-            "hooks": [{
-                "type": "command",
-                "command": hook_command(payload),
-            }],
-        }));
+        if !found {
+            arr.push(json!({
+                "matcher": "",
+                "hooks": [{
+                    "type": "command",
+                    "command": new_cmd,
+                }],
+            }));
+        }
     }
 
     write_settings(&path, &settings)?;
