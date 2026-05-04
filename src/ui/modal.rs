@@ -129,8 +129,7 @@ impl ConfirmDeleteModal {
             ])
             .split(inner);
 
-        Paragraph::new(format!("delete project '{}'?", self.project_name))
-            .render(layout[0], buf);
+        Paragraph::new(format!("delete project '{}'?", self.project_name)).render(layout[0], buf);
         Paragraph::new("y: confirm   n / Esc: cancel")
             .style(Style::default().fg(Color::DarkGray))
             .render(layout[2], buf);

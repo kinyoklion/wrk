@@ -54,8 +54,7 @@ pub fn load() -> Result<Settings> {
     if !path.exists() {
         return Ok(Settings::default());
     }
-    let text =
-        fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let text = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let settings: Settings =
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     Ok(settings)

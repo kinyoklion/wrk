@@ -34,7 +34,11 @@ use crate::ui::ModalState;
 use crate::ui::modal::{AddProjectModal, ConfirmDeleteModal};
 
 #[derive(Parser)]
-#[command(name = "wrk", version, about = "TUI manager for concurrent Claude Code sessions")]
+#[command(
+    name = "wrk",
+    version,
+    about = "TUI manager for concurrent Claude Code sessions"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -99,7 +103,12 @@ fn cmd_ls() -> Result<()> {
         .max()
         .unwrap_or(0);
     for p in &store.projects {
-        println!("  {:<width$}  {}", p.name, p.path.display(), width = max_name);
+        println!(
+            "  {:<width$}  {}",
+            p.name,
+            p.path.display(),
+            width = max_name
+        );
     }
     Ok(())
 }
@@ -220,16 +229,10 @@ impl App {
         let claude_inner = layout.claude_inner();
         let shell_inner = layout.shell_inner();
 
-        let session = self
-            .sessions
-            .entry(project.name.clone())
-            .or_default();
+        let session = self.sessions.entry(project.name.clone()).or_default();
 
         // Spawn claude if missing or its child has died.
-        let claude_dead = session
-            .claude
-            .as_mut()
-            .is_some_and(|p| p.child_finished());
+        let claude_dead = session.claude.as_mut().is_some_and(|p| p.child_finished());
         if session.claude.is_none() || claude_dead {
             let status_file = status::status_file_for(&project.name);
             let claude_env = vec![(
@@ -252,10 +255,7 @@ impl App {
         }
 
         // Spawn shell if missing or dead.
-        let shell_dead = session
-            .shell
-            .as_mut()
-            .is_some_and(|p| p.child_finished());
+        let shell_dead = session.shell.as_mut().is_some_and(|p| p.child_finished());
         if session.shell.is_none() || shell_dead {
             let cmd = self.settings.shell();
             session.shell = match PtyPane::spawn(
@@ -289,9 +289,14 @@ impl App {
         self.sidebar.refresh(&self.store);
 
         // Drop sessions whose project is no longer in the store.
-        let known: std::collections::HashSet<&str> =
-            self.store.projects.iter().map(|p| p.name.as_str()).collect();
-        self.sessions.retain(|name, _| known.contains(name.as_str()));
+        let known: std::collections::HashSet<&str> = self
+            .store
+            .projects
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        self.sessions
+            .retain(|name, _| known.contains(name.as_str()));
 
         if let Some(name) = &self.active_project_name
             && !known.contains(name.as_str())
@@ -321,9 +326,7 @@ impl App {
                 changed = true;
             }
         }
-        if changed
-            && let Err(e) = store::save(&self.store)
-        {
+        if changed && let Err(e) = store::save(&self.store) {
             push_error(&mut self.error, format!("save failed: {e}"));
         }
     }
@@ -431,9 +434,7 @@ fn event_loop(
 
         if event::poll(Duration::from_millis(33))? {
             match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    handle_key(app, key, body)?
-                }
+                Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(app, key, body)?,
                 Event::Mouse(m) => handle_mouse(app, m, area),
                 Event::Resize(_, _) => {
                     // Next loop iteration re-resizes.
@@ -586,9 +587,7 @@ fn handle_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                     LayoutMode::Tabbed => LayoutMode::Split,
                 };
                 app.set_layout_mode(new_mode);
-                if app.layout_mode == LayoutMode::Tabbed
-                    && app.focus == Focus::Projects
-                {
+                if app.layout_mode == LayoutMode::Tabbed && app.focus == Focus::Projects {
                     app.focus = Focus::Claude;
                 }
                 return Ok(());
@@ -787,13 +786,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
     }
 }
 
-fn handle_left_click(
-    app: &mut App,
-    layout: &LayoutRects,
-    body: Rect,
-    pos_x: u16,
-    pos_y: u16,
-) {
+fn handle_left_click(app: &mut App, layout: &LayoutRects, body: Rect, pos_x: u16, pos_y: u16) {
     if let Some(sidebar_rect) = layout.sidebar
         && rect_contains(sidebar_rect, pos_x, pos_y)
     {
@@ -823,9 +816,7 @@ fn handle_left_click(
             }
         }
         LayoutMode::Tabbed => {
-            if rect_contains(layout.claude, pos_x, pos_y)
-                && app.focus == Focus::Projects
-            {
+            if rect_contains(layout.claude, pos_x, pos_y) && app.focus == Focus::Projects {
                 app.focus = Focus::Claude;
             }
         }

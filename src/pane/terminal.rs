@@ -95,7 +95,10 @@ impl PtyPane {
         let term = Term::new(Config::default(), &size, listener);
         let term = Arc::new(Mutex::new(term));
 
-        let mut reader = pty.master.try_clone_reader().context("cloning pty reader")?;
+        let mut reader = pty
+            .master
+            .try_clone_reader()
+            .context("cloning pty reader")?;
 
         let last_output = Arc::new(Mutex::new(Instant::now()));
         let last_output_for_reader = Arc::clone(&last_output);

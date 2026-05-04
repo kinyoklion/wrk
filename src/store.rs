@@ -74,10 +74,9 @@ pub fn load_from(path: &Path) -> Result<ProjectStore> {
         fs::write(path, "").with_context(|| format!("creating {}", path.display()))?;
         return Ok(ProjectStore::default());
     }
-    let text =
-        fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let store: ProjectStore = toml::from_str(&text)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let store: ProjectStore =
+        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     Ok(store)
 }
 

@@ -89,9 +89,10 @@ impl ProjectSidebar {
         if self.filtered_indices.is_empty() {
             return;
         }
-        let i = self.state.selected().map_or(0, |i| {
-            (i + 1).min(self.filtered_indices.len() - 1)
-        });
+        let i = self
+            .state
+            .selected()
+            .map_or(0, |i| (i + 1).min(self.filtered_indices.len() - 1));
         self.state.select(Some(i));
     }
 
@@ -103,13 +104,8 @@ impl ProjectSidebar {
         self.state.select(Some(i));
     }
 
-    pub fn render<F>(
-        &mut self,
-        area: Rect,
-        buf: &mut Buffer,
-        store: &ProjectStore,
-        status_for: F,
-    ) where
+    pub fn render<F>(&mut self, area: Rect, buf: &mut Buffer, store: &ProjectStore, status_for: F)
+    where
         F: Fn(&str) -> ProjectStatus,
     {
         let title = match &self.filter {
@@ -134,15 +130,9 @@ impl ProjectSidebar {
                 let active = matches!(&self.active, Some(name) if name == &p.name);
                 let status = status_for(&p.name);
                 let prefix = match status {
-                    ProjectStatus::Attention => {
-                        Span::styled("● ", Style::default().fg(Color::Red))
-                    }
-                    ProjectStatus::Waiting => {
-                        Span::styled("● ", Style::default().fg(Color::Green))
-                    }
-                    ProjectStatus::Busy => {
-                        Span::styled("· ", Style::default().fg(Color::Yellow))
-                    }
+                    ProjectStatus::Attention => Span::styled("● ", Style::default().fg(Color::Red)),
+                    ProjectStatus::Waiting => Span::styled("● ", Style::default().fg(Color::Green)),
+                    ProjectStatus::Busy => Span::styled("· ", Style::default().fg(Color::Yellow)),
                     ProjectStatus::None => Span::raw("  "),
                 };
                 let active_marker = if active {

@@ -20,10 +20,7 @@ use crate::{App, compute_layout};
 
 const WAITING_THRESHOLD: Duration = Duration::from_millis(500);
 
-fn project_status_for(
-    sessions: &HashMap<String, ProjectSession>,
-    name: &str,
-) -> ProjectStatus {
+fn project_status_for(sessions: &HashMap<String, ProjectSession>, name: &str) -> ProjectStatus {
     let claude = sessions.get(name).and_then(|s| s.claude.as_ref());
     if claude.is_none() {
         return ProjectStatus::None;
@@ -60,12 +57,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(sidebar_area) = layout.sidebar {
         app.sidebar.focused = app.focus == Focus::Projects;
         let sessions = &app.sessions;
-        app.sidebar.render(
-            sidebar_area,
-            frame.buffer_mut(),
-            &app.store,
-            |name| project_status_for(sessions, name),
-        );
+        app.sidebar
+            .render(sidebar_area, frame.buffer_mut(), &app.store, |name| {
+                project_status_for(sessions, name)
+            });
     }
 
     let claude_pane = app.active_claude();
@@ -206,8 +201,7 @@ fn draw_terminal_pane(
             frame.render_widget(PtyPaneWidget(p), inner);
         }
         None => {
-            let para = Paragraph::new(placeholder)
-                .style(Style::default().fg(Color::DarkGray));
+            let para = Paragraph::new(placeholder).style(Style::default().fg(Color::DarkGray));
             frame.render_widget(para, inner);
         }
     }
@@ -218,10 +212,7 @@ fn inner_area(area: Rect) -> Rect {
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
-    let project = app
-        .active_project()
-        .map(|p| p.name.as_str())
-        .unwrap_or("—");
+    let project = app.active_project().map(|p| p.name.as_str()).unwrap_or("—");
     let focus = match app.focus {
         Focus::Projects => "projects",
         Focus::Claude => "claude",
@@ -238,10 +229,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::Black).bg(Color::Cyan),
         ),
         Span::raw(" "),
-        Span::styled(
-            format!("[{focus}] "),
-            Style::default().fg(Color::Yellow),
-        ),
+        Span::styled(format!("[{focus}] "), Style::default().fg(Color::Yellow)),
         Span::styled(
             format!("({session_count} live · {layout}) "),
             Style::default().fg(Color::DarkGray),
@@ -254,7 +242,9 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         ));
     } else {
         let hint = match app.focus {
-            Focus::Projects => "↑/↓ Enter/dbl-click  +/d/r  /  Alt+0 sidebar  Alt+t tabs  Alt+h/l resize  Alt+q quit",
+            Focus::Projects => {
+                "↑/↓ Enter/dbl-click  +/d/r  /  Alt+0 sidebar  Alt+t tabs  Alt+h/l resize  Alt+q quit"
+            }
             _ => "Alt+1/2/3 panes  Alt+0 sidebar  Alt+t tabs  Alt+h/l resize  Alt+q quit",
         };
         spans.push(Span::styled(hint, Style::default().fg(Color::DarkGray)));

@@ -41,8 +41,7 @@ pub fn status_dir() -> PathBuf {
 
 pub fn ensure_status_dir() -> Result<PathBuf> {
     let dir = status_dir();
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("creating {}", dir.display()))?;
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir)
 }
 
@@ -82,9 +81,7 @@ fn hook_command(event: &str) -> String {
     // unset (i.e. the session wasn't launched by wrk) — otherwise the failed
     // `[ -n "" ]` test would propagate as exit 1 and Claude Code would log a
     // hook error.
-    format!(
-        r#"[ -n "$WRK_STATUS_FILE" ] && printf '{event}' > "$WRK_STATUS_FILE"; true"#
-    )
+    format!(r#"[ -n "$WRK_STATUS_FILE" ] && printf '{event}' > "$WRK_STATUS_FILE"; true"#)
 }
 
 fn settings_path() -> Result<PathBuf> {
@@ -96,25 +93,21 @@ fn read_settings(path: &Path) -> Result<Value> {
     if !path.exists() {
         return Ok(json!({}));
     }
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     if text.trim().is_empty() {
         return Ok(json!({}));
     }
-    let value: Value = serde_json::from_str(&text)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let value: Value =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     Ok(value)
 }
 
 fn write_settings(path: &Path, value: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    let text = serde_json::to_string_pretty(value)
-        .context("serializing settings.json")?;
-    fs::write(path, text + "\n")
-        .with_context(|| format!("writing {}", path.display()))?;
+    let text = serde_json::to_string_pretty(value).context("serializing settings.json")?;
+    fs::write(path, text + "\n").with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -124,15 +117,10 @@ pub fn install_hooks() -> Result<PathBuf> {
 
     // Ensure top-level is an object.
     if !settings.is_object() {
-        return Err(anyhow!(
-            "{} top-level is not a JSON object",
-            path.display()
-        ));
+        return Err(anyhow!("{} top-level is not a JSON object", path.display()));
     }
     let root = settings.as_object_mut().unwrap();
-    let hooks_entry = root
-        .entry("hooks".to_string())
-        .or_insert_with(|| json!({}));
+    let hooks_entry = root.entry("hooks".to_string()).or_insert_with(|| json!({}));
     if !hooks_entry.is_object() {
         return Err(anyhow!("settings.json: 'hooks' is not an object"));
     }
@@ -143,9 +131,7 @@ pub fn install_hooks() -> Result<PathBuf> {
             .entry((*event).to_string())
             .or_insert_with(|| json!([]));
         if !arr_entry.is_array() {
-            return Err(anyhow!(
-                "settings.json: hooks.{event} is not an array"
-            ));
+            return Err(anyhow!("settings.json: hooks.{event} is not an array"));
         }
         let arr = arr_entry.as_array_mut().unwrap();
         let new_cmd = hook_command(payload);
@@ -158,10 +144,7 @@ pub fn install_hooks() -> Result<PathBuf> {
                 continue;
             }
             found = true;
-            if let Some(hooks) = entry
-                .get_mut("hooks")
-                .and_then(|h| h.as_array_mut())
-            {
+            if let Some(hooks) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) {
                 for h in hooks.iter_mut() {
                     let is_ours = h
                         .get("command")
@@ -205,8 +188,7 @@ pub fn uninstall_hooks() -> Result<(PathBuf, usize)> {
     };
 
     let mut removed = 0usize;
-    let event_keys: Vec<String> =
-        EVENTS.iter().map(|(e, _)| (*e).to_string()).collect();
+    let event_keys: Vec<String> = EVENTS.iter().map(|(e, _)| (*e).to_string()).collect();
     for event in &event_keys {
         if let Some(arr_entry) = hooks_obj.get_mut(event)
             && let Some(arr) = arr_entry.as_array_mut()
@@ -259,7 +241,10 @@ mod tests {
     #[test]
     fn parse_event_round_trip() {
         assert_eq!(parse_event("Stop"), Some(HookEvent::Stop));
-        assert_eq!(parse_event("UserPromptSubmit"), Some(HookEvent::UserPromptSubmit));
+        assert_eq!(
+            parse_event("UserPromptSubmit"),
+            Some(HookEvent::UserPromptSubmit)
+        );
         assert_eq!(parse_event("Notification"), Some(HookEvent::Notification));
         assert_eq!(parse_event("nope"), None);
     }

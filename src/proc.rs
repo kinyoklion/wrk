@@ -1,9 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
-use portable_pty::{
-    Child, CommandBuilder, MasterPty, PtyPair, PtySize, native_pty_system,
-};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair, PtySize, native_pty_system};
 
 pub struct Pty {
     pub master: Box<dyn MasterPty + Send>,
