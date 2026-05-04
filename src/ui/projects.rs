@@ -5,10 +5,24 @@ use nucleo_matcher::{
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, StatefulWidget};
 
 use crate::store::ProjectStore;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectStatus {
+    /// No live session for this project.
+    None,
+    /// Claude pane is producing output (recent bytes seen) or has just
+    /// received a UserPromptSubmit event.
+    Busy,
+    /// Claude has finished its response and is waiting for input
+    /// (Stop hook), or has been quiet long enough for the heuristic.
+    Waiting,
+    /// Claude has signalled a Notification (e.g. permission prompt).
+    Attention,
+}
 
 pub struct ProjectSidebar {
     pub state: ListState,
@@ -89,7 +103,15 @@ impl ProjectSidebar {
         self.state.select(Some(i));
     }
 
-    pub fn render(&mut self, area: Rect, buf: &mut Buffer, store: &ProjectStore) {
+    pub fn render<F>(
+        &mut self,
+        area: Rect,
+        buf: &mut Buffer,
+        store: &ProjectStore,
+        status_for: F,
+    ) where
+        F: Fn(&str) -> ProjectStatus,
+    {
         let title = match &self.filter {
             Some(f) => format!(" projects /{f} "),
             None => " projects ".to_string(),
@@ -109,11 +131,30 @@ impl ProjectSidebar {
             .iter()
             .filter_map(|&i| store.projects.get(i))
             .map(|p| {
-                let marker = match &self.active {
-                    Some(name) if name == &p.name => " *",
-                    _ => "",
+                let active = matches!(&self.active, Some(name) if name == &p.name);
+                let status = status_for(&p.name);
+                let prefix = match status {
+                    ProjectStatus::Attention => {
+                        Span::styled("● ", Style::default().fg(Color::Red))
+                    }
+                    ProjectStatus::Waiting => {
+                        Span::styled("● ", Style::default().fg(Color::Green))
+                    }
+                    ProjectStatus::Busy => {
+                        Span::styled("· ", Style::default().fg(Color::Yellow))
+                    }
+                    ProjectStatus::None => Span::raw("  "),
                 };
-                ListItem::new(Line::from(format!("{}{}", p.name, marker)))
+                let active_marker = if active {
+                    Span::styled(" *", Style::default().fg(Color::Cyan))
+                } else {
+                    Span::raw("")
+                };
+                ListItem::new(Line::from(vec![
+                    prefix,
+                    Span::raw(p.name.clone()),
+                    active_marker,
+                ]))
             })
             .collect();
 

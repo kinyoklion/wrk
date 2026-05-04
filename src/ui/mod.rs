@@ -7,9 +7,42 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use std::collections::HashMap;
+use std::time::Duration;
+
+use crate::ProjectSession;
 use crate::pane::Focus;
 use crate::pane::terminal::PtyPaneWidget;
+use crate::status::{self, HookEvent};
+use crate::ui::projects::ProjectStatus;
 use crate::{App, LayoutMode, compute_layout};
+
+const WAITING_THRESHOLD: Duration = Duration::from_millis(500);
+
+fn project_status_for(
+    sessions: &HashMap<String, ProjectSession>,
+    name: &str,
+) -> ProjectStatus {
+    let claude = sessions.get(name).and_then(|s| s.claude.as_ref());
+    if claude.is_none() {
+        return ProjectStatus::None;
+    }
+    // Prefer the precise hook signal when available.
+    if let Some(event) = status::read_status(name) {
+        return match event {
+            HookEvent::Notification => ProjectStatus::Attention,
+            HookEvent::Stop => ProjectStatus::Waiting,
+            HookEvent::UserPromptSubmit => ProjectStatus::Busy,
+        };
+    }
+    // Fall back to the time-since-output heuristic.
+    let pane = claude.unwrap();
+    if pane.idle_for() >= WAITING_THRESHOLD {
+        ProjectStatus::Waiting
+    } else {
+        ProjectStatus::Busy
+    }
+}
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -25,7 +58,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if let Some(sidebar_area) = layout.sidebar {
         app.sidebar.focused = app.focus == Focus::Projects;
-        app.sidebar.render(sidebar_area, frame.buffer_mut(), &app.store);
+        let sessions = &app.sessions;
+        app.sidebar.render(
+            sidebar_area,
+            frame.buffer_mut(),
+            &app.store,
+            |name| project_status_for(sessions, name),
+        );
     }
 
     let claude_pane = app.active_claude();

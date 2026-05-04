@@ -2,6 +2,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::Term;
 use alacritty_terminal::event::{Event, EventListener};
@@ -59,13 +60,23 @@ pub struct PtyPane {
     pty: Pty,
     writer: SharedWriter,
     reader_thread: Option<JoinHandle<()>>,
+    /// Timestamp of the most recently received PTY output, updated by the
+    /// reader thread. Used by the sidebar to infer "waiting for input"
+    /// (no output for a while).
+    last_output: Arc<Mutex<Instant>>,
     rows: u16,
     cols: u16,
 }
 
 impl PtyPane {
-    pub fn spawn(command: &[String], cwd: &Path, rows: u16, cols: u16) -> Result<Self> {
-        let pty = proc::spawn(command, cwd, rows, cols)?;
+    pub fn spawn(
+        command: &[String],
+        cwd: &Path,
+        rows: u16,
+        cols: u16,
+        env: &[(String, String)],
+    ) -> Result<Self> {
+        let pty = proc::spawn(command, cwd, rows, cols, env)?;
         Self::wrap(pty, rows, cols)
     }
 
@@ -86,6 +97,8 @@ impl PtyPane {
 
         let mut reader = pty.master.try_clone_reader().context("cloning pty reader")?;
 
+        let last_output = Arc::new(Mutex::new(Instant::now()));
+        let last_output_for_reader = Arc::clone(&last_output);
         let term_for_reader = Arc::clone(&term);
         let reader_thread = thread::spawn(move || {
             let mut parser: Processor<StdSyncHandler> = Processor::new();
@@ -94,6 +107,9 @@ impl PtyPane {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        if let Ok(mut t) = last_output_for_reader.lock() {
+                            *t = Instant::now();
+                        }
                         if let Ok(mut t) = term_for_reader.lock() {
                             parser.advance(&mut *t, &buf[..n]);
                         }
@@ -108,6 +124,7 @@ impl PtyPane {
             pty,
             writer,
             reader_thread: Some(reader_thread),
+            last_output,
             rows,
             cols,
         })
@@ -171,6 +188,14 @@ impl PtyPane {
             .lock()
             .map(|t| t.mode().contains(TermMode::APP_CURSOR))
             .unwrap_or(false)
+    }
+
+    /// Time elapsed since the most recent byte of PTY output.
+    pub fn idle_for(&self) -> Duration {
+        self.last_output
+            .lock()
+            .map(|t| t.elapsed())
+            .unwrap_or_default()
     }
 }
 

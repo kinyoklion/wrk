@@ -1,6 +1,7 @@
 mod pane;
 mod proc;
 mod settings;
+mod status;
 mod store;
 mod ui;
 
@@ -51,6 +52,11 @@ enum Command {
     },
     /// Remove a project by name
     Rm { name: String },
+    /// Install Claude Code hooks into ~/.claude/settings.json so the
+    /// sidebar can show precise per-project status.
+    InstallHooks,
+    /// Remove the wrk-installed hooks from ~/.claude/settings.json.
+    UninstallHooks,
 }
 
 fn main() -> Result<()> {
@@ -59,8 +65,25 @@ fn main() -> Result<()> {
         Some(Command::Ls) => cmd_ls(),
         Some(Command::Add { path, name }) => cmd_add(&path, name),
         Some(Command::Rm { name }) => cmd_rm(&name),
+        Some(Command::InstallHooks) => cmd_install_hooks(),
+        Some(Command::UninstallHooks) => cmd_uninstall_hooks(),
         None => run_tui(),
     }
+}
+
+fn cmd_install_hooks() -> Result<()> {
+    let path = status::install_hooks()?;
+    let dir = status::ensure_status_dir()?;
+    println!("installed hooks in {}", path.display());
+    println!("status files will live under {}", dir.display());
+    println!("(no-op for any Claude session not launched by wrk)");
+    Ok(())
+}
+
+fn cmd_uninstall_hooks() -> Result<()> {
+    let (path, removed) = status::uninstall_hooks()?;
+    println!("removed {removed} wrk hook entries from {}", path.display());
+    Ok(())
 }
 
 fn cmd_ls() -> Result<()> {
@@ -212,11 +235,17 @@ impl App {
             .as_mut()
             .is_some_and(|p| p.child_finished());
         if session.claude.is_none() || claude_dead {
+            let status_file = status::status_file_for(&project.name);
+            let claude_env = vec![(
+                "WRK_STATUS_FILE".to_string(),
+                status_file.to_string_lossy().into_owned(),
+            )];
             session.claude = match PtyPane::spawn(
                 &self.settings.claude_command,
                 &project.path,
                 claude_inner.height,
                 claude_inner.width,
+                &claude_env,
             ) {
                 Ok(p) => Some(p),
                 Err(e) => {
@@ -238,6 +267,7 @@ impl App {
                 &project.path,
                 shell_inner.height,
                 shell_inner.width,
+                &[],
             ) {
                 Ok(p) => Some(p),
                 Err(e) => {
@@ -290,6 +320,7 @@ fn run_tui() -> Result<()> {
         eprintln!("warning: failed to load settings.toml: {e}; using defaults");
         Settings::default()
     });
+    let _ = status::ensure_status_dir();
     let mut app = App::new(store, settings);
 
     enable_raw_mode().context("enabling raw mode")?;

@@ -10,7 +10,13 @@ pub struct Pty {
     pub child: Box<dyn Child + Send + Sync>,
 }
 
-pub fn spawn(command: &[String], cwd: &Path, rows: u16, cols: u16) -> Result<Pty> {
+pub fn spawn(
+    command: &[String],
+    cwd: &Path,
+    rows: u16,
+    cols: u16,
+    env: &[(String, String)],
+) -> Result<Pty> {
     let (program, args) = command
         .split_first()
         .ok_or_else(|| anyhow!("command is empty"))?;
@@ -20,6 +26,9 @@ pub fn spawn(command: &[String], cwd: &Path, rows: u16, cols: u16) -> Result<Pty
     }
     cmd.cwd(cwd);
     cmd.env("TERM", "xterm-256color");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
 
     let pty_system = native_pty_system();
     let PtyPair { master, slave } = pty_system
