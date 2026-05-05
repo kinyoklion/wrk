@@ -159,6 +159,13 @@ pub struct ClaudeTab {
     /// the tab, independent of the Claude session ID).
     pub status_id: String,
     pub pane: Option<PtyPane>,
+    /// True when this tab was spawned as a brand-new session (`claude` with no
+    /// args). We scan the filesystem after a short delay to capture the session
+    /// ID so we can persist it for future restarts.
+    pub detect_session_id: bool,
+    /// Wall-clock time at which the pane was spawned, used to find the right
+    /// session file when detecting the ID post-spawn.
+    pub spawn_time: Option<std::time::SystemTime>,
 }
 
 static TAB_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -278,6 +285,8 @@ impl App {
                     session_id: None,
                     status_id: new_status_id(),
                     pane: None,
+                    detect_session_id: false,
+                    spawn_time: None,
                 });
             } else {
                 for sr in &project.claude_sessions {
@@ -286,6 +295,8 @@ impl App {
                         session_id: sr.session_id.clone(),
                         status_id: new_status_id(),
                         pane: None,
+                        detect_session_id: false,
+                        spawn_time: None,
                     });
                 }
             }
@@ -295,25 +306,33 @@ impl App {
         for tab in &mut session.claude_tabs {
             let dead = tab.pane.as_mut().is_some_and(|p| p.child_finished());
             if tab.pane.is_none() || dead {
-                let cmd = claude_command(&self.settings, tab.session_id.as_deref());
+                let cmd = claude_command(
+                    &self.settings,
+                    tab.session_id.as_deref(),
+                    false,
+                    &project.path,
+                );
                 let status_path = status::status_file_for_tab(&tab.status_id);
                 let env = vec![(
                     "WRK_STATUS_FILE".to_string(),
                     status_path.to_string_lossy().into_owned(),
                 )];
-                tab.pane = match PtyPane::spawn(
+                let spawned = PtyPane::spawn(
                     &cmd,
                     &project.path,
                     claude_inner.height,
                     claude_inner.width,
                     &env,
-                ) {
-                    Ok(p) => Some(p),
-                    Err(e) => {
-                        push_error(&mut self.error, format!("claude spawn failed: {e}"));
-                        None
+                );
+                match spawned {
+                    Ok(p) => {
+                        if tab.detect_session_id {
+                            tab.spawn_time = Some(std::time::SystemTime::now());
+                        }
+                        tab.pane = Some(p);
                     }
-                };
+                    Err(e) => push_error(&mut self.error, format!("claude spawn failed: {e}")),
+                }
             }
         }
 
@@ -379,7 +398,8 @@ impl App {
     }
 
     /// Add a new Claude tab to the active project.
-    /// `session_id = None` → `claude --continue`; `Some(id)` → `claude --resume <id>`.
+    /// `session_id = None` → fresh `claude` session (ID detected post-spawn).
+    /// `session_id = Some(id)` → `claude --resume <id>`.
     fn add_claude_tab(
         &mut self,
         name: String,
@@ -399,7 +419,8 @@ impl App {
             return;
         };
 
-        let cmd = claude_command(&self.settings, session_id.as_deref());
+        let new_session = session_id.is_none();
+        let cmd = claude_command(&self.settings, session_id.as_deref(), new_session, &project_path);
         let status_id = new_status_id();
         let status_path = status::status_file_for_tab(&status_id);
         let env = vec![(
@@ -407,13 +428,19 @@ impl App {
             status_path.to_string_lossy().into_owned(),
         )];
 
-        let pane = match PtyPane::spawn(
+        let spawn_result = PtyPane::spawn(
             &cmd,
             &project_path,
             claude_inner.height,
             claude_inner.width,
             &env,
-        ) {
+        );
+        let spawn_time = if new_session && spawn_result.is_ok() {
+            Some(std::time::SystemTime::now())
+        } else {
+            None
+        };
+        let pane = match spawn_result {
             Ok(p) => Some(p),
             Err(e) => {
                 push_error(&mut self.error, format!("claude spawn failed: {e}"));
@@ -427,6 +454,8 @@ impl App {
             session_id: session_id.clone(),
             status_id,
             pane,
+            detect_session_id: new_session,
+            spawn_time,
         });
         let new_idx = session.claude_tabs.len() - 1;
         session.active_claude = new_idx;
@@ -526,17 +555,78 @@ impl App {
 
 /// Build the claude launch command for a tab.
 ///  - `session_id = Some(id)` → `claude --resume <id>`
-///  - `session_id = None`    → `claude --continue`
-fn claude_command(settings: &Settings, session_id: Option<&str>) -> Vec<String> {
+///  - `new_session = true`    → `claude` (no args; start a fresh session)
+///  - otherwise              → `claude --continue` only when prior sessions
+///                             exist on disk; bare `claude` for a new project
+fn claude_command(
+    settings: &Settings,
+    session_id: Option<&str>,
+    new_session: bool,
+    project_path: &std::path::Path,
+) -> Vec<String> {
     let mut cmd = settings.claude_base();
     match session_id {
         Some(id) => {
             cmd.push("--resume".to_string());
             cmd.push(id.to_string());
         }
-        None => cmd.push("--continue".to_string()),
+        None if new_session => {
+            // bare `claude` — Claude will create a fresh session
+        }
+        None => {
+            // Use --continue only when a prior session actually exists; if the
+            // project is brand-new there is nothing to continue and --continue
+            // may exit immediately.
+            if !session::discover_sessions(project_path).is_empty() {
+                cmd.push("--continue".to_string());
+            }
+        }
     }
     cmd
+}
+
+/// For tabs spawned as new sessions, try to find the session ID that Claude
+/// created on disk. We wait at least 3 s after spawn to give Claude time to
+/// write its session file, then scan the project's session directory.
+fn detect_new_session_ids(app: &mut App) {
+    let Some(project_name) = app.active_project_name.clone() else {
+        return;
+    };
+    let Some(project_path) = app.active_project().map(|p| p.path.clone()) else {
+        return;
+    };
+    let Some(session) = app.sessions.get_mut(&project_name) else {
+        return;
+    };
+
+    let mut any_detected = false;
+    for tab in &mut session.claude_tabs {
+        if !tab.detect_session_id || tab.session_id.is_some() {
+            continue;
+        }
+        let Some(spawn_time) = tab.spawn_time else {
+            continue;
+        };
+        let elapsed = spawn_time.elapsed().unwrap_or_default();
+        if elapsed < Duration::from_secs(3) {
+            continue;
+        }
+        if let Some(id) = session::find_session_created_after(&project_path, spawn_time) {
+            tab.session_id = Some(id);
+            tab.detect_session_id = false;
+            tab.spawn_time = None;
+            any_detected = true;
+        } else if elapsed > Duration::from_secs(30) {
+            // Give up waiting after 30 s.
+            tab.detect_session_id = false;
+            tab.spawn_time = None;
+        }
+    }
+
+    if any_detected {
+        let project_name = project_name.clone();
+        app.persist_claude_sessions(&project_name);
+    }
 }
 
 fn push_error(slot: &mut Option<String>, msg: String) {
@@ -651,6 +741,9 @@ fn event_loop(
                 _ => {}
             }
         }
+
+        // Try to detect the session ID for newly-spawned "new session" tabs.
+        detect_new_session_ids(app);
 
         // Reap dead children on the active session so the placeholder shows.
         if let Some(session) = app.active_session_mut() {
@@ -803,10 +896,18 @@ fn handle_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
             }
             // Claude tab management (works from any pane).
             KeyCode::Char('n') if app.active_project_name.is_some() => {
-                let discovered = app
-                    .active_project()
-                    .map(|p| session::discover_sessions(&p.path))
-                    .unwrap_or_default();
+                let discovered = app.active_project().map(|p| {
+                    let known: std::collections::HashMap<String, String> = p
+                        .claude_sessions
+                        .iter()
+                        .filter_map(|sr| {
+                            sr.session_id
+                                .as_ref()
+                                .map(|id| (id.clone(), sr.name.clone()))
+                        })
+                        .collect();
+                    session::discover_sessions_named(&p.path, &known)
+                }).unwrap_or_default();
                 app.modal = Some(ModalState::ClaudeTabPicker(
                     ClaudeTabPickerModal::new(&discovered),
                 ));
@@ -1017,10 +1118,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
             if m.confirmed {
                 let session_id = m.selected_session_id().map(|s| s.to_owned());
                 let name = if m.tab_name.trim().is_empty() {
-                    session_id
-                        .as_deref()
-                        .map(|id| id[..id.len().min(8)].to_string())
-                        .unwrap_or_else(|| "claude".to_string())
+                    m.suggested_name()
                 } else {
                     m.tab_name.trim().to_string()
                 };

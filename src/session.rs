@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 /// Discover Claude sessions stored on disk for a given project directory.
 ///
 /// Claude Code stores session history under `~/.claude/projects/<key>/` where
@@ -11,6 +13,8 @@ use std::time::SystemTime;
 #[derive(Debug, Clone)]
 pub struct DiscoveredSession {
     pub session_id: String,
+    /// Display name — set to the stored tab name if one is known, otherwise None.
+    pub name: Option<String>,
     /// Wall-clock time of the last write to the session file — used for
     /// display ordering (newest first).
     pub modified: SystemTime,
@@ -46,11 +50,39 @@ pub fn discover_sessions(project_path: &Path) -> Vec<DiscoveredSession> {
             .unwrap_or(SystemTime::UNIX_EPOCH);
         out.push(DiscoveredSession {
             session_id,
+            name: None,
             modified,
         });
     }
     out.sort_by(|a, b| b.modified.cmp(&a.modified));
     out
+}
+
+/// Like `discover_sessions` but annotates each entry with its stored display
+/// name from `known` (mapping session_id → name).
+pub fn discover_sessions_named(
+    project_path: &Path,
+    known: &HashMap<String, String>,
+) -> Vec<DiscoveredSession> {
+    let mut sessions = discover_sessions(project_path);
+    for s in &mut sessions {
+        s.name = known.get(&s.session_id).cloned();
+    }
+    sessions
+}
+
+/// Returns the session ID of the newest session file that was modified
+/// strictly after `since`, or `None` if no such file exists yet.
+///
+/// Used after spawning `claude` (no args) to capture the newly-created
+/// session ID from the filesystem.
+pub fn find_session_created_after(project_path: &Path, since: SystemTime) -> Option<String> {
+    let sessions = discover_sessions(project_path);
+    // sessions is sorted newest-first; find the first one modified after `since`
+    sessions
+        .into_iter()
+        .find(|s| s.modified > since)
+        .map(|s| s.session_id)
 }
 
 fn sessions_dir(project_path: &Path) -> Option<PathBuf> {

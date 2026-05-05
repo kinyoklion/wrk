@@ -140,14 +140,13 @@ impl ConfirmDeleteModal {
 
 /// Modal for picking which Claude session to attach to a new tab.
 ///
-/// The list shows discovered on-disk sessions (newest first) plus a
-/// synthetic "New session" entry at index 0. The caller reads `confirmed` to
-/// learn whether the user accepted; `selected()` returns the chosen session ID
-/// (None = new session) and `tab_name` gives the desired display name.
+/// Index 0 is always the synthetic "New session" entry. Indices ≥ 1 are
+/// discovered on-disk sessions (newest first). The caller checks `confirmed`
+/// then reads `selected_session_id()` (None = new) and `tab_name`.
 #[derive(Debug, Clone)]
 pub struct ClaudeTabPickerModal {
-    /// "New session" + discovered sessions (newest first).
-    pub sessions: Vec<Option<String>>,
+    /// None = "New session"; Some = a discovered session.
+    pub sessions: Vec<Option<DiscoveredSession>>,
     pub selected_idx: usize,
     pub tab_name: String,
     pub name_focused: bool,
@@ -156,9 +155,9 @@ pub struct ClaudeTabPickerModal {
 
 impl ClaudeTabPickerModal {
     pub fn new(discovered: &[DiscoveredSession]) -> Self {
-        let mut sessions = vec![None]; // "New session"
+        let mut sessions: Vec<Option<DiscoveredSession>> = vec![None];
         for s in discovered {
-            sessions.push(Some(s.session_id.clone()));
+            sessions.push(Some(s.clone()));
         }
         Self {
             sessions,
@@ -169,10 +168,24 @@ impl ClaudeTabPickerModal {
         }
     }
 
+    /// Session ID of the selected entry, or `None` for "New session".
     pub fn selected_session_id(&self) -> Option<&str> {
         self.sessions
             .get(self.selected_idx)
-            .and_then(|o| o.as_deref())
+            .and_then(|o| o.as_ref())
+            .map(|s| s.session_id.as_str())
+    }
+
+    /// Suggested tab name: the session's stored name if one exists, otherwise
+    /// the first 8 chars of the session ID, or "new" for a new session.
+    pub fn suggested_name(&self) -> String {
+        match self.sessions.get(self.selected_idx).and_then(|o| o.as_ref()) {
+            Some(s) => s
+                .name
+                .clone()
+                .unwrap_or_else(|| s.session_id[..s.session_id.len().min(8)].to_string()),
+            None => "new".to_string(),
+        }
     }
 
     pub fn select_next(&mut self) {
@@ -195,12 +208,12 @@ impl ClaudeTabPickerModal {
         let inner = block.inner(popup);
         block.render(popup, buf);
 
-        // Layout: name label, name field, blank, session list, blank, footer
+        // Layout: name label + field, blank, session list, footer
         let list_height = inner.height.saturating_sub(5).max(1);
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // "name:" label
+                Constraint::Length(1), // label
                 Constraint::Length(1), // name input
                 Constraint::Length(1), // blank
                 Constraint::Length(list_height),
@@ -209,17 +222,38 @@ impl ClaudeTabPickerModal {
             ])
             .split(inner);
 
-        Paragraph::new("tab name (optional):").render(layout[0], buf);
-        Paragraph::new(self.tab_name.as_str())
-            .style(field_style(self.name_focused))
+        let name_hint = if self.name_focused {
+            "tab name:"
+        } else {
+            "tab name (Tab to edit):"
+        };
+        Paragraph::new(name_hint).render(layout[0], buf);
+        let display_name = if self.name_focused || !self.tab_name.is_empty() {
+            self.tab_name.as_str()
+        } else {
+            // show suggested name greyed out when field is empty and unfocused
+            ""
+        };
+        let name_style = if self.name_focused {
+            field_style(true)
+        } else if self.tab_name.is_empty() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            field_style(false)
+        };
+        let name_display = if !self.name_focused && self.tab_name.is_empty() {
+            self.suggested_name()
+        } else {
+            display_name.to_string()
+        };
+        Paragraph::new(name_display)
+            .style(name_style)
             .render(layout[1], buf);
 
         // Session list
         let list_area = layout[3];
         let visible = list_area.height as usize;
-        let start = self
-            .selected_idx
-            .saturating_sub(visible.saturating_sub(1));
+        let start = self.selected_idx.saturating_sub(visible.saturating_sub(1));
         for (i, sess) in self.sessions.iter().enumerate().skip(start).take(visible) {
             let y = list_area.y + (i - start) as u16;
             if y >= list_area.y + list_area.height {
@@ -228,7 +262,10 @@ impl ClaudeTabPickerModal {
             let row = Rect { y, height: 1, ..list_area };
             let label = match sess {
                 None => "  [ New session ]".to_string(),
-                Some(id) => format!("  {}", id),
+                Some(s) => match &s.name {
+                    Some(name) => format!("  {name}  ({}…)", &s.session_id[..8.min(s.session_id.len())]),
+                    None => format!("  {}", s.session_id),
+                },
             };
             let style = if i == self.selected_idx {
                 Style::default()
@@ -242,15 +279,14 @@ impl ClaudeTabPickerModal {
         }
 
         let footer = if self.name_focused {
-            "Enter: confirm   Esc: back to list"
+            "Enter/Esc: back to list"
         } else {
-            "↑/↓: select   Tab: edit name   Enter: confirm   Esc: cancel"
+            "↑/↓: select   Tab: name   Enter: confirm   Esc: cancel"
         };
         Paragraph::new(footer)
             .style(Style::default().fg(Color::DarkGray))
             .render(layout[5], buf);
 
-        // Cursor position — either in the name field or at first list row
         if self.name_focused {
             let len = self.tab_name.chars().count() as u16;
             Position {
@@ -258,10 +294,7 @@ impl ClaudeTabPickerModal {
                 y: layout[1].y,
             }
         } else {
-            Position {
-                x: list_area.x,
-                y: list_area.y,
-            }
+            Position { x: list_area.x, y: list_area.y }
         }
     }
 }
