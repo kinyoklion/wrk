@@ -13,6 +13,20 @@ pub enum LayoutMode {
     Tabbed,
 }
 
+/// A named pointer to a specific Claude session.
+///
+/// Stored in `projects.toml` so wrk can resume the right conversation when
+/// the user opens a project. `session_id` corresponds to the UUID in
+/// `~/.claude/projects/<path>/<uuid>.jsonl`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionRef {
+    pub name: String,
+    /// Claude session UUID. When present, wrk launches `claude --resume <id>`.
+    /// When absent, wrk launches `claude --continue` (most-recent session).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Project {
     pub name: String,
@@ -23,6 +37,10 @@ pub struct Project {
     /// in projects.toml as `layout = "split"` / `"tabbed"`. None → default.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "layout")]
     pub layout_mode: Option<LayoutMode>,
+    /// Named Claude sessions associated with this project. When empty wrk
+    /// spawns one default `claude --continue` tab (backwards-compatible).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claude_sessions: Vec<SessionRef>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,6 +140,7 @@ mod tests {
                 path: PathBuf::from("/tmp/alpha"),
                 tags: vec![],
                 layout_mode: None,
+                claude_sessions: vec![],
             })
             .unwrap();
         store
@@ -130,6 +149,7 @@ mod tests {
                 path: PathBuf::from("/tmp/beta"),
                 tags: vec!["work".into()],
                 layout_mode: Some(LayoutMode::Tabbed),
+                claude_sessions: vec![],
             })
             .unwrap();
         save_to(&store, &path).unwrap();
@@ -145,6 +165,7 @@ mod tests {
             path: PathBuf::from("/x"),
             tags: vec![],
             layout_mode: None,
+            claude_sessions: vec![],
         };
         store.add(p.clone()).unwrap();
         assert!(store.add(p).is_err());

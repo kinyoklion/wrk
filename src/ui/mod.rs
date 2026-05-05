@@ -10,36 +10,60 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::ProjectSession;
+use crate::{App, ClaudeTab, ProjectSession, compute_layout};
 use crate::pane::Focus;
 use crate::pane::terminal::PtyPaneWidget;
 use crate::status::{self, HookEvent};
 use crate::store::LayoutMode;
 use crate::ui::projects::ProjectStatus;
-use crate::{App, compute_layout};
 
 const WAITING_THRESHOLD: Duration = Duration::from_millis(500);
 
-fn project_status_for(sessions: &HashMap<String, ProjectSession>, name: &str) -> ProjectStatus {
-    let claude = sessions.get(name).and_then(|s| s.claude.as_ref());
-    if claude.is_none() {
+fn tab_status(tab: &ClaudeTab) -> ProjectStatus {
+    if tab.pane.is_none() {
         return ProjectStatus::None;
     }
-    // Prefer the precise hook signal when available.
-    if let Some(event) = status::read_status(name) {
+    if let Some(event) = status::read_tab_status(&tab.status_id) {
         return match event {
             HookEvent::Notification => ProjectStatus::Attention,
             HookEvent::Stop => ProjectStatus::Waiting,
             HookEvent::UserPromptSubmit => ProjectStatus::Busy,
         };
     }
-    // Fall back to the time-since-output heuristic.
-    let pane = claude.unwrap();
-    if pane.idle_for() >= WAITING_THRESHOLD {
-        ProjectStatus::Waiting
-    } else {
-        ProjectStatus::Busy
+    if let Some(p) = &tab.pane {
+        if p.idle_for() >= WAITING_THRESHOLD {
+            return ProjectStatus::Waiting;
+        } else {
+            return ProjectStatus::Busy;
+        }
     }
+    ProjectStatus::None
+}
+
+fn project_status_for(sessions: &HashMap<String, ProjectSession>, name: &str) -> ProjectStatus {
+    let Some(session) = sessions.get(name) else {
+        return ProjectStatus::None;
+    };
+    if session.claude_tabs.is_empty() {
+        return ProjectStatus::None;
+    }
+    // Worst-case across all tabs: Attention > Busy > Waiting > None.
+    let mut result = ProjectStatus::None;
+    for tab in &session.claude_tabs {
+        let s = tab_status(tab);
+        result = match (result, s) {
+            (_, ProjectStatus::Attention) => ProjectStatus::Attention,
+            (ProjectStatus::Attention, _) => ProjectStatus::Attention,
+            (_, ProjectStatus::Busy) => ProjectStatus::Busy,
+            (ProjectStatus::Busy, _) => ProjectStatus::Busy,
+            (_, ProjectStatus::Waiting) => ProjectStatus::Waiting,
+            _ => result,
+        };
+        if result == ProjectStatus::Attention {
+            break;
+        }
+    }
+    result
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -63,18 +87,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             });
     }
 
+    let session = app.active_session();
+    let claude_tabs: Option<&[ClaudeTab]> = session.map(|s| s.claude_tabs.as_slice());
+    let active_claude_idx = session.map(|s| s.active_claude).unwrap_or(0);
     let claude_pane = app.active_claude();
     let shell_pane = app.active_shell();
 
     match app.layout_mode {
         LayoutMode::Split => {
-            draw_terminal_pane(
+            draw_claude_pane(
                 frame,
                 layout.claude,
-                " claude ",
                 app.focus == Focus::Claude,
+                claude_tabs,
+                active_claude_idx,
                 claude_pane,
-                "no project selected — press Enter on a project",
             );
             draw_terminal_pane(
                 frame,
@@ -89,20 +116,24 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             if let Some(strip) = layout.tab_strip {
                 draw_tab_strip(frame, strip, app.focus);
             }
-            // claude and shell rects point at the same content area; render only the focused one.
-            let (title, focused, pane, focused_for_border) = match app.focus {
-                Focus::Shell => (" shell ", true, shell_pane, true),
-                _ => (" claude ", true, claude_pane, true),
-            };
-            let _ = focused; // visible pane is implicitly focused
-            draw_terminal_pane(
-                frame,
-                layout.claude,
-                title,
-                focused_for_border,
-                pane,
-                "no project selected — press Enter on a project",
-            );
+            match app.focus {
+                Focus::Shell => draw_terminal_pane(
+                    frame,
+                    layout.claude,
+                    " shell ",
+                    true,
+                    shell_pane,
+                    "no project selected — press Enter on a project",
+                ),
+                _ => draw_claude_pane(
+                    frame,
+                    layout.claude,
+                    true,
+                    claude_tabs,
+                    active_claude_idx,
+                    claude_pane,
+                ),
+            }
         }
     }
 
@@ -117,16 +148,33 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ModalState::ConfirmDelete(m) => {
                 m.render(area, frame.buffer_mut());
             }
+            ModalState::ClaudeTabPicker(m) => {
+                let cursor = m.render(area, frame.buffer_mut());
+                if m.name_focused {
+                    frame.set_cursor_position(cursor);
+                }
+            }
         }
         return;
     }
 
     // Position the cursor inside the focused terminal pane.
+    // For the claude pane we must account for the 1-row tab strip.
+    let claude_content_area = {
+        let inner = inner_area(layout.claude);
+        let has_strip = claude_tabs.is_some_and(|t| !t.is_empty()) && inner.height >= 2;
+        if has_strip {
+            Rect { y: inner.y + 1, height: inner.height.saturating_sub(1), ..inner }
+        } else {
+            inner
+        }
+    };
     match app.focus {
         Focus::Claude => {
             if let Some(pane) = claude_pane {
-                let inner = inner_area(layout.claude);
-                if let Some(pos) = crate::pane::terminal::cursor_position(pane, inner) {
+                if let Some(pos) =
+                    crate::pane::terminal::cursor_position(pane, claude_content_area)
+                {
                     frame.set_cursor_position(pos);
                 }
             }
@@ -140,6 +188,113 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             }
         }
         _ => {}
+    }
+}
+
+/// Renders the Claude pane: border + optional per-tab strip + terminal content.
+fn draw_claude_pane(
+    frame: &mut Frame,
+    area: Rect,
+    focused: bool,
+    tabs: Option<&[ClaudeTab]>,
+    active_idx: usize,
+    pane: Option<&crate::pane::terminal::PtyPane>,
+) {
+    let border_style = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let block = Block::default()
+        .title(" claude ")
+        .borders(Borders::ALL)
+        .border_style(border_style);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let show_tab_strip = tabs.is_some_and(|t| !t.is_empty());
+
+    let (tab_strip_area, content_area) = if show_tab_strip && inner.height >= 2 {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(inner);
+        (Some(rows[0]), rows[1])
+    } else {
+        (None, inner)
+    };
+
+    if let (Some(strip_area), Some(tabs)) = (tab_strip_area, tabs) {
+        draw_claude_tab_strip(frame, strip_area, tabs, active_idx);
+    }
+
+    match pane {
+        Some(p) => frame.render_widget(PtyPaneWidget(p), content_area),
+        None => {
+            let para = Paragraph::new(
+                "no project selected — press Enter on a project",
+            )
+            .style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(para, content_area);
+        }
+    }
+}
+
+/// Tab strip for Claude sessions within a project.
+fn draw_claude_tab_strip(
+    frame: &mut Frame,
+    area: Rect,
+    tabs: &[ClaudeTab],
+    active_idx: usize,
+) {
+    if tabs.is_empty() || area.width == 0 {
+        return;
+    }
+    let tab_width = (area.width as usize / tabs.len()).max(1) as u16;
+    for (i, tab) in tabs.iter().enumerate() {
+        let x = area.x + (i as u16) * tab_width;
+        if x >= area.x + area.width {
+            break;
+        }
+        let w = if i + 1 == tabs.len() {
+            area.x + area.width - x
+        } else {
+            tab_width
+        };
+        let tab_rect = Rect { x, y: area.y, width: w, height: 1 };
+        let status_char = match tab_status(tab) {
+            ProjectStatus::Attention => "● ",
+            ProjectStatus::Busy => "· ",
+            ProjectStatus::Waiting => "● ",
+            ProjectStatus::None => "  ",
+        };
+        let status_color = match tab_status(tab) {
+            ProjectStatus::Attention => Color::Red,
+            ProjectStatus::Busy => Color::Yellow,
+            ProjectStatus::Waiting => Color::Green,
+            ProjectStatus::None => Color::DarkGray,
+        };
+        let label = format!("{status_char}{}", tab.name);
+        let style = if i == active_idx {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(status_color)
+        };
+        let spans = if i == active_idx {
+            Line::from(vec![Span::raw(label)])
+        } else {
+            Line::from(vec![
+                Span::styled(status_char.to_string(), Style::default().fg(status_color)),
+                Span::styled(tab.name.clone(), Style::default().fg(Color::DarkGray)),
+            ])
+        };
+        frame.render_widget(
+            Paragraph::new(spans).style(style).alignment(ratatui::layout::Alignment::Left),
+            tab_rect,
+        );
     }
 }
 
@@ -245,7 +400,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
             Focus::Projects => {
                 "↑/↓ Enter/dbl-click  +/d/r  /  Alt+0 sidebar  Alt+t tabs  Alt+h/l resize  Alt+q quit"
             }
-            _ => "Alt+1/2/3 panes  Alt+0 sidebar  Alt+t tabs  Alt+h/l resize  Alt+q quit",
+            _ => "Alt+1/2/3  Alt+n new-claude  Alt+w close  Alt+</> tabs  Alt+t layout  Alt+q quit",
         };
         spans.push(Span::styled(hint, Style::default().fg(Color::DarkGray)));
     }
@@ -256,4 +411,5 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 pub enum ModalState {
     Add(modal::AddProjectModal),
     ConfirmDelete(modal::ConfirmDeleteModal),
+    ClaudeTabPicker(modal::ClaudeTabPickerModal),
 }
