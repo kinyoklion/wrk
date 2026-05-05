@@ -179,7 +179,11 @@ impl ClaudeTabPickerModal {
     /// Suggested tab name: the session's stored name if one exists, otherwise
     /// the first 8 chars of the session ID, or "new" for a new session.
     pub fn suggested_name(&self) -> String {
-        match self.sessions.get(self.selected_idx).and_then(|o| o.as_ref()) {
+        match self
+            .sessions
+            .get(self.selected_idx)
+            .and_then(|o| o.as_ref())
+        {
             Some(s) => s
                 .name
                 .clone()
@@ -259,11 +263,18 @@ impl ClaudeTabPickerModal {
             if y >= list_area.y + list_area.height {
                 break;
             }
-            let row = Rect { y, height: 1, ..list_area };
+            let row = Rect {
+                y,
+                height: 1,
+                ..list_area
+            };
             let label = match sess {
                 None => "  [ New session ]".to_string(),
                 Some(s) => match &s.name {
-                    Some(name) => format!("  {name}  ({}…)", &s.session_id[..8.min(s.session_id.len())]),
+                    Some(name) => format!(
+                        "  {name}  ({}…)",
+                        &s.session_id[..8.min(s.session_id.len())]
+                    ),
                     None => format!("  {}", s.session_id),
                 },
             };
@@ -294,7 +305,10 @@ impl ClaudeTabPickerModal {
                 y: layout[1].y,
             }
         } else {
-            Position { x: list_area.x, y: list_area.y }
+            Position {
+                x: list_area.x,
+                y: list_area.y,
+            }
         }
     }
 }

@@ -400,27 +400,24 @@ impl App {
     /// Add a new Claude tab to the active project.
     /// `session_id = None` → fresh `claude` session (ID detected post-spawn).
     /// `session_id = Some(id)` → `claude --resume <id>`.
-    fn add_claude_tab(
-        &mut self,
-        name: String,
-        session_id: Option<String>,
-        body: Rect,
-    ) {
+    fn add_claude_tab(&mut self, name: String, session_id: Option<String>, body: Rect) {
         let Some(project_name) = self.active_project_name.clone() else {
             return;
         };
         let layout = compute_layout(body, self);
         let claude_inner = layout.claude_inner();
 
-        let Some(project_path) = self
-            .active_project()
-            .map(|p| p.path.clone())
-        else {
+        let Some(project_path) = self.active_project().map(|p| p.path.clone()) else {
             return;
         };
 
         let new_session = session_id.is_none();
-        let cmd = claude_command(&self.settings, session_id.as_deref(), new_session, &project_path);
+        let cmd = claude_command(
+            &self.settings,
+            session_id.as_deref(),
+            new_session,
+            &project_path,
+        );
         let status_id = new_status_id();
         let status_path = status::status_file_for_tab(&status_id);
         let env = vec![(
@@ -488,8 +485,7 @@ impl App {
             return;
         };
         if session.claude_tabs.len() > 1 {
-            session.active_claude =
-                (session.active_claude + 1) % session.claude_tabs.len();
+            session.active_claude = (session.active_claude + 1) % session.claude_tabs.len();
         }
     }
 
@@ -524,9 +520,8 @@ impl App {
         {
             // Don't save the synthetic single default tab with no session_id
             // (that's the backwards-compat case — keep the TOML clean).
-            let is_default_single = tabs.len() == 1
-                && tabs[0].name == "claude"
-                && tabs[0].session_id.is_none();
+            let is_default_single =
+                tabs.len() == 1 && tabs[0].name == "claude" && tabs[0].session_id.is_none();
             p.claude_sessions = if is_default_single { vec![] } else { tabs };
         }
         if let Err(e) = store::save(&self.store) {
@@ -896,21 +891,24 @@ fn handle_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
             }
             // Claude tab management (works from any pane).
             KeyCode::Char('n') if app.active_project_name.is_some() => {
-                let discovered = app.active_project().map(|p| {
-                    let known: std::collections::HashMap<String, String> = p
-                        .claude_sessions
-                        .iter()
-                        .filter_map(|sr| {
-                            sr.session_id
-                                .as_ref()
-                                .map(|id| (id.clone(), sr.name.clone()))
-                        })
-                        .collect();
-                    session::discover_sessions_named(&p.path, &known)
-                }).unwrap_or_default();
-                app.modal = Some(ModalState::ClaudeTabPicker(
-                    ClaudeTabPickerModal::new(&discovered),
-                ));
+                let discovered = app
+                    .active_project()
+                    .map(|p| {
+                        let known: std::collections::HashMap<String, String> = p
+                            .claude_sessions
+                            .iter()
+                            .filter_map(|sr| {
+                                sr.session_id
+                                    .as_ref()
+                                    .map(|id| (id.clone(), sr.name.clone()))
+                            })
+                            .collect();
+                        session::discover_sessions_named(&p.path, &known)
+                    })
+                    .unwrap_or_default();
+                app.modal = Some(ModalState::ClaudeTabPicker(ClaudeTabPickerModal::new(
+                    &discovered,
+                )));
                 return Ok(());
             }
             KeyCode::Char('w') => {
@@ -1089,7 +1087,9 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
             if m.name_focused {
                 match key.code {
                     KeyCode::Esc | KeyCode::Tab => m.name_focused = false,
-                    KeyCode::Backspace => { m.tab_name.pop(); }
+                    KeyCode::Backspace => {
+                        m.tab_name.pop();
+                    }
                     KeyCode::Char(c) => m.tab_name.push(c),
                     KeyCode::Enter => {
                         m.confirmed = true;

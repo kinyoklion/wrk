@@ -10,12 +10,12 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::{App, ClaudeTab, ProjectSession, compute_layout};
 use crate::pane::Focus;
 use crate::pane::terminal::PtyPaneWidget;
 use crate::status::{self, HookEvent};
 use crate::store::LayoutMode;
 use crate::ui::projects::ProjectStatus;
+use crate::{App, ClaudeTab, ProjectSession, compute_layout};
 
 const WAITING_THRESHOLD: Duration = Duration::from_millis(500);
 
@@ -164,7 +164,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let inner = inner_area(layout.claude);
         let has_strip = claude_tabs.is_some_and(|t| !t.is_empty()) && inner.height >= 2;
         if has_strip {
-            Rect { y: inner.y + 1, height: inner.height.saturating_sub(1), ..inner }
+            Rect {
+                y: inner.y + 1,
+                height: inner.height.saturating_sub(1),
+                ..inner
+            }
         } else {
             inner
         }
@@ -172,8 +176,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.focus {
         Focus::Claude => {
             if let Some(pane) = claude_pane {
-                if let Some(pos) =
-                    crate::pane::terminal::cursor_position(pane, claude_content_area)
+                if let Some(pos) = crate::pane::terminal::cursor_position(pane, claude_content_area)
                 {
                     frame.set_cursor_position(pos);
                 }
@@ -231,22 +234,15 @@ fn draw_claude_pane(
     match pane {
         Some(p) => frame.render_widget(PtyPaneWidget(p), content_area),
         None => {
-            let para = Paragraph::new(
-                "no project selected — press Enter on a project",
-            )
-            .style(Style::default().fg(Color::DarkGray));
+            let para = Paragraph::new("no project selected — press Enter on a project")
+                .style(Style::default().fg(Color::DarkGray));
             frame.render_widget(para, content_area);
         }
     }
 }
 
 /// Tab strip for Claude sessions within a project.
-fn draw_claude_tab_strip(
-    frame: &mut Frame,
-    area: Rect,
-    tabs: &[ClaudeTab],
-    active_idx: usize,
-) {
+fn draw_claude_tab_strip(frame: &mut Frame, area: Rect, tabs: &[ClaudeTab], active_idx: usize) {
     if tabs.is_empty() || area.width == 0 {
         return;
     }
@@ -261,7 +257,12 @@ fn draw_claude_tab_strip(
         } else {
             tab_width
         };
-        let tab_rect = Rect { x, y: area.y, width: w, height: 1 };
+        let tab_rect = Rect {
+            x,
+            y: area.y,
+            width: w,
+            height: 1,
+        };
         let status_char = match tab_status(tab) {
             ProjectStatus::Attention => "● ",
             ProjectStatus::Busy => "· ",
@@ -292,7 +293,9 @@ fn draw_claude_tab_strip(
             ])
         };
         frame.render_widget(
-            Paragraph::new(spans).style(style).alignment(ratatui::layout::Alignment::Left),
+            Paragraph::new(spans)
+                .style(style)
+                .alignment(ratatui::layout::Alignment::Left),
             tab_rect,
         );
     }
