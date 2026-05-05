@@ -552,7 +552,7 @@ impl App {
 ///  - `session_id = Some(id)` → `claude --resume <id>`
 ///  - `new_session = true`    → `claude` (no args; start a fresh session)
 ///  - otherwise              → `claude --continue` only when prior sessions
-///                             exist on disk; bare `claude` for a new project
+///    exist on disk; bare `claude` for a new project
 fn claude_command(
     settings: &Settings,
     session_id: Option<&str>,

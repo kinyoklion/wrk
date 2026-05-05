@@ -379,7 +379,7 @@ fn find_url_at(chars: &[char], col: usize) -> Option<String> {
     }
     let candidate: String = chars[start..=end].iter().collect();
     // Trim trailing punctuation that is unlikely to be part of the URL.
-    let candidate = candidate.trim_end_matches(|c: char| matches!(c, '.' | ',' | ')' | ']' | '>'));
+    let candidate = candidate.trim_end_matches(['.', ',', ')', ']', '>']);
     for scheme in &["https://", "http://", "ftp://"] {
         if let Some(pos) = candidate.find(scheme) {
             return Some(candidate[pos..].to_string());
