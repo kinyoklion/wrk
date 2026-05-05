@@ -774,6 +774,11 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
 
     match m.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            if m.modifiers.contains(KeyModifiers::CONTROL)
+                && try_open_url(app, &layout, pos_x, pos_y)
+            {
+                return;
+            }
             handle_left_click(app, &layout, body, pos_x, pos_y);
         }
         MouseEventKind::ScrollUp => {
@@ -852,6 +857,53 @@ fn scroll_at(app: &App, layout: &LayoutRects, x: u16, y: u16, delta: i32) {
     if let Some(p) = pane {
         p.scroll(delta);
     }
+}
+
+fn try_open_url(app: &App, layout: &LayoutRects, pos_x: u16, pos_y: u16) -> bool {
+    let Some(session) = app.active_session() else {
+        return false;
+    };
+    let (pane, outer) = match app.layout_mode {
+        LayoutMode::Split => {
+            if rect_contains(layout.claude, pos_x, pos_y) {
+                (session.claude.as_ref(), layout.claude)
+            } else if rect_contains(layout.shell, pos_x, pos_y) {
+                (session.shell.as_ref(), layout.shell)
+            } else {
+                return false;
+            }
+        }
+        LayoutMode::Tabbed => {
+            if !rect_contains(layout.claude, pos_x, pos_y) {
+                return false;
+            }
+            let pane = match app.focus {
+                Focus::Claude => session.claude.as_ref(),
+                Focus::Shell => session.shell.as_ref(),
+                _ => return false,
+            };
+            (pane, layout.claude)
+        }
+    };
+    let Some(pane) = pane else {
+        return false;
+    };
+    let inner = inset(outer);
+    if pos_x < inner.x || pos_y < inner.y {
+        return false;
+    }
+    let col = (pos_x - inner.x) as usize;
+    let row = (pos_y - inner.y) as usize;
+    if let Some(url) = pane.url_at(col, row) {
+        let _ = std::process::Command::new("xdg-open")
+            .arg(&url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        return true;
+    }
+    false
 }
 
 fn handle_sidebar_click(app: &mut App, sidebar: Rect, row: u16, body: Rect) {

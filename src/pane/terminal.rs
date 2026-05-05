@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::Term;
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Point};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config, TermMode};
+use alacritty_terminal::term::{Config, TermMode, viewport_to_point};
 use anyhow::{Context, Result};
 use portable_pty::PtySize;
 use ratatui::buffer::Buffer;
@@ -220,6 +221,34 @@ impl PtyPane {
             t.scroll_display(Scroll::Bottom);
         }
     }
+
+    /// Returns the URL (OSC 8 or plain text) at the given viewport cell
+    /// position, where (col, row) are 0-indexed within the terminal's visible
+    /// area (i.e. relative to the inner pane rect, not the screen).
+    pub fn url_at(&self, col: usize, row: usize) -> Option<String> {
+        let term = self.term.lock().ok()?;
+        let grid = term.grid();
+        let display_offset = grid.display_offset();
+        if row >= term.screen_lines() || col >= term.columns() {
+            return None;
+        }
+        let gp = viewport_to_point(display_offset, Point::new(row, Column(col)));
+        let cell = &grid[gp];
+
+        if let Some(link) = cell.hyperlink() {
+            let uri = link.uri().to_owned();
+            if !uri.is_empty() {
+                return Some(uri);
+            }
+        }
+
+        // Fall back to scanning the text on this line for a plain URL.
+        let cols = term.columns();
+        let line_chars: Vec<char> = (0..cols)
+            .map(|c| grid[viewport_to_point(display_offset, Point::new(row, Column(c)))].c)
+            .collect();
+        find_url_at(&line_chars, col)
+    }
 }
 
 impl Drop for PtyPane {
@@ -334,6 +363,38 @@ fn map_named(n: NamedColor, is_fg: bool) -> Color {
         DimWhite => Color::Gray,
         Cursor => Color::Reset,
     }
+}
+
+fn find_url_at(chars: &[char], col: usize) -> Option<String> {
+    if col >= chars.len() || !is_url_char(chars[col]) {
+        return None;
+    }
+    let mut start = col;
+    while start > 0 && is_url_char(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = col;
+    while end + 1 < chars.len() && is_url_char(chars[end + 1]) {
+        end += 1;
+    }
+    let candidate: String = chars[start..=end].iter().collect();
+    // Trim trailing punctuation that is unlikely to be part of the URL.
+    let candidate = candidate.trim_end_matches(|c: char| matches!(c, '.' | ',' | ')' | ']' | '>'));
+    for scheme in &["https://", "http://", "ftp://"] {
+        if let Some(pos) = candidate.find(scheme) {
+            return Some(candidate[pos..].to_string());
+        }
+    }
+    None
+}
+
+fn is_url_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            '-' | '.' | '_' | '~' | ':' | '/' | '?' | '#' | '[' | ']' | '@' | '!' | '$' | '&'
+                | '\'' | '(' | ')' | '*' | '+' | ',' | ';' | '=' | '%'
+        )
 }
 
 /// Helper used by ui/mod.rs to position the terminal cursor on screen.

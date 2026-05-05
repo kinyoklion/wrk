@@ -32,6 +32,9 @@ project. Linux-only, native rendering (via your terminal), built on
   time-since-output heuristic as fallback.
 - **Mouse**: click panes / tabs / projects to focus, double-click a project to
   open it, scroll wheel paginates the alacritty scrollback (10k lines).
+  **Ctrl+click** on a URL in a claude or shell pane opens it in the browser
+  (`xdg-open`). Works for OSC 8 hyperlinks and plain `http(s)://` / `ftp://`
+  URLs.
 - **Configurable claude command** for quirky setups (e.g. `steam-run claude
   --continue` on NixOS).
 
