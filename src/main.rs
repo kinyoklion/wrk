@@ -835,6 +835,45 @@ fn inset(r: Rect) -> Rect {
     }
 }
 
+/// Diagnostic: dump the currently-focused PTY's alacritty grid to a text
+/// file under `/tmp/`. The path is reported back via `app.error` so the
+/// status bar shows where the file landed.
+fn dump_focused_grid(app: &mut App) {
+    let project = app
+        .active_project_name
+        .clone()
+        .unwrap_or_else(|| "noproject".into());
+    let (label, pane_ref): (&str, Option<&pane::terminal::PtyPane>) = match app.focus {
+        Focus::Claude => ("claude", app.active_claude()),
+        Focus::Shell => ("shell", app.active_shell()),
+        Focus::Projects => {
+            push_error(&mut app.error, "dump: focus a claude or shell pane".into());
+            return;
+        }
+    };
+    let Some(pane) = pane_ref else {
+        push_error(&mut app.error, "dump: no live pane in focus".into());
+        return;
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let safe_project: String = project
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let path = std::path::PathBuf::from(format!("/tmp/wrk-dump-{ts}-{safe_project}-{label}.txt"));
+    match pane.dump_grid(&path) {
+        Ok(()) => {
+            push_error(&mut app.error, format!("dumped grid to {}", path.display()));
+        }
+        Err(e) => {
+            push_error(&mut app.error, format!("dump failed: {e}"));
+        }
+    }
+}
+
 fn handle_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
     if app.modal.is_some() {
         return handle_modal_key(app, key, body);
@@ -921,6 +960,11 @@ fn handle_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
             }
             KeyCode::Char('>') => {
                 app.next_claude_tab();
+                return Ok(());
+            }
+            // Diagnostic: dump the focused pane's grid to a file under /tmp.
+            KeyCode::Char('x') => {
+                dump_focused_grid(app);
                 return Ok(());
             }
             _ => {}
