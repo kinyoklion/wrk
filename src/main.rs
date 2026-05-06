@@ -303,6 +303,7 @@ impl App {
         }
 
         // Spawn any missing or dead claude panes.
+        let claude_content = claude_pane_split(claude_inner, session.claude_tabs.len()).1;
         for tab in &mut session.claude_tabs {
             let dead = tab.pane.as_mut().is_some_and(|p| p.child_finished());
             if tab.pane.is_none() || dead {
@@ -320,8 +321,8 @@ impl App {
                 let spawned = PtyPane::spawn(
                     &cmd,
                     &project.path,
-                    claude_inner.height,
-                    claude_inner.width,
+                    claude_content.height,
+                    claude_content.width,
                     &env,
                 );
                 match spawned {
@@ -358,7 +359,7 @@ impl App {
         // Resize live panes to current geometry (covers terminal resize while inactive).
         for tab in &mut session.claude_tabs {
             if let Some(p) = tab.pane.as_mut() {
-                let _ = p.resize(claude_inner.height, claude_inner.width);
+                let _ = p.resize(claude_content.height, claude_content.width);
             }
         }
         if let Some(p) = session.shell.as_mut() {
@@ -406,6 +407,14 @@ impl App {
         };
         let layout = compute_layout(body, self);
         let claude_inner = layout.claude_inner();
+        // After this spawn there will be at least one tab → strip will render →
+        // size the PTY to the post-strip content height.
+        let existing = self
+            .sessions
+            .get(&project_name)
+            .map(|s| s.claude_tabs.len())
+            .unwrap_or(0);
+        let claude_content = claude_pane_split(claude_inner, existing + 1).1;
 
         let Some(project_path) = self.active_project().map(|p| p.path.clone()) else {
             return;
@@ -428,8 +437,8 @@ impl App {
         let spawn_result = PtyPane::spawn(
             &cmd,
             &project_path,
-            claude_inner.height,
-            claude_inner.width,
+            claude_content.height,
+            claude_content.width,
             &env,
         );
         let spawn_time = if new_session && spawn_result.is_ok() {
@@ -707,9 +716,10 @@ fn event_loop(
 
         // Resize only the active session's panes; inactive sessions keep their grids.
         if let Some(session) = app.active_session_mut() {
+            let claude_content = claude_pane_split(claude_inner, session.claude_tabs.len()).1;
             for tab in &mut session.claude_tabs {
                 if let Some(p) = tab.pane.as_mut() {
-                    let _ = p.resize(claude_inner.height, claude_inner.width);
+                    let _ = p.resize(claude_content.height, claude_content.width);
                 }
             }
             if let Some(p) = session.shell.as_mut() {
@@ -832,6 +842,34 @@ fn inset(r: Rect) -> Rect {
         y: r.y + 1,
         width: r.width.saturating_sub(2),
         height: r.height.saturating_sub(2),
+    }
+}
+
+/// Splits the Claude pane's inner (post-border) area into the optional tab
+/// strip (top row, height 1) and the terminal content area below it. The
+/// strip is only present when there are tabs to display and the inner area
+/// is at least 2 rows tall.
+///
+/// Shared by the renderer (`ui::draw_claude_pane`), the resize loop, the PTY
+/// spawn sites, and the mouse click router so they all agree on where the
+/// strip lives and how much room is left for the embedded terminal.
+pub fn claude_pane_split(inner: Rect, tab_count: usize) -> (Option<Rect>, Rect) {
+    if tab_count > 0 && inner.height >= 2 {
+        let strip = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        };
+        let content = Rect {
+            x: inner.x,
+            y: inner.y + 1,
+            width: inner.width,
+            height: inner.height - 1,
+        };
+        (Some(strip), content)
+    } else {
+        (None, inner)
     }
 }
 
@@ -1214,6 +1252,18 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
         return;
     }
 
+    // Claude tab strip (per-session tabs at the top of the claude pane).
+    // Detect this *before* PTY forwarding so the click selects a tab instead
+    // of being sent to Claude as a mouse event.
+    if let Some(strip) = visible_claude_tab_strip(app, &layout)
+        && rect_contains(strip, pos_x, pos_y)
+    {
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            handle_claude_tab_click(app, strip, pos_x);
+        }
+        return;
+    }
+
     // Ctrl+left-click on a URL takes precedence over both PTY forwarding and
     // focus-switching.
     if let MouseEventKind::Down(MouseButton::Left) = m.kind
@@ -1288,7 +1338,18 @@ fn forward_mouse_to_pane(
         }
     };
 
-    let inner = inset(outer);
+    // For the claude pane, the actual terminal content lives below the per-
+    // session tab strip — adjust the inner rect so pane-local coords match
+    // the cells the user can actually see.
+    let inner = if target_focus == Focus::Claude {
+        let count = app
+            .active_session()
+            .map(|s| s.claude_tabs.len())
+            .unwrap_or(0);
+        claude_pane_split(inset(outer), count).1
+    } else {
+        inset(outer)
+    };
     if x < inner.x || y < inner.y || inner.width == 0 || inner.height == 0 {
         return false;
     }
@@ -1467,6 +1528,41 @@ fn handle_sidebar_click(app: &mut App, sidebar: Rect, row: u16, body: Rect) {
         app.open_selected(body);
         app.last_click = None;
     }
+}
+
+/// Returns the rect occupied by the Claude pane's per-session tab strip if it
+/// is currently rendered. The strip is on top of the claude inner area when
+/// there is at least one tab and the claude pane is visible (always in Split,
+/// only when focus is not Shell in Tabbed).
+fn visible_claude_tab_strip(app: &App, layout: &LayoutRects) -> Option<Rect> {
+    let session = app.active_session()?;
+    let count = session.claude_tabs.len();
+    if count == 0 {
+        return None;
+    }
+    if app.layout_mode == LayoutMode::Tabbed && app.focus == Focus::Shell {
+        return None;
+    }
+    claude_pane_split(inset(layout.claude), count).0
+}
+
+/// Switches the active Claude tab to the one under the click `x`, and gives
+/// the Claude pane focus.
+fn handle_claude_tab_click(app: &mut App, strip: Rect, x: u16) {
+    let Some(session) = app.active_session_mut() else {
+        return;
+    };
+    let n = session.claude_tabs.len();
+    if n == 0 || strip.width == 0 || x < strip.x {
+        return;
+    }
+    let tab_width = (strip.width as usize / n).max(1) as u16;
+    let mut idx = ((x - strip.x) / tab_width) as usize;
+    if idx >= n {
+        idx = n - 1;
+    }
+    session.active_claude = idx;
+    app.focus = Focus::Claude;
 }
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
