@@ -1,8 +1,10 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+
+use crate::session::DiscoveredSession;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddField {
@@ -133,6 +135,181 @@ impl ConfirmDeleteModal {
         Paragraph::new("y: confirm   n / Esc: cancel")
             .style(Style::default().fg(Color::DarkGray))
             .render(layout[2], buf);
+    }
+}
+
+/// Modal for picking which Claude session to attach to a new tab.
+///
+/// Index 0 is always the synthetic "New session" entry. Indices ≥ 1 are
+/// discovered on-disk sessions (newest first). The caller checks `confirmed`
+/// then reads `selected_session_id()` (None = new) and `tab_name`.
+#[derive(Debug, Clone)]
+pub struct ClaudeTabPickerModal {
+    /// None = "New session"; Some = a discovered session.
+    pub sessions: Vec<Option<DiscoveredSession>>,
+    pub selected_idx: usize,
+    pub tab_name: String,
+    pub name_focused: bool,
+    pub confirmed: bool,
+}
+
+impl ClaudeTabPickerModal {
+    pub fn new(discovered: &[DiscoveredSession]) -> Self {
+        let mut sessions: Vec<Option<DiscoveredSession>> = vec![None];
+        for s in discovered {
+            sessions.push(Some(s.clone()));
+        }
+        Self {
+            sessions,
+            selected_idx: 0,
+            tab_name: String::new(),
+            name_focused: false,
+            confirmed: false,
+        }
+    }
+
+    /// Session ID of the selected entry, or `None` for "New session".
+    pub fn selected_session_id(&self) -> Option<&str> {
+        self.sessions
+            .get(self.selected_idx)
+            .and_then(|o| o.as_ref())
+            .map(|s| s.session_id.as_str())
+    }
+
+    /// Suggested tab name: the session's stored name if one exists, otherwise
+    /// the first 8 chars of the session ID, or "new" for a new session.
+    pub fn suggested_name(&self) -> String {
+        match self
+            .sessions
+            .get(self.selected_idx)
+            .and_then(|o| o.as_ref())
+        {
+            Some(s) => s
+                .name
+                .clone()
+                .unwrap_or_else(|| s.session_id[..s.session_id.len().min(8)].to_string()),
+            None => "new".to_string(),
+        }
+    }
+
+    pub fn select_next(&mut self) {
+        if self.selected_idx + 1 < self.sessions.len() {
+            self.selected_idx += 1;
+        }
+    }
+
+    pub fn select_prev(&mut self) {
+        self.selected_idx = self.selected_idx.saturating_sub(1);
+    }
+
+    pub fn render(&self, area: Rect, buf: &mut Buffer) -> Position {
+        let popup = centered_rect(60, 70, area);
+        Clear.render(popup, buf);
+        let block = Block::default()
+            .title(" add claude session ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner = block.inner(popup);
+        block.render(popup, buf);
+
+        // Layout: name label + field, blank, session list, footer
+        let list_height = inner.height.saturating_sub(5).max(1);
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // label
+                Constraint::Length(1), // name input
+                Constraint::Length(1), // blank
+                Constraint::Length(list_height),
+                Constraint::Min(0),
+                Constraint::Length(1), // footer
+            ])
+            .split(inner);
+
+        let name_hint = if self.name_focused {
+            "tab name:"
+        } else {
+            "tab name (Tab to edit):"
+        };
+        Paragraph::new(name_hint).render(layout[0], buf);
+        let display_name = if self.name_focused || !self.tab_name.is_empty() {
+            self.tab_name.as_str()
+        } else {
+            // show suggested name greyed out when field is empty and unfocused
+            ""
+        };
+        let name_style = if self.name_focused {
+            field_style(true)
+        } else if self.tab_name.is_empty() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            field_style(false)
+        };
+        let name_display = if !self.name_focused && self.tab_name.is_empty() {
+            self.suggested_name()
+        } else {
+            display_name.to_string()
+        };
+        Paragraph::new(name_display)
+            .style(name_style)
+            .render(layout[1], buf);
+
+        // Session list
+        let list_area = layout[3];
+        let visible = list_area.height as usize;
+        let start = self.selected_idx.saturating_sub(visible.saturating_sub(1));
+        for (i, sess) in self.sessions.iter().enumerate().skip(start).take(visible) {
+            let y = list_area.y + (i - start) as u16;
+            if y >= list_area.y + list_area.height {
+                break;
+            }
+            let row = Rect {
+                y,
+                height: 1,
+                ..list_area
+            };
+            let label = match sess {
+                None => "  [ New session ]".to_string(),
+                Some(s) => match &s.name {
+                    Some(name) => format!(
+                        "  {name}  ({}…)",
+                        &s.session_id[..8.min(s.session_id.len())]
+                    ),
+                    None => format!("  {}", s.session_id),
+                },
+            };
+            let style = if i == self.selected_idx {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Paragraph::new(label).style(style).render(row, buf);
+        }
+
+        let footer = if self.name_focused {
+            "Enter/Esc: back to list"
+        } else {
+            "↑/↓: select   Tab: name   Enter: confirm   Esc: cancel"
+        };
+        Paragraph::new(footer)
+            .style(Style::default().fg(Color::DarkGray))
+            .render(layout[5], buf);
+
+        if self.name_focused {
+            let len = self.tab_name.chars().count() as u16;
+            Position {
+                x: layout[1].x + len.min(layout[1].width.saturating_sub(1)),
+                y: layout[1].y,
+            }
+        } else {
+            Position {
+                x: list_area.x,
+                y: list_area.y,
+            }
+        }
     }
 }
 

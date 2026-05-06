@@ -23,6 +23,14 @@ project. Linux-only, native rendering (via your terminal), built on
   embedded as PTYs. Switching projects keeps every prior session alive in the
   background; switching back resumes the existing grid + scrollback, no
   respawn.
+- **Multiple Claude sessions per project**: each project can hold any number of
+  named Claude tabs. Switch with `Alt+<` / `Alt+>`, open a new one with
+  `Alt+n` (session picker shows sessions discovered on disk), close the active
+  tab with `Alt+w`. Sessions are persisted in `projects.toml` so wrk resumes
+  the same conversations (`claude --resume <session-id>`) on restart.
+- **Multiple projects per directory**: project names are unique; paths need
+  not be, so you can have `wrk-feature` and `wrk-bugfix` both pointing at the
+  same directory with separate Claude sessions each.
 - **Two layouts per project, persisted**: split (claude | shell side-by-side,
   resizable) or tabbed (one content area, claude/shell as tabs). Stored in
   `projects.toml` as `layout = "split" | "tabbed"`.
@@ -85,6 +93,15 @@ The Nix flake provides the toolchain. Without Nix, any Rust ≥ 1.85 (edition
 | `r` | reload `projects.toml` from disk |
 | `q` | quit |
 
+**Claude session tabs (work from any pane):**
+
+| Key | Action |
+|---|---|
+| `Alt+n` | new Claude tab (session picker) |
+| `Alt+w` | close active Claude tab |
+| `Alt+<` | previous Claude tab |
+| `Alt+>` | next Claude tab |
+
 Anywhere else the pane has focus, all keys (including `Tab`) pass through to
 the embedded PTY child.
 
@@ -97,12 +114,19 @@ the embedded PTY child.
 name = "wrk"
 path = "/home/rlamb/projects/wrk"
 layout = "tabbed"   # optional, defaults to split
+claude_sessions = [
+  { name = "main",      session_id = "5d1f9f10-56bc-43f2-9dd5-ca711af4f3f9" },
+  { name = "refactor" },   # no session_id → uses --continue
+]
 
 [[project]]
 name = "notes-app"
 path = "/home/rlamb/projects/notes-app"
 tags = ["personal"]
 ```
+
+Multiple projects can share the same `path` — they are differentiated by name
+and each carries its own `claude_sessions` list.
 
 The TUI watches this file (notify-rs) and reloads on external edits.
 

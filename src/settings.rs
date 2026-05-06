@@ -28,6 +28,17 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// The Claude binary + wrapper args without any session flag.
+    /// Strips a trailing `--continue` if present so callers can append
+    /// `--continue` or `--resume <id>` as needed.
+    pub fn claude_base(&self) -> Vec<String> {
+        let mut cmd = self.claude_command.clone();
+        if cmd.last().map(|s| s == "--continue").unwrap_or(false) {
+            cmd.pop();
+        }
+        cmd
+    }
+
     pub fn shell(&self) -> Vec<String> {
         if let Some(cmd) = &self.shell_command
             && !cmd.is_empty()

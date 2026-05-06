@@ -1,5 +1,6 @@
 mod pane;
 mod proc;
+mod session;
 mod settings;
 mod status;
 mod store;
@@ -29,9 +30,9 @@ use ratatui::layout::Rect;
 use crate::pane::Focus;
 use crate::pane::terminal::PtyPane;
 use crate::settings::Settings;
-use crate::store::{LayoutMode, Project, ProjectStore};
+use crate::store::{LayoutMode, Project, ProjectStore, SessionRef};
 use crate::ui::ModalState;
-use crate::ui::modal::{AddProjectModal, ConfirmDeleteModal};
+use crate::ui::modal::{AddProjectModal, ClaudeTabPickerModal, ConfirmDeleteModal};
 
 #[derive(Parser)]
 #[command(
@@ -134,6 +135,7 @@ fn cmd_add(path: &Path, name: Option<String>) -> Result<()> {
         path: abs,
         tags: vec![],
         layout_mode: None,
+        claude_sessions: vec![],
     })?;
     store::save(&store)?;
     println!("added '{resolved_name}'");
@@ -148,10 +150,53 @@ fn cmd_rm(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// A single running (or dead) Claude tab within a project.
+pub struct ClaudeTab {
+    pub name: String,
+    /// Claude session UUID — used to resume the same conversation.
+    pub session_id: Option<String>,
+    /// Unique ID for this tab's `WRK_STATUS_FILE` (stable for the lifetime of
+    /// the tab, independent of the Claude session ID).
+    pub status_id: String,
+    pub pane: Option<PtyPane>,
+    /// True when this tab was spawned as a brand-new session (`claude` with no
+    /// args). We scan the filesystem after a short delay to capture the session
+    /// ID so we can persist it for future restarts.
+    pub detect_session_id: bool,
+    /// Wall-clock time at which the pane was spawned, used to find the right
+    /// session file when detecting the ID post-spawn.
+    pub spawn_time: Option<std::time::SystemTime>,
+}
+
+static TAB_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn new_status_id() -> String {
+    format!(
+        "tab{}",
+        TAB_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 #[derive(Default)]
 pub struct ProjectSession {
-    pub claude: Option<PtyPane>,
+    pub claude_tabs: Vec<ClaudeTab>,
+    pub active_claude: usize,
     pub shell: Option<PtyPane>,
+}
+
+impl ProjectSession {
+    pub fn active_claude_tab(&self) -> Option<&ClaudeTab> {
+        self.claude_tabs.get(self.active_claude)
+    }
+    pub fn active_claude_tab_mut(&mut self) -> Option<&mut ClaudeTab> {
+        self.claude_tabs.get_mut(self.active_claude)
+    }
+    pub fn active_claude_pane(&self) -> Option<&PtyPane> {
+        self.active_claude_tab()?.pane.as_ref()
+    }
+    pub fn active_claude_pane_mut(&mut self) -> Option<&mut PtyPane> {
+        self.active_claude_tab_mut()?.pane.as_mut()
+    }
 }
 
 pub struct App {
@@ -208,7 +253,7 @@ impl App {
     }
 
     pub fn active_claude(&self) -> Option<&PtyPane> {
-        self.active_session().and_then(|s| s.claude.as_ref())
+        self.active_session()?.active_claude_pane()
     }
 
     pub fn active_shell(&self) -> Option<&PtyPane> {
@@ -231,27 +276,64 @@ impl App {
 
         let session = self.sessions.entry(project.name.clone()).or_default();
 
-        // Spawn claude if missing or its child has died.
-        let claude_dead = session.claude.as_mut().is_some_and(|p| p.child_finished());
-        if session.claude.is_none() || claude_dead {
-            let status_file = status::status_file_for(&project.name);
-            let claude_env = vec![(
-                "WRK_STATUS_FILE".to_string(),
-                status_file.to_string_lossy().into_owned(),
-            )];
-            session.claude = match PtyPane::spawn(
-                &self.settings.claude_command,
-                &project.path,
-                claude_inner.height,
-                claude_inner.width,
-                &claude_env,
-            ) {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    push_error(&mut self.error, format!("claude spawn failed: {e}"));
-                    None
+        // Build the initial set of tabs from the project's configured sessions
+        // (if none configured, fall back to one default --continue tab).
+        if session.claude_tabs.is_empty() {
+            if project.claude_sessions.is_empty() {
+                session.claude_tabs.push(ClaudeTab {
+                    name: "claude".to_string(),
+                    session_id: None,
+                    status_id: new_status_id(),
+                    pane: None,
+                    detect_session_id: false,
+                    spawn_time: None,
+                });
+            } else {
+                for sr in &project.claude_sessions {
+                    session.claude_tabs.push(ClaudeTab {
+                        name: sr.name.clone(),
+                        session_id: sr.session_id.clone(),
+                        status_id: new_status_id(),
+                        pane: None,
+                        detect_session_id: false,
+                        spawn_time: None,
+                    });
                 }
-            };
+            }
+        }
+
+        // Spawn any missing or dead claude panes.
+        for tab in &mut session.claude_tabs {
+            let dead = tab.pane.as_mut().is_some_and(|p| p.child_finished());
+            if tab.pane.is_none() || dead {
+                let cmd = claude_command(
+                    &self.settings,
+                    tab.session_id.as_deref(),
+                    false,
+                    &project.path,
+                );
+                let status_path = status::status_file_for_tab(&tab.status_id);
+                let env = vec![(
+                    "WRK_STATUS_FILE".to_string(),
+                    status_path.to_string_lossy().into_owned(),
+                )];
+                let spawned = PtyPane::spawn(
+                    &cmd,
+                    &project.path,
+                    claude_inner.height,
+                    claude_inner.width,
+                    &env,
+                );
+                match spawned {
+                    Ok(p) => {
+                        if tab.detect_session_id {
+                            tab.spawn_time = Some(std::time::SystemTime::now());
+                        }
+                        tab.pane = Some(p);
+                    }
+                    Err(e) => push_error(&mut self.error, format!("claude spawn failed: {e}")),
+                }
+            }
         }
 
         // Spawn shell if missing or dead.
@@ -274,8 +356,10 @@ impl App {
         }
 
         // Resize live panes to current geometry (covers terminal resize while inactive).
-        if let Some(p) = session.claude.as_mut() {
-            let _ = p.resize(claude_inner.height, claude_inner.width);
+        for tab in &mut session.claude_tabs {
+            if let Some(p) = tab.pane.as_mut() {
+                let _ = p.resize(claude_inner.height, claude_inner.width);
+            }
         }
         if let Some(p) = session.shell.as_mut() {
             let _ = p.resize(shell_inner.height, shell_inner.width);
@@ -313,6 +397,138 @@ impl App {
         Ok(())
     }
 
+    /// Add a new Claude tab to the active project.
+    /// `session_id = None` → fresh `claude` session (ID detected post-spawn).
+    /// `session_id = Some(id)` → `claude --resume <id>`.
+    fn add_claude_tab(&mut self, name: String, session_id: Option<String>, body: Rect) {
+        let Some(project_name) = self.active_project_name.clone() else {
+            return;
+        };
+        let layout = compute_layout(body, self);
+        let claude_inner = layout.claude_inner();
+
+        let Some(project_path) = self.active_project().map(|p| p.path.clone()) else {
+            return;
+        };
+
+        let new_session = session_id.is_none();
+        let cmd = claude_command(
+            &self.settings,
+            session_id.as_deref(),
+            new_session,
+            &project_path,
+        );
+        let status_id = new_status_id();
+        let status_path = status::status_file_for_tab(&status_id);
+        let env = vec![(
+            "WRK_STATUS_FILE".to_string(),
+            status_path.to_string_lossy().into_owned(),
+        )];
+
+        let spawn_result = PtyPane::spawn(
+            &cmd,
+            &project_path,
+            claude_inner.height,
+            claude_inner.width,
+            &env,
+        );
+        let spawn_time = if new_session && spawn_result.is_ok() {
+            Some(std::time::SystemTime::now())
+        } else {
+            None
+        };
+        let pane = match spawn_result {
+            Ok(p) => Some(p),
+            Err(e) => {
+                push_error(&mut self.error, format!("claude spawn failed: {e}"));
+                None
+            }
+        };
+
+        let session = self.sessions.entry(project_name.clone()).or_default();
+        session.claude_tabs.push(ClaudeTab {
+            name,
+            session_id: session_id.clone(),
+            status_id,
+            pane,
+            detect_session_id: new_session,
+            spawn_time,
+        });
+        let new_idx = session.claude_tabs.len() - 1;
+        session.active_claude = new_idx;
+
+        // Persist to store.
+        self.persist_claude_sessions(&project_name);
+    }
+
+    /// Close (kill) the currently active Claude tab.  If it is the only tab,
+    /// does nothing — a project always keeps at least one tab.
+    fn close_active_claude_tab(&mut self) {
+        let Some(project_name) = self.active_project_name.clone() else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&project_name) else {
+            return;
+        };
+        if session.claude_tabs.len() <= 1 {
+            return;
+        }
+        session.claude_tabs.remove(session.active_claude);
+        if session.active_claude >= session.claude_tabs.len() {
+            session.active_claude = session.claude_tabs.len() - 1;
+        }
+        self.persist_claude_sessions(&project_name);
+    }
+
+    fn next_claude_tab(&mut self) {
+        let Some(session) = self.active_session_mut() else {
+            return;
+        };
+        if session.claude_tabs.len() > 1 {
+            session.active_claude = (session.active_claude + 1) % session.claude_tabs.len();
+        }
+    }
+
+    fn prev_claude_tab(&mut self) {
+        let Some(session) = self.active_session_mut() else {
+            return;
+        };
+        if session.claude_tabs.len() > 1 {
+            let n = session.claude_tabs.len();
+            session.active_claude = (session.active_claude + n - 1) % n;
+        }
+    }
+
+    /// Write the current set of Claude tabs back to the project store and save.
+    fn persist_claude_sessions(&mut self, project_name: &str) {
+        let tabs = match self.sessions.get(project_name) {
+            Some(s) => s
+                .claude_tabs
+                .iter()
+                .map(|t| SessionRef {
+                    name: t.name.clone(),
+                    session_id: t.session_id.clone(),
+                })
+                .collect::<Vec<_>>(),
+            None => return,
+        };
+        if let Some(p) = self
+            .store
+            .projects
+            .iter_mut()
+            .find(|p| p.name == project_name)
+        {
+            // Don't save the synthetic single default tab with no session_id
+            // (that's the backwards-compat case — keep the TOML clean).
+            let is_default_single =
+                tabs.len() == 1 && tabs[0].name == "claude" && tabs[0].session_id.is_none();
+            p.claude_sessions = if is_default_single { vec![] } else { tabs };
+        }
+        if let Err(e) = store::save(&self.store) {
+            push_error(&mut self.error, format!("save failed: {e}"));
+        }
+    }
+
     /// Set the current layout mode and persist it on the active project.
     fn set_layout_mode(&mut self, mode: LayoutMode) {
         self.layout_mode = mode;
@@ -329,6 +545,82 @@ impl App {
         if changed && let Err(e) = store::save(&self.store) {
             push_error(&mut self.error, format!("save failed: {e}"));
         }
+    }
+}
+
+/// Build the claude launch command for a tab.
+///  - `session_id = Some(id)` → `claude --resume <id>`
+///  - `new_session = true`    → `claude` (no args; start a fresh session)
+///  - otherwise              → `claude --continue` only when prior sessions
+///    exist on disk; bare `claude` for a new project
+fn claude_command(
+    settings: &Settings,
+    session_id: Option<&str>,
+    new_session: bool,
+    project_path: &std::path::Path,
+) -> Vec<String> {
+    let mut cmd = settings.claude_base();
+    match session_id {
+        Some(id) => {
+            cmd.push("--resume".to_string());
+            cmd.push(id.to_string());
+        }
+        None if new_session => {
+            // bare `claude` — Claude will create a fresh session
+        }
+        None => {
+            // Use --continue only when a prior session actually exists; if the
+            // project is brand-new there is nothing to continue and --continue
+            // may exit immediately.
+            if !session::discover_sessions(project_path).is_empty() {
+                cmd.push("--continue".to_string());
+            }
+        }
+    }
+    cmd
+}
+
+/// For tabs spawned as new sessions, try to find the session ID that Claude
+/// created on disk. We wait at least 3 s after spawn to give Claude time to
+/// write its session file, then scan the project's session directory.
+fn detect_new_session_ids(app: &mut App) {
+    let Some(project_name) = app.active_project_name.clone() else {
+        return;
+    };
+    let Some(project_path) = app.active_project().map(|p| p.path.clone()) else {
+        return;
+    };
+    let Some(session) = app.sessions.get_mut(&project_name) else {
+        return;
+    };
+
+    let mut any_detected = false;
+    for tab in &mut session.claude_tabs {
+        if !tab.detect_session_id || tab.session_id.is_some() {
+            continue;
+        }
+        let Some(spawn_time) = tab.spawn_time else {
+            continue;
+        };
+        let elapsed = spawn_time.elapsed().unwrap_or_default();
+        if elapsed < Duration::from_secs(3) {
+            continue;
+        }
+        if let Some(id) = session::find_session_created_after(&project_path, spawn_time) {
+            tab.session_id = Some(id);
+            tab.detect_session_id = false;
+            tab.spawn_time = None;
+            any_detected = true;
+        } else if elapsed > Duration::from_secs(30) {
+            // Give up waiting after 30 s.
+            tab.detect_session_id = false;
+            tab.spawn_time = None;
+        }
+    }
+
+    if any_detected {
+        let project_name = project_name.clone();
+        app.persist_claude_sessions(&project_name);
     }
 }
 
@@ -415,8 +707,10 @@ fn event_loop(
 
         // Resize only the active session's panes; inactive sessions keep their grids.
         if let Some(session) = app.active_session_mut() {
-            if let Some(p) = session.claude.as_mut() {
-                let _ = p.resize(claude_inner.height, claude_inner.width);
+            for tab in &mut session.claude_tabs {
+                if let Some(p) = tab.pane.as_mut() {
+                    let _ = p.resize(claude_inner.height, claude_inner.width);
+                }
             }
             if let Some(p) = session.shell.as_mut() {
                 let _ = p.resize(shell_inner.height, shell_inner.width);
@@ -443,12 +737,15 @@ fn event_loop(
             }
         }
 
+        // Try to detect the session ID for newly-spawned "new session" tabs.
+        detect_new_session_ids(app);
+
         // Reap dead children on the active session so the placeholder shows.
         if let Some(session) = app.active_session_mut() {
-            if let Some(p) = session.claude.as_mut()
-                && p.child_finished()
-            {
-                session.claude = None;
+            for tab in &mut session.claude_tabs {
+                if tab.pane.as_mut().is_some_and(|p| p.child_finished()) {
+                    tab.pane = None;
+                }
             }
             if let Some(p) = session.shell.as_mut()
                 && p.child_finished()
@@ -592,6 +889,40 @@ fn handle_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                 }
                 return Ok(());
             }
+            // Claude tab management (works from any pane).
+            KeyCode::Char('n') if app.active_project_name.is_some() => {
+                let discovered = app
+                    .active_project()
+                    .map(|p| {
+                        let known: std::collections::HashMap<String, String> = p
+                            .claude_sessions
+                            .iter()
+                            .filter_map(|sr| {
+                                sr.session_id
+                                    .as_ref()
+                                    .map(|id| (id.clone(), sr.name.clone()))
+                            })
+                            .collect();
+                        session::discover_sessions_named(&p.path, &known)
+                    })
+                    .unwrap_or_default();
+                app.modal = Some(ModalState::ClaudeTabPicker(ClaudeTabPickerModal::new(
+                    &discovered,
+                )));
+                return Ok(());
+            }
+            KeyCode::Char('w') => {
+                app.close_active_claude_tab();
+                return Ok(());
+            }
+            KeyCode::Char('<') => {
+                app.prev_claude_tab();
+                return Ok(());
+            }
+            KeyCode::Char('>') => {
+                app.next_claude_tab();
+                return Ok(());
+            }
             _ => {}
         }
     }
@@ -600,7 +931,7 @@ fn handle_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
         Focus::Projects => handle_projects_key(app, key, body),
         Focus::Claude => {
             if let Some(session) = app.active_session_mut()
-                && let Some(pane) = session.claude.as_mut()
+                && let Some(pane) = session.active_claude_pane_mut()
             {
                 let bytes = pane::key_to_bytes(key, pane.app_cursor_mode());
                 if !bytes.is_empty() {
@@ -687,7 +1018,7 @@ fn handle_filter_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
     Ok(())
 }
 
-fn handle_modal_key(app: &mut App, key: KeyEvent, _body: Rect) -> Result<()> {
+fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
     let mut consumed_modal = None;
     match app.modal.as_mut().unwrap() {
         ModalState::Add(m) => match key.code {
@@ -723,6 +1054,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, _body: Rect) -> Result<()> {
                         path: abs,
                         tags: vec![],
                         layout_mode: None,
+                        claude_sessions: vec![],
                     })?;
                     store::save(&store)?;
                     Ok(())
@@ -751,9 +1083,50 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, _body: Rect) -> Result<()> {
             }
             _ => {}
         },
+        ModalState::ClaudeTabPicker(m) => {
+            if m.name_focused {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Tab => m.name_focused = false,
+                    KeyCode::Backspace => {
+                        m.tab_name.pop();
+                    }
+                    KeyCode::Char(c) => m.tab_name.push(c),
+                    KeyCode::Enter => {
+                        m.confirmed = true;
+                        consumed_modal = Some(());
+                    }
+                    _ => {}
+                }
+            } else {
+                match key.code {
+                    KeyCode::Esc => consumed_modal = Some(()),
+                    KeyCode::Tab => m.name_focused = true,
+                    KeyCode::Up => m.select_prev(),
+                    KeyCode::Down => m.select_next(),
+                    KeyCode::Enter => {
+                        m.confirmed = true;
+                        consumed_modal = Some(());
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
     if consumed_modal.is_some() {
-        app.modal = None;
+        // Consume the ClaudeTabPicker result before clearing the modal.
+        if let Some(ModalState::ClaudeTabPicker(m)) = app.modal.take() {
+            if m.confirmed {
+                let session_id = m.selected_session_id().map(|s| s.to_owned());
+                let name = if m.tab_name.trim().is_empty() {
+                    m.suggested_name()
+                } else {
+                    m.tab_name.trim().to_string()
+                };
+                app.add_claude_tab(name, session_id, body);
+            }
+        } else {
+            app.modal = None;
+        }
     }
     Ok(())
 }
@@ -835,7 +1208,7 @@ fn scroll_at(app: &App, layout: &LayoutRects, x: u16, y: u16, delta: i32) {
     let pane = match app.layout_mode {
         LayoutMode::Split => {
             if rect_contains(layout.claude, x, y) {
-                session.claude.as_ref()
+                session.active_claude_pane()
             } else if rect_contains(layout.shell, x, y) {
                 session.shell.as_ref()
             } else {
@@ -847,7 +1220,7 @@ fn scroll_at(app: &App, layout: &LayoutRects, x: u16, y: u16, delta: i32) {
                 None
             } else {
                 match app.focus {
-                    Focus::Claude => session.claude.as_ref(),
+                    Focus::Claude => session.active_claude_pane(),
                     Focus::Shell => session.shell.as_ref(),
                     _ => None,
                 }
@@ -866,7 +1239,7 @@ fn try_open_url(app: &App, layout: &LayoutRects, pos_x: u16, pos_y: u16) -> bool
     let (pane, outer) = match app.layout_mode {
         LayoutMode::Split => {
             if rect_contains(layout.claude, pos_x, pos_y) {
-                (session.claude.as_ref(), layout.claude)
+                (session.active_claude_pane(), layout.claude)
             } else if rect_contains(layout.shell, pos_x, pos_y) {
                 (session.shell.as_ref(), layout.shell)
             } else {
@@ -878,7 +1251,7 @@ fn try_open_url(app: &App, layout: &LayoutRects, pos_x: u16, pos_y: u16) -> bool
                 return false;
             }
             let pane = match app.focus {
-                Focus::Claude => session.claude.as_ref(),
+                Focus::Claude => session.active_claude_pane(),
                 Focus::Shell => session.shell.as_ref(),
                 _ => return false,
             };

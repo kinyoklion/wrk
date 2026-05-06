@@ -45,12 +45,14 @@ pub fn ensure_status_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-pub fn status_file_for(project_name: &str) -> PathBuf {
-    status_dir().join(format!("{}.status", sanitize(project_name)))
+/// Status file path for an individual Claude tab, keyed by a runtime-assigned
+/// `tab_status_id` (an opaque string unique per spawned tab).
+pub fn status_file_for_tab(tab_status_id: &str) -> PathBuf {
+    status_dir().join(format!("{}.status", sanitize(tab_status_id)))
 }
 
-pub fn read_status(project_name: &str) -> Option<HookEvent> {
-    let path = status_file_for(project_name);
+pub fn read_tab_status(tab_status_id: &str) -> Option<HookEvent> {
+    let path = status_file_for_tab(tab_status_id);
     let content = fs::read_to_string(&path).ok()?;
     parse_event(content.trim())
 }
