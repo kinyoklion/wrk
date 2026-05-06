@@ -263,6 +263,65 @@ impl PtyPane {
             .collect();
         find_url_at(&line_chars, col)
     }
+
+    /// Write a textual snapshot of this pane's alacritty grid to `path`.
+    /// Used to diagnose rendering bugs — captures dimensions, the active
+    /// `TermMode` flags, the visible content per row (with control chars
+    /// rendered as `?`), and a per-cell breakdown of every cell whose flags
+    /// are non-default. The format is plain text, one line per logical entry.
+    pub fn dump_grid(&self, path: &std::path::Path) -> Result<()> {
+        let term = self
+            .term
+            .lock()
+            .map_err(|_| anyhow::anyhow!("term mutex poisoned"))?;
+        let grid = term.grid();
+        let cols = term.columns();
+        let lines = term.screen_lines();
+        let display_offset = grid.display_offset();
+        let mode = term.mode();
+
+        let mut out = String::new();
+        out.push_str(&format!(
+            "wrk grid dump\nrows={lines} cols={cols} display_offset={display_offset}\nmode={mode:?}\n\n"
+        ));
+
+        // Visible content, row by row.
+        out.push_str("--- visible content ---\n");
+        for row in 0..lines {
+            let mut line = String::with_capacity(cols);
+            for col in 0..cols {
+                let gp = viewport_to_point(display_offset, Point::new(row, Column(col)));
+                let cell = &grid[gp];
+                let c = if cell.c.is_control() { '?' } else { cell.c };
+                line.push(c);
+            }
+            out.push_str(&format!("{row:3}: |{line}|\n"));
+        }
+
+        // Per-cell detail for cells with non-default flags or zero-width data.
+        out.push_str("\n--- non-default cells ---\n");
+        for row in 0..lines {
+            for col in 0..cols {
+                let gp = viewport_to_point(display_offset, Point::new(row, Column(col)));
+                let cell = &grid[gp];
+                let zw_count = cell.zerowidth().map(|z| z.len()).unwrap_or(0);
+                if cell.flags.is_empty() && zw_count == 0 && !cell.c.is_control() {
+                    continue;
+                }
+                out.push_str(&format!(
+                    "{row:3},{col:3}: c={:?} flags={:?} zw={zw_count}\n",
+                    cell.c, cell.flags
+                ));
+            }
+        }
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        std::fs::write(path, out).with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
 }
 
 impl Drop for PtyPane {
@@ -300,7 +359,35 @@ impl<'a> Widget for PtyPaneWidget<'a> {
                 continue;
             }
             let cell_buf = &mut buf[(x, y)];
-            cell_buf.set_symbol(&cell.c.to_string());
+
+            // The right half of a wide character (and the leading-spacer column-0
+            // variant introduced by line wrap) is owned by the wide-char cell to
+            // its left. Marking it `skip` keeps ratatui's diff from emitting it
+            // as a separate update, which would otherwise leave a stale glyph in
+            // the trailing cell whenever the wide char shifts to a different
+            // column or disappears.
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                cell_buf.set_skip(true);
+                continue;
+            }
+            cell_buf.set_skip(false);
+
+            // Build the symbol: base char plus any zero-width combining marks
+            // that alacritty stored on the cell. Replace control chars (which
+            // shouldn't reach a cell, but defensively) with a space so we never
+            // emit raw escape bytes through ratatui.
+            let mut symbol = String::new();
+            let base = if cell.c.is_control() { ' ' } else { cell.c };
+            symbol.push(base);
+            if let Some(zw) = cell.zerowidth() {
+                for c in zw {
+                    symbol.push(*c);
+                }
+            }
+            cell_buf.set_symbol(&symbol);
             cell_buf.set_style(cell_style(cell.fg, cell.bg, cell.flags));
         }
     }
