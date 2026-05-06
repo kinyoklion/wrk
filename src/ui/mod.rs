@@ -15,7 +15,7 @@ use crate::pane::terminal::PtyPaneWidget;
 use crate::status::{self, HookEvent};
 use crate::store::LayoutMode;
 use crate::ui::projects::ProjectStatus;
-use crate::{App, ClaudeTab, ProjectSession, compute_layout};
+use crate::{App, ClaudeTab, ProjectSession, claude_pane_split, compute_layout};
 
 const WAITING_THRESHOLD: Duration = Duration::from_millis(500);
 
@@ -162,16 +162,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // For the claude pane we must account for the 1-row tab strip.
     let claude_content_area = {
         let inner = inner_area(layout.claude);
-        let has_strip = claude_tabs.is_some_and(|t| !t.is_empty()) && inner.height >= 2;
-        if has_strip {
-            Rect {
-                y: inner.y + 1,
-                height: inner.height.saturating_sub(1),
-                ..inner
-            }
-        } else {
-            inner
-        }
+        let count = claude_tabs.map(|t| t.len()).unwrap_or(0);
+        claude_pane_split(inner, count).1
     };
     match app.focus {
         Focus::Claude => {
@@ -215,17 +207,8 @@ fn draw_claude_pane(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let show_tab_strip = tabs.is_some_and(|t| !t.is_empty());
-
-    let (tab_strip_area, content_area) = if show_tab_strip && inner.height >= 2 {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(0)])
-            .split(inner);
-        (Some(rows[0]), rows[1])
-    } else {
-        (None, inner)
-    };
+    let tab_count = tabs.map(|t| t.len()).unwrap_or(0);
+    let (tab_strip_area, content_area) = claude_pane_split(inner, tab_count);
 
     if let (Some(strip_area), Some(tabs)) = (tab_strip_area, tabs) {
         draw_claude_tab_strip(frame, strip_area, tabs, active_idx);
