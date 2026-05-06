@@ -197,6 +197,20 @@ impl PtyPane {
             .unwrap_or(false)
     }
 
+    /// Snapshot of the terminal's current mouse-reporting flags.
+    pub fn mouse_mode(&self) -> super::MouseMode {
+        let Ok(term) = self.term.lock() else {
+            return super::MouseMode::default();
+        };
+        let m = term.mode();
+        super::MouseMode {
+            report_click: m.contains(TermMode::MOUSE_REPORT_CLICK),
+            drag: m.contains(TermMode::MOUSE_DRAG),
+            motion: m.contains(TermMode::MOUSE_MOTION),
+            sgr: m.contains(TermMode::SGR_MOUSE),
+        }
+    }
+
     /// Time elapsed since the most recent byte of PTY output.
     pub fn idle_for(&self) -> Duration {
         self.last_output
