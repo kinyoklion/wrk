@@ -1,6 +1,6 @@
 pub mod terminal;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -115,5 +115,223 @@ pub fn key_to_bytes(key: KeyEvent, app_cursor: bool) -> Vec<u8> {
         out
     } else {
         base
+    }
+}
+
+/// Snapshot of the embedded terminal's mouse-reporting state. Together these
+/// flags determine which incoming mouse events should be encoded and forwarded
+/// to the PTY child (and in which wire format).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MouseMode {
+    /// `CSI ? 1000 h` — report button presses and releases.
+    pub report_click: bool,
+    /// `CSI ? 1002 h` — also report motion while a button is held.
+    pub drag: bool,
+    /// `CSI ? 1003 h` — report all motion (with or without buttons).
+    pub motion: bool,
+    /// `CSI ? 1006 h` — encode events with SGR escape sequences instead of
+    /// the legacy single-byte form.
+    pub sgr: bool,
+}
+
+impl MouseMode {
+    /// True when any reporting mode is active.
+    pub fn any(&self) -> bool {
+        self.report_click || self.drag || self.motion
+    }
+}
+
+/// Encode a crossterm `MouseEvent` as the byte sequence the PTY's child
+/// program expects. `cx`/`cy` are 1-based pane-local coordinates (i.e. column
+/// 1 is the leftmost cell of the inner content area).
+///
+/// Returns an empty `Vec` for event kinds that don't translate (e.g. plain
+/// motion when no mouse mode is active — the caller is expected to gate on
+/// `MouseMode` first).
+pub fn mouse_to_bytes(event: MouseEvent, cx: u16, cy: u16, mode: MouseMode) -> Vec<u8> {
+    let mods = event.modifiers;
+    let mut mod_bits: u32 = 0;
+    if mods.contains(KeyModifiers::SHIFT) {
+        mod_bits |= 4;
+    }
+    if mods.contains(KeyModifiers::ALT) {
+        mod_bits |= 8;
+    }
+    if mods.contains(KeyModifiers::CONTROL) {
+        mod_bits |= 16;
+    }
+
+    let button_code = |b: MouseButton| -> u32 {
+        match b {
+            MouseButton::Left => 0,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+        }
+    };
+
+    let (cb, released) = match event.kind {
+        MouseEventKind::Down(b) => (button_code(b), false),
+        MouseEventKind::Up(b) => (button_code(b), true),
+        MouseEventKind::Drag(b) => (button_code(b) | 32, false),
+        // X10 button code 3 means "no button"; combined with the motion bit
+        // this is the conventional "any-event" motion report.
+        MouseEventKind::Moved => (3 | 32, false),
+        MouseEventKind::ScrollUp => (64, false),
+        MouseEventKind::ScrollDown => (65, false),
+        MouseEventKind::ScrollLeft => (66, false),
+        MouseEventKind::ScrollRight => (67, false),
+    };
+    let cb = cb | mod_bits;
+
+    if mode.sgr {
+        let final_byte = if released { 'm' } else { 'M' };
+        format!("\x1b[<{cb};{cx};{cy}{final_byte}").into_bytes()
+    } else {
+        // Legacy X10: ESC [ M  Cb  Cx  Cy  with each byte offset by 32. On
+        // release X10 reports button 3. Coordinates beyond 223 wrap; we
+        // clamp to keep the bytes valid.
+        let cb_byte = (if released { 3 + mod_bits } else { cb }).min(223) as u8 + 32;
+        let cx_byte = (cx.min(223) as u8).saturating_add(32);
+        let cy_byte = (cy.min(223) as u8).saturating_add(32);
+        vec![0x1b, b'[', b'M', cb_byte, cx_byte, cy_byte]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyModifiers, MouseEvent};
+
+    fn ev(kind: MouseEventKind, mods: KeyModifiers) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: mods,
+        }
+    }
+
+    #[test]
+    fn sgr_left_press() {
+        let m = MouseMode {
+            report_click: true,
+            sgr: true,
+            ..MouseMode::default()
+        };
+        let bytes = mouse_to_bytes(
+            ev(MouseEventKind::Down(MouseButton::Left), KeyModifiers::NONE),
+            10,
+            5,
+            m,
+        );
+        assert_eq!(bytes, b"\x1b[<0;10;5M");
+    }
+
+    #[test]
+    fn sgr_left_release_uses_lowercase_m() {
+        let m = MouseMode {
+            report_click: true,
+            sgr: true,
+            ..MouseMode::default()
+        };
+        let bytes = mouse_to_bytes(
+            ev(MouseEventKind::Up(MouseButton::Left), KeyModifiers::NONE),
+            10,
+            5,
+            m,
+        );
+        assert_eq!(bytes, b"\x1b[<0;10;5m");
+    }
+
+    #[test]
+    fn sgr_drag_sets_motion_bit() {
+        let m = MouseMode {
+            drag: true,
+            sgr: true,
+            ..MouseMode::default()
+        };
+        let bytes = mouse_to_bytes(
+            ev(MouseEventKind::Drag(MouseButton::Left), KeyModifiers::NONE),
+            7,
+            3,
+            m,
+        );
+        // 0 (left) | 32 (motion) = 32.
+        assert_eq!(bytes, b"\x1b[<32;7;3M");
+    }
+
+    #[test]
+    fn sgr_motion_no_button() {
+        let m = MouseMode {
+            motion: true,
+            sgr: true,
+            ..MouseMode::default()
+        };
+        let bytes = mouse_to_bytes(ev(MouseEventKind::Moved, KeyModifiers::NONE), 4, 2, m);
+        // 3 (no button) | 32 (motion) = 35.
+        assert_eq!(bytes, b"\x1b[<35;4;2M");
+    }
+
+    #[test]
+    fn sgr_wheel_up() {
+        let m = MouseMode {
+            report_click: true,
+            sgr: true,
+            ..MouseMode::default()
+        };
+        let bytes = mouse_to_bytes(ev(MouseEventKind::ScrollUp, KeyModifiers::NONE), 1, 1, m);
+        assert_eq!(bytes, b"\x1b[<64;1;1M");
+    }
+
+    #[test]
+    fn sgr_modifiers_or_into_button_code() {
+        let m = MouseMode {
+            report_click: true,
+            sgr: true,
+            ..MouseMode::default()
+        };
+        let bytes = mouse_to_bytes(
+            ev(
+                MouseEventKind::Down(MouseButton::Left),
+                KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+            ),
+            1,
+            1,
+            m,
+        );
+        // 0 (left) | 4 (shift) | 16 (ctrl) = 20.
+        assert_eq!(bytes, b"\x1b[<20;1;1M");
+    }
+
+    #[test]
+    fn x10_left_press_at_origin() {
+        let m = MouseMode {
+            report_click: true,
+            ..MouseMode::default()
+        };
+        let bytes = mouse_to_bytes(
+            ev(MouseEventKind::Down(MouseButton::Left), KeyModifiers::NONE),
+            1,
+            1,
+            m,
+        );
+        // ESC [ M, button 0+32=32 (' '), col 1+32=33 ('!'), row 1+32=33 ('!').
+        assert_eq!(bytes, b"\x1b[M !!");
+    }
+
+    #[test]
+    fn x10_release_uses_button_three() {
+        let m = MouseMode {
+            report_click: true,
+            ..MouseMode::default()
+        };
+        let bytes = mouse_to_bytes(
+            ev(MouseEventKind::Up(MouseButton::Left), KeyModifiers::NONE),
+            1,
+            1,
+            m,
+        );
+        // Button 3+32=35 ('#').
+        assert_eq!(bytes, b"\x1b[M#!!");
     }
 }

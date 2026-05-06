@@ -1145,13 +1145,48 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
     let pos_x = m.column;
     let pos_y = m.row;
 
+    // Sidebar clicks always belong to us, never to a PTY.
+    if let Some(sidebar) = layout.sidebar
+        && rect_contains(sidebar, pos_x, pos_y)
+    {
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            handle_sidebar_click(app, sidebar, pos_y, body);
+        }
+        return;
+    }
+
+    // Tab strip (Tabbed mode) — switch focus on click, ignore everything else.
+    if let Some(strip) = layout.tab_strip
+        && rect_contains(strip, pos_x, pos_y)
+    {
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            let half = strip.width / 2;
+            if pos_x < strip.x + half {
+                app.focus = Focus::Claude;
+            } else {
+                app.focus = Focus::Shell;
+            }
+        }
+        return;
+    }
+
+    // Ctrl+left-click on a URL takes precedence over both PTY forwarding and
+    // focus-switching.
+    if let MouseEventKind::Down(MouseButton::Left) = m.kind
+        && m.modifiers.contains(KeyModifiers::CONTROL)
+        && try_open_url(app, &layout, pos_x, pos_y)
+    {
+        return;
+    }
+
+    // Forward to a PTY when its embedded program has enabled mouse reporting.
+    if forward_mouse_to_pane(app, &layout, m, pos_x, pos_y) {
+        return;
+    }
+
+    // Fallback: existing focus-on-click / scrollback behavior.
     match m.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if m.modifiers.contains(KeyModifiers::CONTROL)
-                && try_open_url(app, &layout, pos_x, pos_y)
-            {
-                return;
-            }
             handle_left_click(app, &layout, body, pos_x, pos_y);
         }
         MouseEventKind::ScrollUp => {
@@ -1164,27 +1199,112 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
     }
 }
 
-fn handle_left_click(app: &mut App, layout: &LayoutRects, body: Rect, pos_x: u16, pos_y: u16) {
-    if let Some(sidebar_rect) = layout.sidebar
-        && rect_contains(sidebar_rect, pos_x, pos_y)
-    {
-        handle_sidebar_click(app, sidebar_rect, pos_y, body);
-        return;
-    }
-
-    // Tab strip click (only in Tabbed mode).
-    if let Some(strip) = layout.tab_strip
-        && rect_contains(strip, pos_x, pos_y)
-    {
-        let half = strip.width / 2;
-        if pos_x < strip.x + half {
-            app.focus = Focus::Claude;
-        } else {
-            app.focus = Focus::Shell;
+/// Returns `true` if the event was forwarded to a PTY (or otherwise consumed
+/// by the forwarding path) and the caller should not run fallback handling.
+///
+/// The forwarding rules:
+/// - Click events forward only to the focused pane. Clicks on a different
+///   pane fall through to focus-switching, then the next event (release/drag)
+///   will be forwarded since focus matches by then.
+/// - Drag/Move events forward only to the focused pane.
+/// - Wheel events forward to whichever pane is under the cursor, regardless
+///   of focus, so users can scroll without switching focus first — but only
+///   when that pane has some mouse mode enabled. Otherwise we leave the
+///   wheel events for the scrollback fallback.
+fn forward_mouse_to_pane(
+    app: &mut App,
+    layout: &LayoutRects,
+    m: MouseEvent,
+    x: u16,
+    y: u16,
+) -> bool {
+    // Determine which logical pane the cursor is over and the outer rect we
+    // need to inset for coordinate conversion.
+    let (target_focus, outer) = match app.layout_mode {
+        LayoutMode::Split => {
+            if rect_contains(layout.claude, x, y) {
+                (Focus::Claude, layout.claude)
+            } else if rect_contains(layout.shell, x, y) {
+                (Focus::Shell, layout.shell)
+            } else {
+                return false;
+            }
         }
-        return;
+        LayoutMode::Tabbed => {
+            if !rect_contains(layout.claude, x, y) {
+                return false;
+            }
+            // claude/shell rects share the same area; the visible pane is the
+            // currently focused one, defaulting to claude if focus is on Projects.
+            let f = match app.focus {
+                Focus::Shell => Focus::Shell,
+                _ => Focus::Claude,
+            };
+            (f, layout.claude)
+        }
+    };
+
+    let inner = inset(outer);
+    if x < inner.x || y < inner.y || inner.width == 0 || inner.height == 0 {
+        return false;
+    }
+    let cx = x - inner.x + 1;
+    let cy = y - inner.y + 1;
+    if cx > inner.width || cy > inner.height {
+        return false;
     }
 
+    // Snapshot the pane's current mouse mode (drops the borrow before we
+    // potentially re-borrow the session mutably below).
+    let mode = {
+        let Some(session) = app.active_session() else {
+            return false;
+        };
+        let pane = match target_focus {
+            Focus::Claude => session.active_claude_pane(),
+            Focus::Shell => session.shell.as_ref(),
+            Focus::Projects => None,
+        };
+        match pane {
+            Some(p) => p.mouse_mode(),
+            None => return false,
+        }
+    };
+
+    let focus_match = app.focus == target_focus;
+    let should_forward = match m.kind {
+        MouseEventKind::Down(_) | MouseEventKind::Up(_) => mode.report_click && focus_match,
+        MouseEventKind::Drag(_) => (mode.drag || mode.motion) && focus_match,
+        MouseEventKind::Moved => mode.motion && focus_match,
+        MouseEventKind::ScrollUp
+        | MouseEventKind::ScrollDown
+        | MouseEventKind::ScrollLeft
+        | MouseEventKind::ScrollRight => mode.any(),
+    };
+    if !should_forward {
+        return false;
+    }
+
+    let bytes = pane::mouse_to_bytes(m, cx, cy, mode);
+    if bytes.is_empty() {
+        return false;
+    }
+
+    if let Some(session) = app.active_session_mut() {
+        let pane = match target_focus {
+            Focus::Claude => session.active_claude_pane_mut(),
+            Focus::Shell => session.shell.as_mut(),
+            Focus::Projects => None,
+        };
+        if let Some(p) = pane {
+            let _ = p.write(&bytes);
+            return true;
+        }
+    }
+    false
+}
+
+fn handle_left_click(app: &mut App, layout: &LayoutRects, _body: Rect, pos_x: u16, pos_y: u16) {
     match app.layout_mode {
         LayoutMode::Split => {
             if rect_contains(layout.claude, pos_x, pos_y) {
