@@ -1468,8 +1468,23 @@ fn forward_mouse_to_pane(
     };
 
     let focus_match = app.focus == target_focus;
+    // Per the X11 mouse spec all three reporting modes report button events:
+    // `\e[?1000h` (MOUSE_REPORT_CLICK) is press/release, `\e[?1002h`
+    // (MOUSE_DRAG) is press/release plus motion-while-button-held, and
+    // `\e[?1003h` (MOUSE_MOTION) is press/release plus all motion. Alacritty
+    // stores those as mutually exclusive flags (term/mod.rs:1953-1968), so a
+    // program enabling 1002 (helix does this) clears MOUSE_REPORT_CLICK and
+    // sets only MOUSE_DRAG. We therefore gate Down/Up on `mode.any()` rather
+    // than `mode.report_click` — otherwise the Down to a helix pane is
+    // dropped and the program sees a Drag without an anchor (#13).
+    //
+    // `Down` is also routed regardless of focus_match so the *first* click on
+    // an unfocused mouse-aware pane reaches the program; we then switch focus
+    // to that pane as a side effect so subsequent Up/Drag/Moved naturally
+    // match focus.
     let should_forward = match m.kind {
-        MouseEventKind::Down(_) | MouseEventKind::Up(_) => mode.report_click && focus_match,
+        MouseEventKind::Down(_) => mode.any(),
+        MouseEventKind::Up(_) => mode.any() && focus_match,
         MouseEventKind::Drag(_) => (mode.drag || mode.motion) && focus_match,
         MouseEventKind::Moved => mode.motion && focus_match,
         MouseEventKind::ScrollUp
@@ -1484,6 +1499,12 @@ fn forward_mouse_to_pane(
     let bytes = pane::mouse_to_bytes(m, cx, cy, mode);
     if bytes.is_empty() {
         return false;
+    }
+
+    // Move focus to the target pane on Down so subsequent events are routed
+    // there. Done before re-borrowing the session map mutably below.
+    if matches!(m.kind, MouseEventKind::Down(_)) && !focus_match {
+        app.focus = target_focus;
     }
 
     if let Some(session) = app.active_session_mut() {
