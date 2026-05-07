@@ -4,7 +4,7 @@ use nucleo_matcher::{
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, StatefulWidget};
 
@@ -104,19 +104,25 @@ impl ProjectSidebar {
         self.state.select(Some(i));
     }
 
-    pub fn render<F>(&mut self, area: Rect, buf: &mut Buffer, store: &ProjectStore, status_for: F)
-    where
+    pub fn render<F>(
+        &mut self,
+        area: Rect,
+        buf: &mut Buffer,
+        store: &ProjectStore,
+        theme: &crate::settings::Theme,
+        status_for: F,
+    ) where
         F: Fn(&str) -> ProjectStatus,
     {
         let title = match &self.filter {
             Some(f) => format!(" projects /{f} "),
             None => " projects ".to_string(),
         };
-        let border_style = if self.focused {
-            Style::default().fg(Color::Cyan)
+        let border_style = Style::default().fg(if self.focused {
+            theme.border_focused
         } else {
-            Style::default().fg(Color::DarkGray)
-        };
+            theme.border_unfocused
+        });
         let block = Block::default()
             .title(title)
             .borders(Borders::ALL)
@@ -130,13 +136,19 @@ impl ProjectSidebar {
                 let active = matches!(&self.active, Some(name) if name == &p.name);
                 let status = status_for(&p.name);
                 let prefix = match status {
-                    ProjectStatus::Attention => Span::styled("● ", Style::default().fg(Color::Red)),
-                    ProjectStatus::Waiting => Span::styled("● ", Style::default().fg(Color::Green)),
-                    ProjectStatus::Busy => Span::styled("· ", Style::default().fg(Color::Yellow)),
+                    ProjectStatus::Attention => {
+                        Span::styled("● ", Style::default().fg(theme.status_attention))
+                    }
+                    ProjectStatus::Waiting => {
+                        Span::styled("● ", Style::default().fg(theme.status_waiting))
+                    }
+                    ProjectStatus::Busy => {
+                        Span::styled("· ", Style::default().fg(theme.status_busy))
+                    }
                     ProjectStatus::None => Span::raw("  "),
                 };
                 let active_marker = if active {
-                    Span::styled(" *", Style::default().fg(Color::Cyan))
+                    Span::styled(" *", Style::default().fg(theme.accent))
                 } else {
                     Span::raw("")
                 };
@@ -150,8 +162,8 @@ impl ProjectSidebar {
 
         let list = List::new(items).block(block).highlight_style(
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(theme.accent_fg)
+                .bg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         );
 

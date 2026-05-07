@@ -140,6 +140,24 @@ claude_command = ["steam-run", "claude", "--continue"]
 
 # Optional. Defaults to $SHELL, then /bin/bash.
 # shell_command = ["zsh"]
+
+# Optional theme overrides. Each value accepts a hex color (#rrggbb or
+# #rgb) or one of the standard ratatui color names (case-insensitive:
+# black, red, green, yellow, blue, magenta, cyan, white, gray, darkgray,
+# lightred, lightgreen, lightyellow, lightblue, lightmagenta, lightcyan,
+# reset). Anything you don't set keeps wrk's built-in default.
+[theme]
+border_focused    = "#5fafff"   # focused pane border
+border_unfocused  = "darkgray"  # unfocused pane border
+accent            = "#5fafff"   # active markers, tab + selection bg, status chip bg
+accent_fg         = "black"     # text drawn on top of `accent`
+hint              = "darkgray"  # hint/placeholder text
+info              = "gray"      # subtle info text inside modals
+error             = "#ff5f5f"   # error messages, danger borders
+status_waiting    = "#5faf87"   # sidebar/tab dot: claude has finished (Stop)
+status_busy       = "#d7af00"   # sidebar/tab dot: claude is processing
+status_attention  = "#ff5f5f"   # sidebar/tab dot: claude needs attention
+focus_indicator   = "yellow"    # `[focus]` label in the status bar
 ```
 
 ### Status hooks (`wrk install-hooks`)

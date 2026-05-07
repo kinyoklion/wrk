@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
 use directories::ProjectDirs;
+use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,6 +17,12 @@ pub struct Settings {
     /// then `/bin/bash`.
     #[serde(default)]
     pub shell_command: Option<Vec<String>>,
+
+    /// Optional per-key color overrides for the chrome (borders, status bar,
+    /// sidebar/tab indicators). All fields are optional — anything not set
+    /// keeps wrk's built-in default.
+    #[serde(default)]
+    pub theme: ThemeConfig,
 }
 
 impl Default for Settings {
@@ -23,6 +30,7 @@ impl Default for Settings {
         Self {
             claude_command: default_claude(),
             shell_command: None,
+            theme: ThemeConfig::default(),
         }
     }
 }
@@ -69,4 +77,212 @@ pub fn load() -> Result<Settings> {
     let settings: Settings =
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     Ok(settings)
+}
+
+// -----------------------------------------------------------------------------
+// Theme
+// -----------------------------------------------------------------------------
+
+/// Resolved chrome colors used by the renderer. Each slot has a built-in
+/// default; user overrides come from `[theme]` in `settings.toml`.
+#[derive(Debug, Clone, Copy)]
+pub struct Theme {
+    /// Color for the border around the focused pane.
+    pub border_focused: Color,
+    /// Color for the border around an unfocused pane.
+    pub border_unfocused: Color,
+    /// Highlight/accent color: active project marker, active claude tab
+    /// background, sidebar selection background, status bar project chip
+    /// background.
+    pub accent: Color,
+    /// Foreground color used on top of `accent` (selection text, chip text).
+    pub accent_fg: Color,
+    /// Color for hint text, placeholders, and inactive labels.
+    pub hint: Color,
+    /// Subtle informational text in modals.
+    pub info: Color,
+    /// Color for error messages and "danger" modal borders.
+    pub error: Color,
+    /// Sidebar/tab indicator: claude finished its response (Stop hook).
+    pub status_waiting: Color,
+    /// Sidebar/tab indicator: claude is processing (UserPromptSubmit hook /
+    /// recent PTY output).
+    pub status_busy: Color,
+    /// Sidebar/tab indicator: claude needs attention (Notification hook,
+    /// e.g. permission prompt).
+    pub status_attention: Color,
+    /// Color for the `[focus]` label in the status bar.
+    pub focus_indicator: Color,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        // Defaults match the previous hard-coded values so users with no
+        // `[theme]` section see no visual change.
+        Self {
+            border_focused: Color::Cyan,
+            border_unfocused: Color::DarkGray,
+            accent: Color::Cyan,
+            accent_fg: Color::Black,
+            hint: Color::DarkGray,
+            info: Color::Gray,
+            error: Color::Red,
+            status_waiting: Color::Green,
+            status_busy: Color::Yellow,
+            status_attention: Color::Red,
+            focus_indicator: Color::Yellow,
+        }
+    }
+}
+
+/// On-disk representation. Each field is optional; missing fields fall back
+/// to `Theme::default()`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThemeConfig {
+    pub border_focused: Option<String>,
+    pub border_unfocused: Option<String>,
+    pub accent: Option<String>,
+    pub accent_fg: Option<String>,
+    pub hint: Option<String>,
+    pub info: Option<String>,
+    pub error: Option<String>,
+    pub status_waiting: Option<String>,
+    pub status_busy: Option<String>,
+    pub status_attention: Option<String>,
+    pub focus_indicator: Option<String>,
+}
+
+impl ThemeConfig {
+    /// Resolve the user's overrides against the built-in defaults. Invalid
+    /// color strings are silently ignored — the slot keeps its default.
+    pub fn resolve(&self) -> Theme {
+        let mut t = Theme::default();
+        let apply = |slot: &mut Color, value: &Option<String>| {
+            if let Some(s) = value
+                && let Some(c) = parse_color(s)
+            {
+                *slot = c;
+            }
+        };
+        apply(&mut t.border_focused, &self.border_focused);
+        apply(&mut t.border_unfocused, &self.border_unfocused);
+        apply(&mut t.accent, &self.accent);
+        apply(&mut t.accent_fg, &self.accent_fg);
+        apply(&mut t.hint, &self.hint);
+        apply(&mut t.info, &self.info);
+        apply(&mut t.error, &self.error);
+        apply(&mut t.status_waiting, &self.status_waiting);
+        apply(&mut t.status_busy, &self.status_busy);
+        apply(&mut t.status_attention, &self.status_attention);
+        apply(&mut t.focus_indicator, &self.focus_indicator);
+        t
+    }
+}
+
+/// Parse a hex color (`#rrggbb` or `#rgb`) or one of the standard ratatui
+/// color names (case-insensitive). Returns `None` for unrecognized input so
+/// the caller can fall back to a default.
+pub fn parse_color(s: &str) -> Option<Color> {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix('#') {
+        match rest.len() {
+            6 => {
+                let r = u8::from_str_radix(&rest[0..2], 16).ok()?;
+                let g = u8::from_str_radix(&rest[2..4], 16).ok()?;
+                let b = u8::from_str_radix(&rest[4..6], 16).ok()?;
+                return Some(Color::Rgb(r, g, b));
+            }
+            3 => {
+                let parse = |c: char| u8::from_str_radix(&c.to_string(), 16).ok();
+                let mut chars = rest.chars();
+                let r = parse(chars.next()?)?;
+                let g = parse(chars.next()?)?;
+                let b = parse(chars.next()?)?;
+                // Expand 4-bit nibbles to 8-bit by duplication (e.g. f → ff).
+                return Some(Color::Rgb(r * 0x11, g * 0x11, b * 0x11));
+            }
+            _ => return None,
+        }
+    }
+    match s.to_ascii_lowercase().as_str() {
+        "black" => Some(Color::Black),
+        "red" => Some(Color::Red),
+        "green" => Some(Color::Green),
+        "yellow" => Some(Color::Yellow),
+        "blue" => Some(Color::Blue),
+        "magenta" => Some(Color::Magenta),
+        "cyan" => Some(Color::Cyan),
+        "white" => Some(Color::White),
+        "gray" | "grey" => Some(Color::Gray),
+        "darkgray" | "darkgrey" => Some(Color::DarkGray),
+        "lightred" => Some(Color::LightRed),
+        "lightgreen" => Some(Color::LightGreen),
+        "lightyellow" => Some(Color::LightYellow),
+        "lightblue" => Some(Color::LightBlue),
+        "lightmagenta" => Some(Color::LightMagenta),
+        "lightcyan" => Some(Color::LightCyan),
+        "reset" | "default" => Some(Color::Reset),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_six_digit_hex() {
+        assert_eq!(parse_color("#1d1f21"), Some(Color::Rgb(0x1d, 0x1f, 0x21)));
+    }
+
+    #[test]
+    fn parses_three_digit_hex() {
+        assert_eq!(parse_color("#f0a"), Some(Color::Rgb(0xff, 0x00, 0xaa)));
+    }
+
+    #[test]
+    fn parses_named_colors_case_insensitively() {
+        assert_eq!(parse_color("Cyan"), Some(Color::Cyan));
+        assert_eq!(parse_color("DARKGRAY"), Some(Color::DarkGray));
+        assert_eq!(parse_color("darkgrey"), Some(Color::DarkGray));
+        assert_eq!(parse_color("reset"), Some(Color::Reset));
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert_eq!(parse_color("not-a-color"), None);
+        assert_eq!(parse_color("#zzzzzz"), None);
+        assert_eq!(parse_color("#12345"), None);
+    }
+
+    #[test]
+    fn theme_defaults_match_builtin() {
+        let t = ThemeConfig::default().resolve();
+        assert_eq!(t.border_focused, Color::Cyan);
+        assert_eq!(t.error, Color::Red);
+    }
+
+    #[test]
+    fn theme_overrides_apply() {
+        let cfg = ThemeConfig {
+            border_focused: Some("#5fafff".into()),
+            error: Some("lightmagenta".into()),
+            ..Default::default()
+        };
+        let t = cfg.resolve();
+        assert_eq!(t.border_focused, Color::Rgb(0x5f, 0xaf, 0xff));
+        assert_eq!(t.error, Color::LightMagenta);
+        // Unset slots keep defaults.
+        assert_eq!(t.accent, Color::Cyan);
+    }
+
+    #[test]
+    fn invalid_overrides_keep_defaults() {
+        let cfg = ThemeConfig {
+            border_focused: Some("notacolor".into()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolve().border_focused, Color::Cyan);
+    }
 }
