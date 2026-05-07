@@ -659,9 +659,19 @@ fn run_tui() -> Result<()> {
     // apart from plain Enter; on terminals that don't support it the request
     // is silently ignored. Tracked separately so we know whether to pop on
     // shutdown.
+    // DISAMBIGUATE_ESCAPE_CODES alone makes kitty-protocol terminals report
+    // shifted printable chars as their *base* codepoint plus a SHIFT modifier
+    // (e.g. `Shift+,` arrives as `Char(',')` + SHIFT instead of `Char('<')`).
+    // That broke our `Alt+<` / `Alt+>` claude-tab shortcuts. REPORT_ALTERNATE_KEYS
+    // tells the terminal to also send the shifted form; crossterm's parser then
+    // promotes that to the keycode and drops the SHIFT modifier, so the rest of
+    // wrk sees the same `Char('<')` events it always did.
     let pushed_kbd_flags = execute!(
         stdout,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        )
     )
     .is_ok();
     let backend = CrosstermBackend::new(stdout);
