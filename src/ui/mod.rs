@@ -400,12 +400,13 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     if app.shell_passthrough {
         // Reverse-video the passthrough chip so it stands out — a reminder
         // that wrk's normal Alt+… shortcuts won't fire while focus is on the
-        // shell pane.
+        // shell pane. Reuses theme slots so users who recolor `error` get a
+        // matching chip background.
         spans.push(Span::styled(
             "[passthru] ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Red)
+                .fg(theme.accent_fg)
+                .bg(theme.error)
                 .add_modifier(Modifier::BOLD),
         ));
     }

@@ -1468,8 +1468,18 @@ fn forward_mouse_to_pane(
     };
 
     let focus_match = app.focus == target_focus;
+    // `Down` is special: we forward it whenever the target pane has mouse
+    // reporting, even when focus doesn't currently match. The previous rule
+    // ("focus must match for Down to forward") meant the first click on an
+    // unfocused mouse-aware pane (helix, htop, …) was eaten by the
+    // focus-switch fallback — the program never saw the Down, so single
+    // clicks did nothing and drags began from the program's previous cursor
+    // anchor instead of the click origin (#13). Switching focus as a side
+    // effect of the forwarded Down makes Up/Drag/Moved naturally match
+    // focus on subsequent events.
     let should_forward = match m.kind {
-        MouseEventKind::Down(_) | MouseEventKind::Up(_) => mode.report_click && focus_match,
+        MouseEventKind::Down(_) => mode.report_click,
+        MouseEventKind::Up(_) => mode.report_click && focus_match,
         MouseEventKind::Drag(_) => (mode.drag || mode.motion) && focus_match,
         MouseEventKind::Moved => mode.motion && focus_match,
         MouseEventKind::ScrollUp
@@ -1484,6 +1494,12 @@ fn forward_mouse_to_pane(
     let bytes = pane::mouse_to_bytes(m, cx, cy, mode);
     if bytes.is_empty() {
         return false;
+    }
+
+    // Move focus to the target pane on Down so subsequent events are routed
+    // there. Done before re-borrowing the session map mutably below.
+    if matches!(m.kind, MouseEventKind::Down(_)) && !focus_match {
+        app.focus = target_focus;
     }
 
     if let Some(session) = app.active_session_mut() {
