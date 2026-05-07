@@ -80,6 +80,15 @@ The Nix flake provides the toolchain. Without Nix, any Rust ≥ 1.85 (edition
 | `Alt+h` / `Alt+l` | shrink / grow claude pane (split mode) |
 | `Alt+q` | quit |
 | `Ctrl+Space` | jump back to projects from any pane |
+| `F12` | toggle shell-pane passthrough (persisted per project) |
+
+**Shell-pane passthrough.** When toggled on, wrk forwards every key (including
+`Alt+…` and `Ctrl+Space`) directly to the shell pane's PTY — useful for nested
+apps like tmux, zellij, or vim that have their own conflicting shortcuts. Only
+the focused shell pane is affected; the claude and projects panes still see
+wrk's normal shortcuts. `F12` itself is always intercepted so you can toggle
+it back off. The current state is shown as a `[passthru]` chip in the status
+bar and persisted per project as `passthrough = true` in `projects.toml`.
 
 **On the projects pane:**
 
@@ -93,11 +102,11 @@ The Nix flake provides the toolchain. Without Nix, any Rust ≥ 1.85 (edition
 | `r` | reload `projects.toml` from disk |
 | `q` | quit |
 
-**Claude session tabs (work from any pane):**
+**Claude session tabs:**
 
 | Key | Action |
 |---|---|
-| `Alt+n` | new Claude tab (session picker) |
+| `Alt+n` | new Claude tab (session picker) — only fires while the claude pane is focused |
 | `Alt+w` | close active Claude tab |
 | `Alt+<` | previous Claude tab |
 | `Alt+>` | next Claude tab |

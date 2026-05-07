@@ -37,6 +37,17 @@ pub struct Project {
     /// in projects.toml as `layout = "split"` / `"tabbed"`. None → default.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "layout")]
     pub layout_mode: Option<LayoutMode>,
+    /// Per-project shell-pane passthrough state. When `Some(true)`, wrk's
+    /// global Alt+… / Ctrl+Space shortcuts are not intercepted while the
+    /// shell pane is focused — every key (except F12, which toggles this
+    /// flag) is forwarded straight to the PTY. Persisted in projects.toml
+    /// as `passthrough = true`. None → default (false).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "passthrough"
+    )]
+    pub shell_passthrough: Option<bool>,
     /// Named Claude sessions associated with this project. When empty wrk
     /// spawns one default `claude --continue` tab (backwards-compatible).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -140,6 +151,7 @@ mod tests {
                 path: PathBuf::from("/tmp/alpha"),
                 tags: vec![],
                 layout_mode: None,
+                shell_passthrough: None,
                 claude_sessions: vec![],
             })
             .unwrap();
@@ -149,6 +161,7 @@ mod tests {
                 path: PathBuf::from("/tmp/beta"),
                 tags: vec!["work".into()],
                 layout_mode: Some(LayoutMode::Tabbed),
+                shell_passthrough: Some(true),
                 claude_sessions: vec![],
             })
             .unwrap();
@@ -165,6 +178,7 @@ mod tests {
             path: PathBuf::from("/x"),
             tags: vec![],
             layout_mode: None,
+            shell_passthrough: None,
             claude_sessions: vec![],
         };
         store.add(p.clone()).unwrap();
