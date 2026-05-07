@@ -3,7 +3,7 @@ pub mod projects;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use crate::pane::Focus;
 use crate::pane::terminal::PtyPaneWidget;
+use crate::settings::Theme;
 use crate::status::{self, HookEvent};
 use crate::store::LayoutMode;
 use crate::ui::projects::ProjectStatus;
@@ -68,6 +69,7 @@ fn project_status_for(sessions: &HashMap<String, ProjectSession>, name: &str) ->
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    let theme = app.theme;
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -81,10 +83,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(sidebar_area) = layout.sidebar {
         app.sidebar.focused = app.focus == Focus::Projects;
         let sessions = &app.sessions;
-        app.sidebar
-            .render(sidebar_area, frame.buffer_mut(), &app.store, |name| {
-                project_status_for(sessions, name)
-            });
+        app.sidebar.render(
+            sidebar_area,
+            frame.buffer_mut(),
+            &app.store,
+            &theme,
+            |name| project_status_for(sessions, name),
+        );
     }
 
     let session = app.active_session();
@@ -102,6 +107,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 claude_tabs,
                 active_claude_idx,
                 claude_pane,
+                &theme,
             );
             draw_terminal_pane(
                 frame,
@@ -110,11 +116,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 app.focus == Focus::Shell,
                 shell_pane,
                 "no project selected — press Enter on a project",
+                &theme,
             );
         }
         LayoutMode::Tabbed => {
             if let Some(strip) = layout.tab_strip {
-                draw_tab_strip(frame, strip, app.focus);
+                draw_tab_strip(frame, strip, app.focus, &theme);
             }
             match app.focus {
                 Focus::Shell => draw_terminal_pane(
@@ -124,6 +131,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     true,
                     shell_pane,
                     "no project selected — press Enter on a project",
+                    &theme,
                 ),
                 _ => draw_claude_pane(
                     frame,
@@ -132,6 +140,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     claude_tabs,
                     active_claude_idx,
                     claude_pane,
+                    &theme,
                 ),
             }
         }
@@ -142,14 +151,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(modal) = &app.modal {
         match modal {
             ModalState::Add(m) => {
-                let cursor = m.render(area, frame.buffer_mut());
+                let cursor = m.render(area, frame.buffer_mut(), &theme);
                 frame.set_cursor_position(cursor);
             }
             ModalState::ConfirmDelete(m) => {
-                m.render(area, frame.buffer_mut());
+                m.render(area, frame.buffer_mut(), &theme);
             }
             ModalState::ClaudeTabPicker(m) => {
-                let cursor = m.render(area, frame.buffer_mut());
+                let cursor = m.render(area, frame.buffer_mut(), &theme);
                 if m.name_focused {
                     frame.set_cursor_position(cursor);
                 }
@@ -194,12 +203,13 @@ fn draw_claude_pane(
     tabs: Option<&[ClaudeTab]>,
     active_idx: usize,
     pane: Option<&crate::pane::terminal::PtyPane>,
+    theme: &Theme,
 ) {
-    let border_style = if focused {
-        Style::default().fg(Color::Cyan)
+    let border_style = Style::default().fg(if focused {
+        theme.border_focused
     } else {
-        Style::default().fg(Color::DarkGray)
-    };
+        theme.border_unfocused
+    });
     let block = Block::default()
         .title(" claude ")
         .borders(Borders::ALL)
@@ -211,21 +221,27 @@ fn draw_claude_pane(
     let (tab_strip_area, content_area) = claude_pane_split(inner, tab_count);
 
     if let (Some(strip_area), Some(tabs)) = (tab_strip_area, tabs) {
-        draw_claude_tab_strip(frame, strip_area, tabs, active_idx);
+        draw_claude_tab_strip(frame, strip_area, tabs, active_idx, theme);
     }
 
     match pane {
         Some(p) => frame.render_widget(PtyPaneWidget(p), content_area),
         None => {
             let para = Paragraph::new("no project selected — press Enter on a project")
-                .style(Style::default().fg(Color::DarkGray));
+                .style(Style::default().fg(theme.hint));
             frame.render_widget(para, content_area);
         }
     }
 }
 
 /// Tab strip for Claude sessions within a project.
-fn draw_claude_tab_strip(frame: &mut Frame, area: Rect, tabs: &[ClaudeTab], active_idx: usize) {
+fn draw_claude_tab_strip(
+    frame: &mut Frame,
+    area: Rect,
+    tabs: &[ClaudeTab],
+    active_idx: usize,
+    theme: &Theme,
+) {
     if tabs.is_empty() || area.width == 0 {
         return;
     }
@@ -253,16 +269,16 @@ fn draw_claude_tab_strip(frame: &mut Frame, area: Rect, tabs: &[ClaudeTab], acti
             ProjectStatus::None => "  ",
         };
         let status_color = match tab_status(tab) {
-            ProjectStatus::Attention => Color::Red,
-            ProjectStatus::Busy => Color::Yellow,
-            ProjectStatus::Waiting => Color::Green,
-            ProjectStatus::None => Color::DarkGray,
+            ProjectStatus::Attention => theme.status_attention,
+            ProjectStatus::Busy => theme.status_busy,
+            ProjectStatus::Waiting => theme.status_waiting,
+            ProjectStatus::None => theme.hint,
         };
         let label = format!("{status_char}{}", tab.name);
         let style = if i == active_idx {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(theme.accent_fg)
+                .bg(theme.accent)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(status_color)
@@ -272,7 +288,7 @@ fn draw_claude_tab_strip(frame: &mut Frame, area: Rect, tabs: &[ClaudeTab], acti
         } else {
             Line::from(vec![
                 Span::styled(status_char.to_string(), Style::default().fg(status_color)),
-                Span::styled(tab.name.clone(), Style::default().fg(Color::DarkGray)),
+                Span::styled(tab.name.clone(), Style::default().fg(theme.hint)),
             ])
         };
         frame.render_widget(
@@ -284,7 +300,7 @@ fn draw_claude_tab_strip(frame: &mut Frame, area: Rect, tabs: &[ClaudeTab], acti
     }
 }
 
-fn draw_tab_strip(frame: &mut Frame, area: Rect, focus: Focus) {
+fn draw_tab_strip(frame: &mut Frame, area: Rect, focus: Focus, theme: &Theme) {
     let half = area.width / 2;
     let claude_rect = Rect {
         x: area.x,
@@ -299,18 +315,18 @@ fn draw_tab_strip(frame: &mut Frame, area: Rect, focus: Focus) {
         height: 1,
     };
     let claude_focused = focus == Focus::Claude || focus == Focus::Projects;
-    frame.render_widget(tab_label("claude", claude_focused), claude_rect);
-    frame.render_widget(tab_label("shell", focus == Focus::Shell), shell_rect);
+    frame.render_widget(tab_label("claude", claude_focused, theme), claude_rect);
+    frame.render_widget(tab_label("shell", focus == Focus::Shell, theme), shell_rect);
 }
 
-fn tab_label(label: &str, active: bool) -> Paragraph<'static> {
+fn tab_label(label: &str, active: bool, theme: &Theme) -> Paragraph<'static> {
     let style = if active {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
+            .fg(theme.accent_fg)
+            .bg(theme.accent)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.hint)
     };
     Paragraph::new(format!(" {label} "))
         .style(style)
@@ -324,12 +340,13 @@ fn draw_terminal_pane(
     focused: bool,
     pane: Option<&crate::pane::terminal::PtyPane>,
     placeholder: &str,
+    theme: &Theme,
 ) {
-    let border_style = if focused {
-        Style::default().fg(Color::Cyan)
+    let border_style = Style::default().fg(if focused {
+        theme.border_focused
     } else {
-        Style::default().fg(Color::DarkGray)
-    };
+        theme.border_unfocused
+    });
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -342,7 +359,7 @@ fn draw_terminal_pane(
             frame.render_widget(PtyPaneWidget(p), inner);
         }
         None => {
-            let para = Paragraph::new(placeholder).style(Style::default().fg(Color::DarkGray));
+            let para = Paragraph::new(placeholder).style(Style::default().fg(theme.hint));
             frame.render_widget(para, inner);
         }
     }
@@ -353,6 +370,7 @@ fn inner_area(area: Rect) -> Rect {
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
     let project = app.active_project().map(|p| p.name.as_str()).unwrap_or("—");
     let focus = match app.focus {
         Focus::Projects => "projects",
@@ -367,19 +385,22 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![
         Span::styled(
             format!(" {project} "),
-            Style::default().fg(Color::Black).bg(Color::Cyan),
+            Style::default().fg(theme.accent_fg).bg(theme.accent),
         ),
         Span::raw(" "),
-        Span::styled(format!("[{focus}] "), Style::default().fg(Color::Yellow)),
+        Span::styled(
+            format!("[{focus}] "),
+            Style::default().fg(theme.focus_indicator),
+        ),
         Span::styled(
             format!("({session_count} live · {layout}) "),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.hint),
         ),
     ];
     if let Some(err) = &app.error {
         spans.push(Span::styled(
             format!("error: {err}"),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.error),
         ));
     } else {
         let hint = match app.focus {
@@ -388,7 +409,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
             }
             _ => "Alt+1/2/3  Alt+n new-claude  Alt+w close  Alt+</> tabs  Alt+t layout  Alt+q quit",
         };
-        spans.push(Span::styled(hint, Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(hint, Style::default().fg(theme.hint)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }

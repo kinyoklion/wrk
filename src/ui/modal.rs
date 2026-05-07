@@ -1,10 +1,11 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
 use crate::session::DiscoveredSession;
+use crate::settings::Theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddField {
@@ -46,13 +47,13 @@ impl AddProjectModal {
         }
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer) -> Position {
+    pub fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) -> Position {
         let popup = centered_rect(60, 30, area);
         Clear.render(popup, buf);
         let block = Block::default()
             .title(" add project ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(Style::default().fg(theme.border_focused));
         let inner = block.inner(popup);
         block.render(popup, buf);
 
@@ -71,24 +72,24 @@ impl AddProjectModal {
         let (path_row, name_row) = (layout[1], layout[3]);
         Paragraph::new("path:").render(layout[0], buf);
         Paragraph::new(self.path_input.as_str())
-            .style(field_style(self.focus == AddField::Path))
+            .style(field_style(self.focus == AddField::Path, theme))
             .render(path_row, buf);
 
         Paragraph::new("name (optional, defaults to dir basename):").render(layout[2], buf);
         Paragraph::new(self.name_input.as_str())
-            .style(field_style(self.focus == AddField::Name))
+            .style(field_style(self.focus == AddField::Name, theme))
             .render(name_row, buf);
 
         let footer = if let Some(err) = &self.error {
             Line::from(vec![Span::styled(
                 err.clone(),
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme.error),
             )])
         } else {
             Line::from("Tab: switch field   Enter: add   Esc: cancel")
         };
         Paragraph::new(footer)
-            .style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().fg(theme.hint))
             .render(layout[5], buf);
 
         let cursor_row = match self.focus {
@@ -112,13 +113,13 @@ pub struct ConfirmDeleteModal {
 }
 
 impl ConfirmDeleteModal {
-    pub fn render(&self, area: Rect, buf: &mut Buffer) {
+    pub fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         let popup = centered_rect(50, 20, area);
         Clear.render(popup, buf);
         let block = Block::default()
             .title(" confirm delete ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Red));
+            .border_style(Style::default().fg(theme.error));
         let inner = block.inner(popup);
         block.render(popup, buf);
 
@@ -133,7 +134,7 @@ impl ConfirmDeleteModal {
 
         Paragraph::new(format!("delete project '{}'?", self.project_name)).render(layout[0], buf);
         Paragraph::new("y: confirm   n / Esc: cancel")
-            .style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().fg(theme.hint))
             .render(layout[2], buf);
     }
 }
@@ -202,13 +203,13 @@ impl ClaudeTabPickerModal {
         self.selected_idx = self.selected_idx.saturating_sub(1);
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer) -> Position {
+    pub fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) -> Position {
         let popup = centered_rect(60, 70, area);
         Clear.render(popup, buf);
         let block = Block::default()
             .title(" add claude session ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(Style::default().fg(theme.border_focused));
         let inner = block.inner(popup);
         block.render(popup, buf);
 
@@ -239,11 +240,11 @@ impl ClaudeTabPickerModal {
             ""
         };
         let name_style = if self.name_focused {
-            field_style(true)
+            field_style(true, theme)
         } else if self.tab_name.is_empty() {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.hint)
         } else {
-            field_style(false)
+            field_style(false, theme)
         };
         let name_display = if !self.name_focused && self.tab_name.is_empty() {
             self.suggested_name()
@@ -280,8 +281,8 @@ impl ClaudeTabPickerModal {
             };
             let style = if i == self.selected_idx {
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .fg(theme.accent_fg)
+                    .bg(theme.accent)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -295,7 +296,7 @@ impl ClaudeTabPickerModal {
             "↑/↓: select   Tab: name   Enter: confirm   Esc: cancel"
         };
         Paragraph::new(footer)
-            .style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().fg(theme.hint))
             .render(layout[5], buf);
 
         if self.name_focused {
@@ -313,11 +314,17 @@ impl ClaudeTabPickerModal {
     }
 }
 
-fn field_style(focused: bool) -> Style {
+fn field_style(focused: bool, theme: &Theme) -> Style {
     if focused {
-        Style::default().bg(Color::DarkGray).fg(Color::White)
+        // A subtle "this field is being edited" treatment: light text on a
+        // darker bg so it pops against the modal interior. Defaults match the
+        // pre-theme behavior (Color::White on Color::DarkGray); themes can
+        // dial both via `info` and `border_unfocused`.
+        Style::default()
+            .bg(theme.border_unfocused)
+            .fg(ratatui::style::Color::White)
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(theme.info)
     }
 }
 

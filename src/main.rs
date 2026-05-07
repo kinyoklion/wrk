@@ -30,7 +30,7 @@ use ratatui::layout::Rect;
 
 use crate::pane::Focus;
 use crate::pane::terminal::PtyPane;
-use crate::settings::Settings;
+use crate::settings::{Settings, Theme};
 use crate::store::{LayoutMode, Project, ProjectStore, SessionRef};
 use crate::ui::ModalState;
 use crate::ui::modal::{AddProjectModal, ClaudeTabPickerModal, ConfirmDeleteModal};
@@ -203,6 +203,8 @@ impl ProjectSession {
 pub struct App {
     pub store: ProjectStore,
     pub settings: Settings,
+    /// Resolved chrome theme. Cached at startup from `settings.theme`.
+    pub theme: Theme,
     pub sidebar: ui::projects::ProjectSidebar,
     pub focus: Focus,
     pub sessions: HashMap<String, ProjectSession>,
@@ -221,9 +223,11 @@ impl App {
     fn new(store: ProjectStore, settings: Settings) -> Self {
         let mut sidebar = ui::projects::ProjectSidebar::default();
         sidebar.refresh(&store);
+        let theme = settings.theme.resolve();
         Self {
             store,
             settings,
+            theme,
             sidebar,
             focus: Focus::Projects,
             sessions: HashMap::new(),
