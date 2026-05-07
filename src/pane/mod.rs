@@ -39,6 +39,18 @@ pub fn key_to_bytes(key: KeyEvent, app_cursor: bool) -> Vec<u8> {
     let mods = key.modifiers;
     let ctrl = mods.contains(KeyModifiers::CONTROL);
     let alt = mods.contains(KeyModifiers::ALT);
+    let shift = mods.contains(KeyModifiers::SHIFT);
+
+    // Shift+Enter is the conventional "insert a newline within input" key for
+    // Claude Code (and many other TUIs). On terminals that report
+    // disambiguated keys (Kitty keyboard protocol — wrk enables it on
+    // startup), the SHIFT modifier reaches us. Translate it to ESC+CR, which
+    // Claude Code accepts as a literal newline (same byte sequence as
+    // Alt+Enter). Done as an early return so other modifier combinations
+    // (e.g. Shift+Alt+Enter) don't double-prefix the ESC byte below.
+    if matches!(key.code, KeyCode::Enter) && shift {
+        return b"\x1b\r".to_vec();
+    }
 
     let cursor = |c: char| -> Vec<u8> {
         if app_cursor {
@@ -200,7 +212,7 @@ pub fn mouse_to_bytes(event: MouseEvent, cx: u16, cy: u16, mode: MouseMode) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyModifiers, MouseEvent};
+    use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers, MouseEvent};
 
     fn ev(kind: MouseEventKind, mods: KeyModifiers) -> MouseEvent {
         MouseEvent {
@@ -209,6 +221,53 @@ mod tests {
             row: 0,
             modifiers: mods,
         }
+    }
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: mods,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    #[test]
+    fn enter_no_modifiers_sends_cr() {
+        assert_eq!(
+            key_to_bytes(key(KeyCode::Enter, KeyModifiers::NONE), false),
+            b"\r"
+        );
+    }
+
+    #[test]
+    fn shift_enter_sends_esc_cr() {
+        assert_eq!(
+            key_to_bytes(key(KeyCode::Enter, KeyModifiers::SHIFT), false),
+            b"\x1b\r"
+        );
+    }
+
+    #[test]
+    fn shift_alt_enter_does_not_double_prefix() {
+        // Sanity check: combining SHIFT with ALT must not produce ESC+ESC+CR.
+        assert_eq!(
+            key_to_bytes(
+                key(KeyCode::Enter, KeyModifiers::SHIFT | KeyModifiers::ALT),
+                false,
+            ),
+            b"\x1b\r"
+        );
+    }
+
+    #[test]
+    fn alt_enter_still_sends_esc_cr() {
+        // Pre-existing behavior: Alt+Enter goes through the generic Alt-prefix
+        // branch and produces the same ESC+CR sequence.
+        assert_eq!(
+            key_to_bytes(key(KeyCode::Enter, KeyModifiers::ALT), false),
+            b"\x1b\r"
+        );
     }
 
     #[test]
