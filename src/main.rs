@@ -16,7 +16,8 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -644,6 +645,16 @@ fn run_tui() -> Result<()> {
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
         .context("entering alternate screen")?;
+    // Ask the host terminal for disambiguated key reporting (Kitty Keyboard
+    // Protocol). On supporting terminals this is what lets us tell Shift+Enter
+    // apart from plain Enter; on terminals that don't support it the request
+    // is silently ignored. Tracked separately so we know whether to pop on
+    // shutdown.
+    let pushed_kbd_flags = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )
+    .is_ok();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("creating terminal")?;
 
@@ -653,6 +664,9 @@ fn run_tui() -> Result<()> {
 
     disable_raw_mode().ok();
     let mut stdout = io::stdout();
+    if pushed_kbd_flags {
+        execute!(stdout, PopKeyboardEnhancementFlags).ok();
+    }
     execute!(stdout, DisableMouseCapture, LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
 
