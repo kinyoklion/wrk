@@ -1,3 +1,4 @@
+mod keymap;
 mod pane;
 mod proc;
 mod session;
@@ -28,6 +29,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 
+use crate::keymap::{GlobalAction, KeyMap};
 use crate::pane::Focus;
 use crate::pane::terminal::PtyPane;
 use crate::settings::{Settings, Theme};
@@ -206,6 +208,8 @@ pub struct App {
     pub settings: Settings,
     /// Resolved chrome theme. Cached at startup from `settings.theme`.
     pub theme: Theme,
+    /// Resolved global key bindings. Cached at startup from `settings.keys.global`.
+    pub keymap: KeyMap,
     pub sidebar: ui::projects::ProjectSidebar,
     pub focus: Focus,
     pub sessions: HashMap<String, ProjectSession>,
@@ -230,17 +234,26 @@ impl App {
         let mut sidebar = ui::projects::ProjectSidebar::default();
         sidebar.refresh(&store);
         let theme = settings.theme.resolve();
+        let (keymap, keymap_warnings) = KeyMap::build(&settings.keys.global);
+        // Surface any keymap warnings (invalid bindings, conflicts) via the
+        // status-bar error slot; they remain visible until the user dismisses
+        // them by triggering any other action that overwrites `app.error`.
+        let mut error = None;
+        for w in keymap_warnings {
+            push_error(&mut error, w);
+        }
         Self {
             store,
             settings,
             theme,
+            keymap,
             sidebar,
             focus: Focus::Projects,
             sessions: HashMap::new(),
             active_project_name: None,
             modal: None,
             should_quit: false,
-            error: None,
+            error,
             last_click: None,
             layout_mode: LayoutMode::Split,
             sidebar_hidden: false,
@@ -980,151 +993,145 @@ fn handle_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
         return handle_modal_key(app, key, body);
     }
 
-    // F12 toggles shell-pane passthrough. Always intercepted (even while
-    // passthrough is on) so the user can always get back out.
-    if matches!(key.code, KeyCode::F(12)) {
+    let action = app.keymap.lookup(&key);
+
+    // The passthrough toggle is always honored — even while passthrough is on
+    // and the shell pane is focused — so the user can always get back out.
+    if action == Some(GlobalAction::ToggleShellPassthrough) {
         app.toggle_shell_passthrough();
         return Ok(());
     }
 
     // When passthrough is on AND the shell pane is focused, every other key
-    // goes straight to the PTY — no global Alt+… / Ctrl+Space shortcuts so
-    // nested apps (tmux, zellij, vim, …) keep their own bindings.
+    // (whether it has a global binding or not) goes straight to the PTY so
+    // nested apps (tmux, zellij, vim, …) keep their own shortcuts.
     if app.shell_passthrough && app.focus == Focus::Shell {
-        if let Some(session) = app.active_session_mut()
-            && let Some(pane) = session.shell.as_mut()
-        {
-            let bytes = pane::key_to_bytes(key, pane.app_cursor_mode());
-            if !bytes.is_empty() {
-                let _ = pane.write(&bytes);
-                pane.scroll_to_bottom();
-            }
-        }
+        forward_key_to_focused_pty(app, key);
         return Ok(());
     }
 
-    // Global keys (work from any pane, including inside a PTY).
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(' ') {
-        app.focus = Focus::Projects;
+    // Try to dispatch a global action. `dispatch_global_action` returns
+    // false when the action isn't applicable in the current context (e.g.
+    // NewClaudeTab outside the claude pane), in which case we fall through
+    // to per-focus key handling so the keystroke can still reach a PTY.
+    if let Some(action) = action
+        && dispatch_global_action(app, action, body)
+    {
         return Ok(());
-    }
-    if key.modifiers.contains(KeyModifiers::ALT) {
-        match key.code {
-            KeyCode::Char('q') => {
-                app.should_quit = true;
-                return Ok(());
-            }
-            KeyCode::Char('1') => {
-                app.focus = Focus::Projects;
-                return Ok(());
-            }
-            KeyCode::Char('2') => {
-                app.focus = Focus::Claude;
-                return Ok(());
-            }
-            KeyCode::Char('3') => {
-                app.focus = Focus::Shell;
-                return Ok(());
-            }
-            KeyCode::Char('0') => {
-                app.sidebar_hidden = !app.sidebar_hidden;
-                if app.sidebar_hidden && app.focus == Focus::Projects {
-                    app.focus = Focus::Claude;
-                }
-                return Ok(());
-            }
-            KeyCode::Char('h') | KeyCode::Char(',') | KeyCode::Char('-') => {
-                app.claude_pct = app.claude_pct.saturating_sub(5).max(10);
-                return Ok(());
-            }
-            KeyCode::Char('l') | KeyCode::Char('.') | KeyCode::Char(']') => {
-                app.claude_pct = (app.claude_pct + 5).min(90);
-                return Ok(());
-            }
-            KeyCode::Char('t') => {
-                let new_mode = match app.layout_mode {
-                    LayoutMode::Split => LayoutMode::Tabbed,
-                    LayoutMode::Tabbed => LayoutMode::Split,
-                };
-                app.set_layout_mode(new_mode);
-                if app.layout_mode == LayoutMode::Tabbed && app.focus == Focus::Projects {
-                    app.focus = Focus::Claude;
-                }
-                return Ok(());
-            }
-            // Claude tab management. `n` only fires while the claude pane is
-            // focused so it doesn't intercept Alt+n in shell apps; the others
-            // intentionally work from any pane.
-            KeyCode::Char('n')
-                if app.focus == Focus::Claude && app.active_project_name.is_some() =>
-            {
-                let discovered = app
-                    .active_project()
-                    .map(|p| {
-                        let known: std::collections::HashMap<String, String> = p
-                            .claude_sessions
-                            .iter()
-                            .filter_map(|sr| {
-                                sr.session_id
-                                    .as_ref()
-                                    .map(|id| (id.clone(), sr.name.clone()))
-                            })
-                            .collect();
-                        session::discover_sessions_named(&p.path, &known)
-                    })
-                    .unwrap_or_default();
-                app.modal = Some(ModalState::ClaudeTabPicker(ClaudeTabPickerModal::new(
-                    &discovered,
-                )));
-                return Ok(());
-            }
-            KeyCode::Char('w') => {
-                app.close_active_claude_tab();
-                return Ok(());
-            }
-            KeyCode::Char('<') => {
-                app.prev_claude_tab();
-                return Ok(());
-            }
-            KeyCode::Char('>') => {
-                app.next_claude_tab();
-                return Ok(());
-            }
-            // Diagnostic: dump the focused pane's grid to a file under /tmp.
-            KeyCode::Char('x') => {
-                dump_focused_grid(app);
-                return Ok(());
-            }
-            _ => {}
-        }
     }
 
     match app.focus {
         Focus::Projects => handle_projects_key(app, key, body),
-        Focus::Claude => {
-            if let Some(session) = app.active_session_mut()
-                && let Some(pane) = session.active_claude_pane_mut()
-            {
-                let bytes = pane::key_to_bytes(key, pane.app_cursor_mode());
-                if !bytes.is_empty() {
-                    let _ = pane.write(&bytes);
-                    pane.scroll_to_bottom();
-                }
-            }
+        Focus::Claude | Focus::Shell => {
+            forward_key_to_focused_pty(app, key);
             Ok(())
         }
-        Focus::Shell => {
-            if let Some(session) = app.active_session_mut()
-                && let Some(pane) = session.shell.as_mut()
-            {
-                let bytes = pane::key_to_bytes(key, pane.app_cursor_mode());
-                if !bytes.is_empty() {
-                    let _ = pane.write(&bytes);
-                    pane.scroll_to_bottom();
-                }
-            }
-            Ok(())
+    }
+}
+
+/// Run a [`GlobalAction`]. Returns `true` if the action was applied; `false`
+/// if it wasn't applicable in the current context (the caller falls through
+/// to per-focus dispatch so the keystroke isn't lost).
+fn dispatch_global_action(app: &mut App, action: GlobalAction, body: Rect) -> bool {
+    match action {
+        GlobalAction::Quit => {
+            app.should_quit = true;
         }
+        GlobalAction::FocusProjects | GlobalAction::LeaderFocusProjects => {
+            app.focus = Focus::Projects;
+        }
+        GlobalAction::FocusClaude => {
+            app.focus = Focus::Claude;
+        }
+        GlobalAction::FocusShell => {
+            app.focus = Focus::Shell;
+        }
+        GlobalAction::ToggleSidebar => {
+            app.sidebar_hidden = !app.sidebar_hidden;
+            if app.sidebar_hidden && app.focus == Focus::Projects {
+                app.focus = Focus::Claude;
+            }
+        }
+        GlobalAction::ShrinkClaude => {
+            app.claude_pct = app.claude_pct.saturating_sub(5).max(10);
+        }
+        GlobalAction::GrowClaude => {
+            app.claude_pct = (app.claude_pct + 5).min(90);
+        }
+        GlobalAction::ToggleLayout => {
+            let new_mode = match app.layout_mode {
+                LayoutMode::Split => LayoutMode::Tabbed,
+                LayoutMode::Tabbed => LayoutMode::Split,
+            };
+            app.set_layout_mode(new_mode);
+            if app.layout_mode == LayoutMode::Tabbed && app.focus == Focus::Projects {
+                app.focus = Focus::Claude;
+            }
+        }
+        // `new_claude_tab` only fires while the claude pane is focused so it
+        // doesn't intercept its bound key inside a shell app.
+        GlobalAction::NewClaudeTab => {
+            if app.focus != Focus::Claude || app.active_project_name.is_none() {
+                return false;
+            }
+            let _ = body;
+            let discovered = app
+                .active_project()
+                .map(|p| {
+                    let known: std::collections::HashMap<String, String> = p
+                        .claude_sessions
+                        .iter()
+                        .filter_map(|sr| {
+                            sr.session_id
+                                .as_ref()
+                                .map(|id| (id.clone(), sr.name.clone()))
+                        })
+                        .collect();
+                    session::discover_sessions_named(&p.path, &known)
+                })
+                .unwrap_or_default();
+            app.modal = Some(ModalState::ClaudeTabPicker(ClaudeTabPickerModal::new(
+                &discovered,
+            )));
+        }
+        GlobalAction::CloseClaudeTab => {
+            app.close_active_claude_tab();
+        }
+        GlobalAction::PrevClaudeTab => {
+            app.prev_claude_tab();
+        }
+        GlobalAction::NextClaudeTab => {
+            app.next_claude_tab();
+        }
+        // Handled in handle_key before passthrough check.
+        GlobalAction::ToggleShellPassthrough => {
+            app.toggle_shell_passthrough();
+        }
+        GlobalAction::DumpGrid => {
+            dump_focused_grid(app);
+        }
+    }
+    true
+}
+
+/// Forward `key` as bytes to whichever PTY currently has focus.
+fn forward_key_to_focused_pty(app: &mut App, key: KeyEvent) {
+    let focus = app.focus;
+    let Some(session) = app.active_session_mut() else {
+        return;
+    };
+    let pane = match focus {
+        Focus::Claude => session.active_claude_pane_mut(),
+        Focus::Shell => session.shell.as_mut(),
+        Focus::Projects => return,
+    };
+    let Some(pane) = pane else {
+        return;
+    };
+    let bytes = pane::key_to_bytes(key, pane.app_cursor_mode());
+    if !bytes.is_empty() {
+        let _ = pane.write(&bytes);
+        pane.scroll_to_bottom();
     }
 }
 
