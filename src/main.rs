@@ -136,6 +136,7 @@ fn cmd_add(path: &Path, name: Option<String>) -> Result<()> {
         path: abs,
         tags: vec![],
         layout_mode: None,
+        shell_passthrough: None,
         claude_sessions: vec![],
     })?;
     store::save(&store)?;
@@ -215,6 +216,11 @@ pub struct App {
     pub sidebar_hidden: bool,
     /// Width of the claude pane as a percentage of the content area in Split mode.
     pub claude_pct: u16,
+    /// When true and the shell pane is focused, wrk's global Alt+… / Ctrl+Space
+    /// shortcuts are not intercepted — every key (except F12, which toggles
+    /// this flag) is forwarded to the shell PTY. Lets nested apps like tmux,
+    /// zellij, and vim keep their own shortcuts. Persisted per project.
+    pub shell_passthrough: bool,
 }
 
 impl App {
@@ -235,6 +241,7 @@ impl App {
             layout_mode: LayoutMode::Split,
             sidebar_hidden: false,
             claude_pct: 50,
+            shell_passthrough: false,
         }
     }
 
@@ -269,6 +276,7 @@ impl App {
         self.active_project_name = Some(project.name.clone());
         self.sidebar.active = Some(project.name.clone());
         self.layout_mode = project.layout_mode.unwrap_or_default();
+        self.shell_passthrough = project.shell_passthrough.unwrap_or(false);
         self.error = None;
 
         let layout = compute_layout(body, self);
@@ -391,10 +399,13 @@ impl App {
             self.sidebar.active = None;
         }
 
-        // Re-sync layout from the active project (its layout may have been
-        // edited externally).
+        // Re-sync per-project state from the active project (these may have
+        // been edited externally).
         if let Some(p) = self.active_project() {
-            self.layout_mode = p.layout_mode.unwrap_or_default();
+            let layout = p.layout_mode.unwrap_or_default();
+            let passthru = p.shell_passthrough.unwrap_or(false);
+            self.layout_mode = layout;
+            self.shell_passthrough = passthru;
         }
         Ok(())
     }
@@ -551,6 +562,30 @@ impl App {
                 p.layout_mode = Some(mode);
                 changed = true;
             }
+        }
+        if changed && let Err(e) = store::save(&self.store) {
+            push_error(&mut self.error, format!("save failed: {e}"));
+        }
+    }
+
+    /// Toggle shell-pane passthrough for the active project and persist the
+    /// new value. With no active project this is a no-op (nothing to persist
+    /// against).
+    fn toggle_shell_passthrough(&mut self) {
+        let new = !self.shell_passthrough;
+        self.shell_passthrough = new;
+        let Some(name) = self.active_project_name.clone() else {
+            return;
+        };
+        // Store `None` instead of `Some(false)` so we don't write a noisy
+        // `passthrough = false` line into projects.toml for the default case.
+        let to_store = if new { Some(true) } else { None };
+        let mut changed = false;
+        if let Some(p) = self.store.projects.iter_mut().find(|p| p.name == name)
+            && p.shell_passthrough != to_store
+        {
+            p.shell_passthrough = to_store;
+            changed = true;
         }
         if changed && let Err(e) = store::save(&self.store) {
             push_error(&mut self.error, format!("save failed: {e}"));
@@ -941,6 +976,29 @@ fn handle_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
         return handle_modal_key(app, key, body);
     }
 
+    // F12 toggles shell-pane passthrough. Always intercepted (even while
+    // passthrough is on) so the user can always get back out.
+    if matches!(key.code, KeyCode::F(12)) {
+        app.toggle_shell_passthrough();
+        return Ok(());
+    }
+
+    // When passthrough is on AND the shell pane is focused, every other key
+    // goes straight to the PTY — no global Alt+… / Ctrl+Space shortcuts so
+    // nested apps (tmux, zellij, vim, …) keep their own bindings.
+    if app.shell_passthrough && app.focus == Focus::Shell {
+        if let Some(session) = app.active_session_mut()
+            && let Some(pane) = session.shell.as_mut()
+        {
+            let bytes = pane::key_to_bytes(key, pane.app_cursor_mode());
+            if !bytes.is_empty() {
+                let _ = pane.write(&bytes);
+                pane.scroll_to_bottom();
+            }
+        }
+        return Ok(());
+    }
+
     // Global keys (work from any pane, including inside a PTY).
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(' ') {
         app.focus = Focus::Projects;
@@ -990,8 +1048,12 @@ fn handle_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                 }
                 return Ok(());
             }
-            // Claude tab management (works from any pane).
-            KeyCode::Char('n') if app.active_project_name.is_some() => {
+            // Claude tab management. `n` only fires while the claude pane is
+            // focused so it doesn't intercept Alt+n in shell apps; the others
+            // intentionally work from any pane.
+            KeyCode::Char('n')
+                if app.focus == Focus::Claude && app.active_project_name.is_some() =>
+            {
                 let discovered = app
                     .active_project()
                     .map(|p| {
@@ -1160,6 +1222,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                         path: abs,
                         tags: vec![],
                         layout_mode: None,
+                        shell_passthrough: None,
                         claude_sessions: vec![],
                     })?;
                     store::save(&store)?;

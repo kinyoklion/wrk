@@ -376,17 +376,36 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::DarkGray),
         ),
     ];
+    if app.shell_passthrough {
+        // Reverse-video the passthrough chip so it stands out — a reminder
+        // that wrk's normal Alt+… shortcuts won't fire while focus is on the
+        // shell pane.
+        spans.push(Span::styled(
+            "[passthru] ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if let Some(err) = &app.error {
         spans.push(Span::styled(
             format!("error: {err}"),
             Style::default().fg(Color::Red),
         ));
     } else {
-        let hint = match app.focus {
-            Focus::Projects => {
-                "↑/↓ Enter/dbl-click  +/d/r  /  Alt+0 sidebar  Alt+t tabs  Alt+h/l resize  Alt+q quit"
+        let shell_passthrough_active = app.shell_passthrough && app.focus == Focus::Shell;
+        let hint = if shell_passthrough_active {
+            "F12 exit passthrough  (all other keys → shell)"
+        } else {
+            match app.focus {
+                Focus::Projects => {
+                    "↑/↓ Enter/dbl-click  +/d/r  /  Alt+0 sidebar  Alt+t tabs  Alt+h/l resize  Alt+q quit"
+                }
+                _ => {
+                    "Alt+1/2/3  Alt+n new-claude  Alt+w close  Alt+</> tabs  Alt+t layout  F12 passthru  Alt+q quit"
+                }
             }
-            _ => "Alt+1/2/3  Alt+n new-claude  Alt+w close  Alt+</> tabs  Alt+t layout  Alt+q quit",
         };
         spans.push(Span::styled(hint, Style::default().fg(Color::DarkGray)));
     }
