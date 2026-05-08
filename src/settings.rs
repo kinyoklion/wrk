@@ -23,6 +23,13 @@ pub struct Settings {
     /// keeps wrk's built-in default.
     #[serde(default)]
     pub theme: ThemeConfig,
+
+    /// Optional shortcut overrides. Today only the `[keys.global]` namespace
+    /// is consumed; the wrapper struct exists so we can grow into per-pane
+    /// scopes (`[keys.projects]`, `[keys.modal]`, …) without renaming the
+    /// existing top-level table.
+    #[serde(default)]
+    pub keys: KeyConfig,
 }
 
 impl Default for Settings {
@@ -31,6 +38,7 @@ impl Default for Settings {
             claude_command: default_claude(),
             shell_command: None,
             theme: ThemeConfig::default(),
+            keys: KeyConfig::default(),
         }
     }
 }
@@ -224,6 +232,68 @@ pub fn parse_color(s: &str) -> Option<Color> {
         "lightcyan" => Some(Color::LightCyan),
         "reset" | "default" => Some(Color::Reset),
         _ => None,
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Keys
+// -----------------------------------------------------------------------------
+
+use crate::keymap::GlobalAction;
+
+/// Top-level wrapper for `[keys.<scope>]` tables. Only `global` is consumed
+/// today; the wrapper exists so `[keys.projects]` / `[keys.modal]` / … can
+/// be added later without renaming user configs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeyConfig {
+    pub global: GlobalKeysConfig,
+}
+
+/// User-facing override schema for the global keymap. Each field is optional;
+/// missing fields keep the built-in default from
+/// [`GlobalAction::default_binding`]. Each value is a key string parsed by
+/// [`crate::keymap::parse_key`] (e.g. `"Alt+q"`, `"Ctrl+Space"`, `"F12"`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GlobalKeysConfig {
+    pub quit: Option<String>,
+    pub focus_projects: Option<String>,
+    pub focus_claude: Option<String>,
+    pub focus_shell: Option<String>,
+    pub toggle_sidebar: Option<String>,
+    pub shrink_claude: Option<String>,
+    pub grow_claude: Option<String>,
+    pub toggle_layout: Option<String>,
+    pub new_claude_tab: Option<String>,
+    pub close_claude_tab: Option<String>,
+    pub prev_claude_tab: Option<String>,
+    pub next_claude_tab: Option<String>,
+    pub leader_focus_projects: Option<String>,
+    pub toggle_shell_passthrough: Option<String>,
+    pub dump_grid: Option<String>,
+}
+
+impl crate::keymap::GlobalKeysSource for GlobalKeysConfig {
+    fn get(&self, action: GlobalAction) -> Option<&str> {
+        let s = match action {
+            GlobalAction::Quit => &self.quit,
+            GlobalAction::FocusProjects => &self.focus_projects,
+            GlobalAction::FocusClaude => &self.focus_claude,
+            GlobalAction::FocusShell => &self.focus_shell,
+            GlobalAction::ToggleSidebar => &self.toggle_sidebar,
+            GlobalAction::ShrinkClaude => &self.shrink_claude,
+            GlobalAction::GrowClaude => &self.grow_claude,
+            GlobalAction::ToggleLayout => &self.toggle_layout,
+            GlobalAction::NewClaudeTab => &self.new_claude_tab,
+            GlobalAction::CloseClaudeTab => &self.close_claude_tab,
+            GlobalAction::PrevClaudeTab => &self.prev_claude_tab,
+            GlobalAction::NextClaudeTab => &self.next_claude_tab,
+            GlobalAction::LeaderFocusProjects => &self.leader_focus_projects,
+            GlobalAction::ToggleShellPassthrough => &self.toggle_shell_passthrough,
+            GlobalAction::DumpGrid => &self.dump_grid,
+        };
+        s.as_deref()
     }
 }
 

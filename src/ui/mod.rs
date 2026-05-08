@@ -416,22 +416,50 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(theme.error),
         ));
     } else {
-        let shell_passthrough_active = app.shell_passthrough && app.focus == Focus::Shell;
-        let hint = if shell_passthrough_active {
-            "F12 exit passthrough  (all other keys → shell)"
-        } else {
-            match app.focus {
-                Focus::Projects => {
-                    "↑/↓ Enter/dbl-click  +/d/r  /  Alt+0 sidebar  Alt+t tabs  Alt+h/l resize  Alt+q quit"
-                }
-                _ => {
-                    "Alt+1/2/3  Alt+n new-claude  Alt+w close  Alt+</> tabs  Alt+t layout  F12 passthru  Alt+q quit"
-                }
-            }
-        };
+        let hint = build_hint(app);
         spans.push(Span::styled(hint, Style::default().fg(theme.hint)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Compose the focus-specific hint string from the live keymap so it stays in
+/// sync with any user overrides. Hard-coded keys (the projects-pane single
+/// chars `+`, `d`, `r`, `/`, `↑`/`↓`, `Enter`) are not configurable yet so
+/// they're spliced in literally.
+fn build_hint(app: &App) -> String {
+    let km = &app.keymap;
+    let passthrough_active = app.shell_passthrough && app.focus == Focus::Shell;
+    if passthrough_active {
+        return format!(
+            "{toggle} exit passthrough  (all other keys → shell)",
+            toggle = km.display(crate::keymap::GlobalAction::ToggleShellPassthrough),
+        );
+    }
+    use crate::keymap::GlobalAction as A;
+    let toggle_sidebar = km.display(A::ToggleSidebar);
+    let toggle_layout = km.display(A::ToggleLayout);
+    let shrink = km.display(A::ShrinkClaude);
+    let grow = km.display(A::GrowClaude);
+    let quit = km.display(A::Quit);
+    match app.focus {
+        Focus::Projects => format!(
+            "↑/↓ Enter/dbl-click  +/d/r  /  {toggle_sidebar} sidebar  \
+             {toggle_layout} layout  {shrink}/{grow} resize  {quit} quit",
+        ),
+        _ => format!(
+            "{focus_p}/{focus_c}/{focus_s} panes  {new} new-claude  \
+             {close} close  {prev}/{next} tabs  {toggle_layout} layout  \
+             {passthru} passthru  {quit} quit",
+            focus_p = km.display(A::FocusProjects),
+            focus_c = km.display(A::FocusClaude),
+            focus_s = km.display(A::FocusShell),
+            new = km.display(A::NewClaudeTab),
+            close = km.display(A::CloseClaudeTab),
+            prev = km.display(A::PrevClaudeTab),
+            next = km.display(A::NextClaudeTab),
+            passthru = km.display(A::ToggleShellPassthrough),
+        ),
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -167,6 +167,30 @@ status_waiting    = "#5faf87"   # sidebar/tab dot: claude has finished (Stop)
 status_busy       = "#d7af00"   # sidebar/tab dot: claude is processing
 status_attention  = "#ff5f5f"   # sidebar/tab dot: claude needs attention
 focus_indicator   = "yellow"    # `[focus]` label in the status bar
+
+# Optional shortcut overrides. Anything you don't set keeps the
+# default. Modifiers: Ctrl, Alt, Shift, Super (case-insensitive).
+# Keys: a single char, F1–F24, or a named key (Space, Enter, Tab,
+# Esc, Backspace, Delete, Insert, Up/Down/Left/Right, Home, End,
+# PageUp, PageDown). Use `Shift+a` for `A`; for symbols, use the
+# shifted character directly (e.g. `Alt+<`, not `Alt+Shift+,`).
+# Status-bar hints update automatically to reflect overrides.
+[keys.global]
+quit                     = "Alt+q"
+focus_projects           = "Alt+1"
+focus_claude             = "Alt+2"
+focus_shell              = "Alt+3"
+toggle_sidebar           = "Alt+0"
+shrink_claude            = "Alt+h"
+grow_claude              = "Alt+l"
+toggle_layout            = "Alt+t"
+new_claude_tab           = "Alt+n"   # only fires while the claude pane is focused
+close_claude_tab         = "Alt+w"
+prev_claude_tab          = "Alt+<"
+next_claude_tab          = "Alt+>"
+leader_focus_projects    = "Ctrl+Space"
+toggle_shell_passthrough = "F12"
+dump_grid                = "Alt+x"   # diagnostic: dump the focused PTY grid
 ```
 
 ### Status hooks (`wrk install-hooks`)
