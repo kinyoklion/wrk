@@ -271,6 +271,7 @@ pub struct GlobalKeysConfig {
     pub next_claude_tab: Option<String>,
     pub leader_focus_projects: Option<String>,
     pub toggle_shell_passthrough: Option<String>,
+    pub open_link_picker: Option<String>,
     pub dump_grid: Option<String>,
 }
 
@@ -291,6 +292,7 @@ impl crate::keymap::GlobalKeysSource for GlobalKeysConfig {
             GlobalAction::NextClaudeTab => &self.next_claude_tab,
             GlobalAction::LeaderFocusProjects => &self.leader_focus_projects,
             GlobalAction::ToggleShellPassthrough => &self.toggle_shell_passthrough,
+            GlobalAction::OpenLinkPicker => &self.open_link_picker,
             GlobalAction::DumpGrid => &self.dump_grid,
         };
         s.as_deref()

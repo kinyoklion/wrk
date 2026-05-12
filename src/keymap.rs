@@ -36,6 +36,7 @@ pub enum GlobalAction {
     /// where `FocusProjects`'s default Alt+1 might collide with an app.
     LeaderFocusProjects,
     ToggleShellPassthrough,
+    OpenLinkPicker,
     DumpGrid,
 }
 
@@ -58,6 +59,7 @@ impl GlobalAction {
             Self::NextClaudeTab => "Alt+>",
             Self::LeaderFocusProjects => "Ctrl+Space",
             Self::ToggleShellPassthrough => "F12",
+            Self::OpenLinkPicker => "Alt+u",
             Self::DumpGrid => "Alt+x",
         }
     }
@@ -79,6 +81,7 @@ impl GlobalAction {
         Self::NextClaudeTab,
         Self::LeaderFocusProjects,
         Self::ToggleShellPassthrough,
+        Self::OpenLinkPicker,
         Self::DumpGrid,
     ];
 }
@@ -291,6 +294,7 @@ fn action_name(a: GlobalAction) -> &'static str {
         GlobalAction::NextClaudeTab => "next_claude_tab",
         GlobalAction::LeaderFocusProjects => "leader_focus_projects",
         GlobalAction::ToggleShellPassthrough => "toggle_shell_passthrough",
+        GlobalAction::OpenLinkPicker => "open_link_picker",
         GlobalAction::DumpGrid => "dump_grid",
     }
 }
