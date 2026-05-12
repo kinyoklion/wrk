@@ -40,9 +40,11 @@ project. Linux-only, native rendering (via your terminal), built on
   time-since-output heuristic as fallback.
 - **Mouse**: click panes / tabs / projects to focus, double-click a project to
   open it, scroll wheel paginates the alacritty scrollback (10k lines).
-  **Ctrl+click** on a URL in a claude or shell pane opens it in the browser
-  (`xdg-open`). Works for OSC 8 hyperlinks and plain `http(s)://` / `ftp://`
-  URLs.
+  **Ctrl+click** (or **Shift+click**, if your outer terminal swallows Ctrl) on
+  a URL in a claude or shell pane opens it in the browser (`xdg-open`). Works
+  for OSC 8 hyperlinks and plain `http(s)://` / `ftp://` URLs. For keyboard
+  access, **`Alt+u`** opens a picker over every URL in the focused pane's
+  scrollback (newest first, filter by typing).
 - **Configurable claude command** for quirky setups (e.g. `steam-run claude
   --continue` on NixOS).
 
@@ -79,6 +81,7 @@ The Nix flake provides the toolchain. Without Nix, any Rust ≥ 1.85 (edition
 | `Alt+t` | toggle split / tabbed layout (persisted per project) |
 | `Alt+h` / `Alt+l` | shrink / grow claude pane (split mode) |
 | `Alt+q` | quit |
+| `Alt+u` | open URL picker (scans the focused pane's scrollback) |
 | `Ctrl+Space` | jump back to projects from any pane |
 | `F12` | toggle shell-pane passthrough (persisted per project) |
 
@@ -190,6 +193,7 @@ prev_claude_tab          = "Alt+<"
 next_claude_tab          = "Alt+>"
 leader_focus_projects    = "Ctrl+Space"
 toggle_shell_passthrough = "F12"
+open_link_picker         = "Alt+u"
 dump_grid                = "Alt+x"   # diagnostic: dump the focused PTY grid
 ```
 

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -7,7 +8,7 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::Term;
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Point};
+use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, TermMode, viewport_to_point};
 use anyhow::{Context, Result};
@@ -264,6 +265,59 @@ impl PtyPane {
         find_url_at(&line_chars, col)
     }
 
+    /// Collect every URL visible in this pane's grid plus full scrollback,
+    /// newest first, deduped by URL string. Cells with an OSC 8 hyperlink are
+    /// recorded by their URI; plain-text URLs on each row are extracted with
+    /// the same scheme/character rules as the click-based opener.
+    pub fn collect_urls(&self) -> Vec<String> {
+        let Ok(term) = self.term.lock() else {
+            return Vec::new();
+        };
+        let grid = term.grid();
+        let cols = term.columns();
+        let top = grid.topmost_line().0;
+        let bottom = grid.bottommost_line().0;
+
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let push = |s: String, out: &mut Vec<String>, seen: &mut HashSet<String>| -> bool {
+            if s.is_empty() {
+                return true;
+            }
+            if seen.insert(s.clone()) {
+                out.push(s);
+            }
+            out.len() < URL_COLLECT_CAP
+        };
+
+        // Walk bottom-up so the most recent URLs come first.
+        'outer: for line_i in (top..=bottom).rev() {
+            let line = Line(line_i);
+            // Track contiguous OSC 8 hyperlink runs so we record each one once.
+            let mut prev_uri: Option<String> = None;
+            let mut chars: Vec<char> = Vec::with_capacity(cols);
+            for c in 0..cols {
+                let cell = &grid[Point::new(line, Column(c))];
+                chars.push(cell.c);
+                let cur_uri = cell.hyperlink().map(|h| h.uri().to_owned());
+                match (&prev_uri, &cur_uri) {
+                    (Some(prev), Some(cur)) if prev == cur => {}
+                    (_, Some(cur)) if !push(cur.clone(), &mut out, &mut seen) => {
+                        break 'outer;
+                    }
+                    _ => {}
+                }
+                prev_uri = cur_uri;
+            }
+            for url in scan_line(&chars) {
+                if !push(url, &mut out, &mut seen) {
+                    break 'outer;
+                }
+            }
+        }
+        out
+    }
+
     /// Write a textual snapshot of this pane's alacritty grid to `path`.
     /// Used to diagnose rendering bugs — captures dimensions, the active
     /// `TermMode` flags, the visible content per row (with control chars
@@ -466,6 +520,36 @@ fn map_named(n: NamedColor, is_fg: bool) -> Color {
     }
 }
 
+const URL_COLLECT_CAP: usize = 500;
+
+/// Find every plain-text URL on `chars`. Returns them in left-to-right order,
+/// non-overlapping. Uses the same scheme list and character class as
+/// [`find_url_at`].
+fn scan_line(chars: &[char]) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if !is_url_char(chars[i]) {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j + 1 < chars.len() && is_url_char(chars[j + 1]) {
+            j += 1;
+        }
+        let run: String = chars[i..=j].iter().collect();
+        let trimmed = run.trim_end_matches(['.', ',', ')', ']', '>']);
+        for scheme in &["https://", "http://", "ftp://"] {
+            if let Some(pos) = trimmed.find(scheme) {
+                urls.push(trimmed[pos..].to_string());
+                break;
+            }
+        }
+        i = j + 1;
+    }
+    urls
+}
+
 fn find_url_at(chars: &[char], col: usize) -> Option<String> {
     if col >= chars.len() || !is_url_char(chars[col]) {
         return None;
@@ -525,4 +609,39 @@ pub fn cursor_position(pane: &PtyPane, area: Rect) -> Option<Position> {
         x: area.x + col,
         y: area.y + row,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chars(s: &str) -> Vec<char> {
+        s.chars().collect()
+    }
+
+    #[test]
+    fn scan_line_finds_multiple_urls() {
+        let line = chars("see https://a.test/x and http://b.test, then ftp://c.test/path.");
+        let urls = scan_line(&line);
+        assert_eq!(
+            urls,
+            vec![
+                "https://a.test/x".to_string(),
+                "http://b.test".to_string(),
+                "ftp://c.test/path".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_line_skips_non_url_text() {
+        let line = chars("no url here, just words and (parens).");
+        assert!(scan_line(&line).is_empty());
+    }
+
+    #[test]
+    fn scan_line_trims_trailing_punctuation_and_brackets() {
+        let line = chars("(see https://example.com).");
+        assert_eq!(scan_line(&line), vec!["https://example.com".to_string()]);
+    }
 }

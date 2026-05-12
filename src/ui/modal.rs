@@ -314,6 +314,151 @@ impl ClaudeTabPickerModal {
     }
 }
 
+/// Modal for picking a URL from a pane's scrollback. The constructor receives
+/// the candidate list newest-first; the modal owns the substring filter and
+/// selection state, and the caller reads `confirmed_url` after Enter.
+#[derive(Debug, Clone)]
+pub struct UrlPickerModal {
+    pub all: Vec<String>,
+    pub query: String,
+    pub filtered: Vec<usize>,
+    pub selected: usize,
+    pub confirmed_url: Option<String>,
+}
+
+impl UrlPickerModal {
+    pub fn new(urls: Vec<String>) -> Self {
+        let filtered = (0..urls.len()).collect();
+        Self {
+            all: urls,
+            query: String::new(),
+            filtered,
+            selected: 0,
+            confirmed_url: None,
+        }
+    }
+
+    pub fn select_next(&mut self) {
+        if self.selected + 1 < self.filtered.len() {
+            self.selected += 1;
+        }
+    }
+
+    pub fn select_prev(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub fn push_char(&mut self, c: char) {
+        self.query.push(c);
+        self.refilter();
+    }
+
+    pub fn pop_char(&mut self) {
+        if self.query.pop().is_some() {
+            self.refilter();
+        }
+    }
+
+    /// Case-insensitive substring match. Keeps the newest-first ordering.
+    fn refilter(&mut self) {
+        let needle = self.query.to_lowercase();
+        self.filtered = self
+            .all
+            .iter()
+            .enumerate()
+            .filter(|(_, u)| needle.is_empty() || u.to_lowercase().contains(&needle))
+            .map(|(i, _)| i)
+            .collect();
+        self.selected = 0;
+    }
+
+    /// Stash the currently highlighted URL into `confirmed_url`; the caller
+    /// reads it after the modal is popped.
+    pub fn confirm(&mut self) {
+        if let Some(&idx) = self.filtered.get(self.selected) {
+            self.confirmed_url = self.all.get(idx).cloned();
+        }
+    }
+
+    pub fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) -> Position {
+        let popup = centered_rect(70, 60, area);
+        Clear.render(popup, buf);
+        let block = Block::default()
+            .title(" open url ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.border_focused));
+        let inner = block.inner(popup);
+        block.render(popup, buf);
+
+        let list_height = inner.height.saturating_sub(4).max(1);
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // label
+                Constraint::Length(1), // query input
+                Constraint::Length(1), // blank
+                Constraint::Length(list_height),
+                Constraint::Min(0),
+                Constraint::Length(1), // footer
+            ])
+            .split(inner);
+
+        Paragraph::new("filter:").render(layout[0], buf);
+        Paragraph::new(self.query.as_str())
+            .style(field_style(true, theme))
+            .render(layout[1], buf);
+
+        let list_area = layout[3];
+        let visible = list_area.height as usize;
+        let start = self.selected.saturating_sub(visible.saturating_sub(1));
+        for (offset, idx) in self.filtered.iter().enumerate().skip(start).take(visible) {
+            let y = list_area.y + (offset - start) as u16;
+            if y >= list_area.y + list_area.height {
+                break;
+            }
+            let row = Rect {
+                y,
+                height: 1,
+                ..list_area
+            };
+            // Truncate long URLs so they fit on one row.
+            let url = self.all.get(*idx).map(String::as_str).unwrap_or("");
+            let max = row.width.saturating_sub(2) as usize;
+            let display: String = if url.chars().count() > max {
+                let mut s: String = url.chars().take(max.saturating_sub(1)).collect();
+                s.push('…');
+                format!("  {s}")
+            } else {
+                format!("  {url}")
+            };
+            let style = if offset == self.selected {
+                Style::default()
+                    .fg(theme.accent_fg)
+                    .bg(theme.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Paragraph::new(display).style(style).render(row, buf);
+        }
+
+        if self.filtered.is_empty() && !self.all.is_empty() {
+            let msg = Paragraph::new("(no matches)").style(Style::default().fg(theme.hint));
+            msg.render(list_area, buf);
+        }
+
+        Paragraph::new("type to filter   ↑/↓: select   Enter: open   Esc: cancel")
+            .style(Style::default().fg(theme.hint))
+            .render(layout[5], buf);
+
+        let len = self.query.chars().count() as u16;
+        Position {
+            x: layout[1].x + len.min(layout[1].width.saturating_sub(1)),
+            y: layout[1].y,
+        }
+    }
+}
+
 fn field_style(focused: bool, theme: &Theme) -> Style {
     if focused {
         // A subtle "this field is being edited" treatment: light text on a

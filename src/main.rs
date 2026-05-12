@@ -35,7 +35,7 @@ use crate::pane::terminal::PtyPane;
 use crate::settings::{Settings, Theme};
 use crate::store::{LayoutMode, Project, ProjectStore, SessionRef};
 use crate::ui::ModalState;
-use crate::ui::modal::{AddProjectModal, ClaudeTabPickerModal, ConfirmDeleteModal};
+use crate::ui::modal::{AddProjectModal, ClaudeTabPickerModal, ConfirmDeleteModal, UrlPickerModal};
 
 #[derive(Parser)]
 #[command(
@@ -1107,9 +1107,38 @@ fn dispatch_global_action(app: &mut App, action: GlobalAction, body: Rect) -> bo
         GlobalAction::ToggleShellPassthrough => {
             app.toggle_shell_passthrough();
         }
+        GlobalAction::OpenLinkPicker => {
+            return open_link_picker(app);
+        }
         GlobalAction::DumpGrid => {
             dump_focused_grid(app);
         }
+    }
+    true
+}
+
+/// Scan the focused pane's scrollback for URLs and open a picker modal.
+/// Returns `false` when there's no pane to scan (e.g. Projects focus) so the
+/// keystroke can fall through to per-focus handling.
+fn open_link_picker(app: &mut App) -> bool {
+    let urls = {
+        let Some(session) = app.active_session() else {
+            return false;
+        };
+        let pane = match app.focus {
+            Focus::Claude => session.active_claude_pane(),
+            Focus::Shell => session.shell.as_ref(),
+            Focus::Projects => return false,
+        };
+        let Some(pane) = pane else {
+            return false;
+        };
+        pane.collect_urls()
+    };
+    if urls.is_empty() {
+        push_error(&mut app.error, "no URLs in scrollback".to_string());
+    } else {
+        app.modal = Some(ModalState::UrlPicker(UrlPickerModal::new(urls)));
     }
     true
 }
@@ -1291,11 +1320,32 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                 }
             }
         }
+        ModalState::UrlPicker(m) => match key.code {
+            KeyCode::Esc => consumed_modal = Some(()),
+            KeyCode::Up => m.select_prev(),
+            KeyCode::Down => m.select_next(),
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                m.select_prev();
+            }
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                m.select_next();
+            }
+            KeyCode::Backspace => m.pop_char(),
+            KeyCode::Enter => {
+                m.confirm();
+                consumed_modal = Some(());
+            }
+            KeyCode::Char(c) => m.push_char(c),
+            _ => {}
+        },
     }
     if consumed_modal.is_some() {
-        // Consume the ClaudeTabPicker result before clearing the modal.
-        if let Some(ModalState::ClaudeTabPicker(m)) = app.modal.take() {
-            if m.confirmed {
+        // Take the modal and dispatch on its terminal state. Most modals are
+        // already finalized by the time we get here — they only need the
+        // top-level state cleared. ClaudeTabPicker and UrlPicker carry a
+        // post-confirm side effect (spawn a tab, spawn xdg-open).
+        match app.modal.take() {
+            Some(ModalState::ClaudeTabPicker(m)) if m.confirmed => {
                 let session_id = m.selected_session_id().map(|s| s.to_owned());
                 let name = if m.tab_name.trim().is_empty() {
                     m.suggested_name()
@@ -1304,8 +1354,17 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                 };
                 app.add_claude_tab(name, session_id, body);
             }
-        } else {
-            app.modal = None;
+            Some(ModalState::UrlPicker(m)) => {
+                if let Some(url) = m.confirmed_url {
+                    let _ = std::process::Command::new("xdg-open")
+                        .arg(&url)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                }
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -1362,10 +1421,13 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
         return;
     }
 
-    // Ctrl+left-click on a URL takes precedence over both PTY forwarding and
-    // focus-switching.
+    // Ctrl- or Shift+left-click on a URL takes precedence over both PTY
+    // forwarding and focus-switching. Shift is offered as an alternative to
+    // Ctrl because many outer terminal emulators capture Ctrl+Click for their
+    // own link-handling before crossterm ever sees it.
     if let MouseEventKind::Down(MouseButton::Left) = m.kind
-        && m.modifiers.contains(KeyModifiers::CONTROL)
+        && (m.modifiers.contains(KeyModifiers::CONTROL)
+            || m.modifiers.contains(KeyModifiers::SHIFT))
         && try_open_url(app, &layout, pos_x, pos_y)
     {
         return;
@@ -1580,12 +1642,15 @@ fn try_open_url(app: &App, layout: &LayoutRects, pos_x: u16, pos_y: u16) -> bool
     let Some(session) = app.active_session() else {
         return false;
     };
-    let (pane, outer) = match app.layout_mode {
+    // is_claude_pane drives whether we strip off the per-session tab strip row
+    // when computing the inner content rect — the shell pane has no strip even
+    // when it shares the claude rect in Tabbed mode.
+    let (pane, outer, is_claude_pane) = match app.layout_mode {
         LayoutMode::Split => {
             if rect_contains(layout.claude, pos_x, pos_y) {
-                (session.active_claude_pane(), layout.claude)
+                (session.active_claude_pane(), layout.claude, true)
             } else if rect_contains(layout.shell, pos_x, pos_y) {
-                (session.shell.as_ref(), layout.shell)
+                (session.shell.as_ref(), layout.shell, false)
             } else {
                 return false;
             }
@@ -1594,18 +1659,21 @@ fn try_open_url(app: &App, layout: &LayoutRects, pos_x: u16, pos_y: u16) -> bool
             if !rect_contains(layout.claude, pos_x, pos_y) {
                 return false;
             }
-            let pane = match app.focus {
-                Focus::Claude => session.active_claude_pane(),
-                Focus::Shell => session.shell.as_ref(),
+            match app.focus {
+                Focus::Claude => (session.active_claude_pane(), layout.claude, true),
+                Focus::Shell => (session.shell.as_ref(), layout.claude, false),
                 _ => return false,
-            };
-            (pane, layout.claude)
+            }
         }
     };
     let Some(pane) = pane else {
         return false;
     };
-    let inner = inset(outer);
+    let inner = if is_claude_pane {
+        claude_pane_split(inset(outer), session.claude_tabs.len()).1
+    } else {
+        inset(outer)
+    };
     if pos_x < inner.x || pos_y < inner.y {
         return false;
     }

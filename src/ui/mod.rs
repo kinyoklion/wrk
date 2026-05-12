@@ -163,6 +163,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     frame.set_cursor_position(cursor);
                 }
             }
+            ModalState::UrlPicker(m) => {
+                let cursor = m.render(area, frame.buffer_mut(), &theme);
+                frame.set_cursor_position(cursor);
+            }
         }
         return;
     }
@@ -467,4 +471,5 @@ pub enum ModalState {
     Add(modal::AddProjectModal),
     ConfirmDelete(modal::ConfirmDeleteModal),
     ClaudeTabPicker(modal::ClaudeTabPickerModal),
+    UrlPicker(modal::UrlPickerModal),
 }
