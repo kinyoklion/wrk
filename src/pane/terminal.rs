@@ -198,6 +198,16 @@ impl PtyPane {
             .unwrap_or(false)
     }
 
+    /// True when the embedded program has enabled bracketed-paste mode
+    /// (DECSET 2004). Callers wrap paste payloads in `\e[200~ … \e[201~`
+    /// when set so the program can distinguish a paste from per-char input.
+    pub fn bracketed_paste_mode(&self) -> bool {
+        self.term
+            .lock()
+            .map(|t| t.mode().contains(TermMode::BRACKETED_PASTE))
+            .unwrap_or(false)
+    }
+
     /// Snapshot of the terminal's current mouse-reporting flags.
     pub fn mouse_mode(&self) -> super::MouseMode {
         let Ok(term) = self.term.lock() else {

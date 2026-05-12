@@ -16,9 +16,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -704,8 +704,13 @@ fn run_tui() -> Result<()> {
 
     enable_raw_mode().context("enabling raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-        .context("entering alternate screen")?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste,
+    )
+    .context("entering alternate screen")?;
     // Ask the host terminal for disambiguated key reporting (Kitty Keyboard
     // Protocol). On supporting terminals this is what lets us tell Shift+Enter
     // apart from plain Enter; on terminals that don't support it the request
@@ -738,7 +743,13 @@ fn run_tui() -> Result<()> {
     if pushed_kbd_flags {
         execute!(stdout, PopKeyboardEnhancementFlags).ok();
     }
-    execute!(stdout, DisableMouseCapture, LeaveAlternateScreen).ok();
+    execute!(
+        stdout,
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+    )
+    .ok();
     terminal.show_cursor().ok();
 
     res
@@ -816,6 +827,7 @@ fn event_loop(
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(app, key, body)?,
                 Event::Mouse(m) => handle_mouse(app, m, area),
+                Event::Paste(content) => handle_paste(app, content, body),
                 Event::Resize(_, _) => {
                     // Next loop iteration re-resizes.
                 }
@@ -1141,6 +1153,93 @@ fn open_link_picker(app: &mut App) -> bool {
         app.modal = Some(ModalState::UrlPicker(UrlPickerModal::new(urls)));
     }
     true
+}
+
+/// Route a bracketed-paste payload from the host terminal. When a modal text
+/// input or the sidebar filter is active, the paste is appended there; in
+/// every other case it is forwarded to the focused PTY (wrapped in
+/// `\e[200~ … \e[201~` markers when the inner program has bracketed-paste
+/// mode enabled, so paste-aware apps like Claude see it as a single paste
+/// rather than a stream of keypresses).
+fn handle_paste(app: &mut App, content: String, body: Rect) {
+    let _ = body;
+    let payload = normalize_paste(&content);
+    if payload.is_empty() {
+        return;
+    }
+
+    if let Some(modal) = app.modal.as_mut() {
+        match modal {
+            ModalState::Add(m) => m.current_input_mut().push_str(&payload),
+            ModalState::ClaudeTabPicker(m) if m.name_focused => m.tab_name.push_str(&payload),
+            ModalState::UrlPicker(m) => {
+                for c in payload.chars() {
+                    m.push_char(c);
+                }
+            }
+            // ConfirmDelete is y/n only; ClaudeTabPicker with the list focused
+            // has no text input to append to.
+            _ => {}
+        }
+        return;
+    }
+
+    if app.focus == Focus::Projects {
+        if let Some(filter) = app.sidebar.filter.as_mut() {
+            filter.push_str(&payload);
+            app.sidebar.refresh(&app.store);
+        }
+        return;
+    }
+
+    forward_paste_to_focused_pty(app, &payload);
+}
+
+/// Normalize a paste payload: convert `\r\n` and `\n` to `\r` (Enter), and
+/// strip any embedded `\e[201~` end-marker so a hostile paste can't escape
+/// bracketed-paste mode and inject control sequences into the inner program.
+fn normalize_paste(s: &str) -> String {
+    let stripped = s.replace("\x1b[201~", "");
+    let mut out = String::with_capacity(stripped.len());
+    let mut prev_cr = false;
+    for c in stripped.chars() {
+        match c {
+            '\n' if prev_cr => {
+                // CRLF: the \r was already pushed, swallow the \n.
+            }
+            '\n' => out.push('\r'),
+            '\r' => out.push('\r'),
+            _ => out.push(c),
+        }
+        prev_cr = c == '\r';
+    }
+    out
+}
+
+fn forward_paste_to_focused_pty(app: &mut App, payload: &str) {
+    let focus = app.focus;
+    let Some(session) = app.active_session_mut() else {
+        return;
+    };
+    let pane = match focus {
+        Focus::Claude => session.active_claude_pane_mut(),
+        Focus::Shell => session.shell.as_mut(),
+        Focus::Projects => return,
+    };
+    let Some(pane) = pane else {
+        return;
+    };
+    let bytes: Vec<u8> = if pane.bracketed_paste_mode() {
+        let mut v = Vec::with_capacity(payload.len() + 12);
+        v.extend_from_slice(b"\x1b[200~");
+        v.extend_from_slice(payload.as_bytes());
+        v.extend_from_slice(b"\x1b[201~");
+        v
+    } else {
+        payload.as_bytes().to_vec()
+    };
+    let _ = pane.write(&bytes);
+    pane.scroll_to_bottom();
 }
 
 /// Forward `key` as bytes to whichever PTY currently has focus.
@@ -1754,4 +1853,45 @@ fn handle_claude_tab_click(app: &mut App, strip: Rect, x: u16) {
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
     x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_paste;
+
+    #[test]
+    fn crlf_collapses_to_single_cr() {
+        assert_eq!(normalize_paste("a\r\nb"), "a\rb");
+    }
+
+    #[test]
+    fn lone_lf_becomes_cr() {
+        assert_eq!(normalize_paste("a\nb\nc"), "a\rb\rc");
+    }
+
+    #[test]
+    fn lone_cr_passes_through() {
+        assert_eq!(normalize_paste("a\rb"), "a\rb");
+    }
+
+    #[test]
+    fn strips_embedded_end_marker() {
+        // A hostile paste embeds the bracketed-paste end marker to escape
+        // the wrapping and inject control bytes; we must strip it.
+        let s = "hello\x1b[201~rm -rf /";
+        assert_eq!(normalize_paste(s), "hellorm -rf /");
+    }
+
+    #[test]
+    fn preserves_other_escape_sequences() {
+        // We only strip \e[201~; everything else (color codes, etc.) is
+        // forwarded verbatim so the inner program can decide.
+        let s = "\x1b[31mred\x1b[0m";
+        assert_eq!(normalize_paste(s), s);
+    }
+
+    #[test]
+    fn empty_in_empty_out() {
+        assert_eq!(normalize_paste(""), "");
+    }
 }
