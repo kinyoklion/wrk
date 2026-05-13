@@ -217,6 +217,10 @@ pub struct App {
     pub modal: Option<ModalState>,
     pub should_quit: bool,
     pub error: Option<String>,
+    /// Transient informational status, rendered in the status bar without
+    /// the "error:" prefix and auto-cleared on the next key or mouse event.
+    /// Use for ephemeral feedback like "copied N chars".
+    pub info: Option<String>,
     pub last_click: Option<(Instant, usize)>,
     pub layout_mode: LayoutMode,
     pub sidebar_hidden: bool,
@@ -227,6 +231,13 @@ pub struct App {
     /// this flag) is forwarded to the shell PTY. Lets nested apps like tmux,
     /// zellij, and vim keep their own shortcuts. Persisted per project.
     pub shell_passthrough: bool,
+    /// Transient text-selection mode. While set, mouse-drag selects text in
+    /// the focused pane and mouse-up copies via OSC 52, then auto-exits.
+    /// Escape exits without copying.
+    pub select_mode: bool,
+    /// While in select mode, which pane the mouse-down landed on. Drag and
+    /// up events route to this pane regardless of where the cursor moves.
+    pub select_anchor_pane: Option<Focus>,
 }
 
 impl App {
@@ -254,11 +265,14 @@ impl App {
             modal: None,
             should_quit: false,
             error,
+            info: None,
             last_click: None,
             layout_mode: LayoutMode::Split,
             sidebar_hidden: false,
             claude_pct: 50,
             shell_passthrough: false,
+            select_mode: false,
+            select_anchor_pane: None,
         }
     }
 
@@ -693,6 +707,20 @@ fn push_error(slot: &mut Option<String>, msg: String) {
     });
 }
 
+/// Copy `text` to the host terminal's clipboard via OSC 52 (`ESC ]52;c;<b64> BEL`).
+/// Self-contained so it works over SSH without needing `xclip`/`wl-copy`. Some
+/// terminals require enabling OSC 52 clipboard writes (e.g. xterm
+/// `allowWindowOps`/`disallowedWindowOps`, tmux `set -g allow-passthrough on`).
+fn copy_to_clipboard(text: &str) {
+    use base64::Engine;
+    use std::io::Write;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let payload = format!("\x1b]52;c;{encoded}\x07");
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(payload.as_bytes());
+    let _ = stdout.flush();
+}
+
 fn run_tui() -> Result<()> {
     let store = store::load()?;
     let settings = settings::load().unwrap_or_else(|e| {
@@ -1001,11 +1029,25 @@ fn dump_focused_grid(app: &mut App) {
 }
 
 fn handle_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
+    // Ephemeral status feedback (e.g. "copied N chars") clears on the next
+    // user action so it doesn't shadow the hint indefinitely.
+    app.info = None;
+
     if app.modal.is_some() {
         return handle_modal_key(app, key, body);
     }
 
     let action = app.keymap.lookup(&key);
+
+    // While select mode is on, only Esc (cancel) and the select-mode trigger
+    // itself (toggle off) fire. Everything else is swallowed so partial
+    // input doesn't reach the underlying app while the user is dragging.
+    if app.select_mode {
+        if key.code == KeyCode::Esc || action == Some(GlobalAction::EnterSelectMode) {
+            exit_select_mode(app);
+        }
+        return Ok(());
+    }
 
     // The passthrough toggle is always honored — even while passthrough is on
     // and the shell pane is focused — so the user can always get back out.
@@ -1122,6 +1164,9 @@ fn dispatch_global_action(app: &mut App, action: GlobalAction, body: Rect) -> bo
         GlobalAction::OpenLinkPicker => {
             return open_link_picker(app);
         }
+        GlobalAction::EnterSelectMode => {
+            enter_select_mode(app);
+        }
         GlobalAction::DumpGrid => {
             dump_focused_grid(app);
         }
@@ -1153,6 +1198,35 @@ fn open_link_picker(app: &mut App) -> bool {
         app.modal = Some(ModalState::UrlPicker(UrlPickerModal::new(urls)));
     }
     true
+}
+
+/// Enter transient text-selection mode. Drag with the mouse to select; mouse
+/// up copies via OSC 52 and auto-exits. No-op when focus is on Projects (no
+/// pane to select from); a hint is shown so the user knows why.
+fn enter_select_mode(app: &mut App) {
+    if app.focus == Focus::Projects {
+        push_error(
+            &mut app.error,
+            "select mode: focus a claude or shell pane first".to_string(),
+        );
+        return;
+    }
+    app.select_mode = true;
+    app.select_anchor_pane = None;
+    // No status push here — `build_hint` already shows the right
+    // "drag to select / release to copy / Esc to cancel" guidance
+    // while `select_mode` is on.
+}
+
+/// Cancel select mode without copying. Clears any in-progress selection on
+/// the pane the drag had anchored to.
+fn exit_select_mode(app: &mut App) {
+    if let Some(focus) = app.select_anchor_pane.take()
+        && let Some(pane) = pane_for_focus(app, focus)
+    {
+        pane.selection_clear();
+    }
+    app.select_mode = false;
 }
 
 /// Route a bracketed-paste payload from the host terminal. When a modal text
@@ -1474,6 +1548,11 @@ const DOUBLE_CLICK_MS: u128 = 350;
 const SCROLL_LINES: i32 = 3;
 
 fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
+    // Clear the ephemeral status before dispatching so the next mouse
+    // action either replaces it (e.g. the select-mode mouse-up sets a
+    // fresh "copied N chars") or leaves it cleared.
+    app.info = None;
+
     if app.modal.is_some() {
         return;
     }
@@ -1482,6 +1561,14 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
     let layout = compute_layout(body, app);
     let pos_x = m.column;
     let pos_y = m.row;
+
+    // Select mode owns the mouse: plain drag selects, mouse-up copies via
+    // OSC 52 and auto-exits. PTY mouse-capture and Ctrl/Shift+click are
+    // bypassed so the user can always select regardless of the inner app.
+    if app.select_mode {
+        handle_select_mouse(app, &layout, m, pos_x, pos_y);
+        return;
+    }
 
     // Sidebar clicks always belong to us, never to a PTY.
     if let Some(sidebar) = layout.sidebar
@@ -1549,6 +1636,150 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
             scroll_at(app, &layout, pos_x, pos_y, -SCROLL_LINES);
         }
         _ => {}
+    }
+}
+
+/// Dispatch a mouse event while [`App::select_mode`] is active.
+///
+/// `Down(Left)` anchors a fresh selection on whichever pane is under the
+/// cursor and locks subsequent drags/ups to that pane. `Drag(Left)` extends
+/// the selection (clamped to the anchored pane's content rect, so drag past
+/// the edges still updates to the nearest cell). `Up(Left)` finalizes:
+/// reads the selection text, OSC 52-copies it to the host clipboard, shows
+/// "copied N chars" in the status bar, then auto-exits the mode.
+///
+/// Scroll events still page the alacritty scrollback of the pane under the
+/// cursor so a user can scroll back, then drag to select content that
+/// scrolled off-screen.
+fn handle_select_mouse(app: &mut App, layout: &LayoutRects, m: MouseEvent, pos_x: u16, pos_y: u16) {
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some((focus, inner)) = pane_at(app, layout, pos_x, pos_y) else {
+                return;
+            };
+            let col = (pos_x - inner.x) as usize;
+            let row = (pos_y - inner.y) as usize;
+            app.focus = focus;
+            app.select_anchor_pane = Some(focus);
+            if let Some(pane) = pane_for_focus(app, focus) {
+                pane.selection_anchor(col, row);
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let Some(focus) = app.select_anchor_pane else {
+                return;
+            };
+            let Some(inner) = inner_rect_for_focus(app, layout, focus) else {
+                return;
+            };
+            // Clamp the cursor to the anchored pane so dragging outside its
+            // borders still extends to the edge cell.
+            let col = pos_x.saturating_sub(inner.x) as usize;
+            let row = pos_y.saturating_sub(inner.y) as usize;
+            if let Some(pane) = pane_for_focus(app, focus) {
+                pane.selection_update(col, row);
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let focus = match app.select_anchor_pane.take() {
+                Some(f) => f,
+                None => return,
+            };
+            let text = pane_for_focus(app, focus).and_then(|p| p.selection_text());
+            if let Some(pane) = pane_for_focus(app, focus) {
+                pane.selection_clear();
+            }
+            app.select_mode = false;
+            match text {
+                Some(s) => {
+                    let n = s.chars().count();
+                    copy_to_clipboard(&s);
+                    app.info = Some(format!("copied {n} chars"));
+                }
+                None => {
+                    // Empty drag (just a click) — exit silently.
+                }
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            scroll_at(app, layout, pos_x, pos_y, SCROLL_LINES);
+        }
+        MouseEventKind::ScrollDown => {
+            scroll_at(app, layout, pos_x, pos_y, -SCROLL_LINES);
+        }
+        _ => {}
+    }
+}
+
+/// Resolve the screen position `(x, y)` to the pane under the cursor and
+/// its inner content rect (after stripping the border and the per-session
+/// claude tab strip). Returns `None` for sidebar / tab-strip / gutter clicks.
+fn pane_at(app: &App, layout: &LayoutRects, x: u16, y: u16) -> Option<(Focus, Rect)> {
+    let (focus, outer, is_claude_pane) = match app.layout_mode {
+        LayoutMode::Split => {
+            if rect_contains(layout.claude, x, y) {
+                (Focus::Claude, layout.claude, true)
+            } else if rect_contains(layout.shell, x, y) {
+                (Focus::Shell, layout.shell, false)
+            } else {
+                return None;
+            }
+        }
+        LayoutMode::Tabbed => {
+            if !rect_contains(layout.claude, x, y) {
+                return None;
+            }
+            match app.focus {
+                Focus::Claude => (Focus::Claude, layout.claude, true),
+                Focus::Shell => (Focus::Shell, layout.claude, false),
+                _ => return None,
+            }
+        }
+    };
+    let inner = if is_claude_pane {
+        let count = app
+            .active_session()
+            .map(|s| s.claude_tabs.len())
+            .unwrap_or(0);
+        claude_pane_split(inset(outer), count).1
+    } else {
+        inset(outer)
+    };
+    if !rect_contains(inner, x, y) {
+        return None;
+    }
+    Some((focus, inner))
+}
+
+/// Inner content rect for `focus` in the current layout, accounting for the
+/// claude tab strip. Returns `None` if no pane is currently visible at that
+/// focus (e.g. Tabbed mode with the other side showing).
+fn inner_rect_for_focus(app: &App, layout: &LayoutRects, focus: Focus) -> Option<Rect> {
+    let (outer, is_claude_pane) = match (app.layout_mode, focus) {
+        (LayoutMode::Split, Focus::Claude) => (layout.claude, true),
+        (LayoutMode::Split, Focus::Shell) => (layout.shell, false),
+        (LayoutMode::Tabbed, Focus::Claude) if app.focus != Focus::Shell => (layout.claude, true),
+        (LayoutMode::Tabbed, Focus::Shell) if app.focus == Focus::Shell => (layout.claude, false),
+        _ => return None,
+    };
+    let inner = if is_claude_pane {
+        let count = app
+            .active_session()
+            .map(|s| s.claude_tabs.len())
+            .unwrap_or(0);
+        claude_pane_split(inset(outer), count).1
+    } else {
+        inset(outer)
+    };
+    Some(inner)
+}
+
+fn pane_for_focus(app: &App, focus: Focus) -> Option<&PtyPane> {
+    let session = app.active_session()?;
+    match focus {
+        Focus::Claude => session.active_claude_pane(),
+        Focus::Shell => session.shell.as_ref(),
+        Focus::Projects => None,
     }
 }
 

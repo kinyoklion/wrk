@@ -37,6 +37,7 @@ pub enum GlobalAction {
     LeaderFocusProjects,
     ToggleShellPassthrough,
     OpenLinkPicker,
+    EnterSelectMode,
     DumpGrid,
 }
 
@@ -60,6 +61,7 @@ impl GlobalAction {
             Self::LeaderFocusProjects => "Ctrl+Space",
             Self::ToggleShellPassthrough => "F12",
             Self::OpenLinkPicker => "Alt+u",
+            Self::EnterSelectMode => "Alt+s",
             Self::DumpGrid => "Alt+x",
         }
     }
@@ -82,6 +84,7 @@ impl GlobalAction {
         Self::LeaderFocusProjects,
         Self::ToggleShellPassthrough,
         Self::OpenLinkPicker,
+        Self::EnterSelectMode,
         Self::DumpGrid,
     ];
 }
@@ -295,6 +298,7 @@ fn action_name(a: GlobalAction) -> &'static str {
         GlobalAction::LeaderFocusProjects => "leader_focus_projects",
         GlobalAction::ToggleShellPassthrough => "toggle_shell_passthrough",
         GlobalAction::OpenLinkPicker => "open_link_picker",
+        GlobalAction::EnterSelectMode => "enter_select_mode",
         GlobalAction::DumpGrid => "dump_grid",
     }
 }
