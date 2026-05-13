@@ -302,8 +302,13 @@ impl App {
 
         let session = self.sessions.entry(project.name.clone()).or_default();
 
-        // Build the initial set of tabs from the project's configured sessions
-        // (if none configured, fall back to one default --continue tab).
+        // Build the initial set of tabs from the project's configured sessions.
+        // If the list is empty, spawn one fresh new session — its ID will be
+        // captured by `detect_new_session_ids` (~3 s post-spawn) and persisted
+        // back to `projects.toml`, so subsequent opens resume deterministically
+        // via `--resume <id>`. Entries that already have a `session_id` resume
+        // it directly; entries with no ID (hand-written, or new since last
+        // run) also spawn fresh and capture the ID on first run.
         if session.claude_tabs.is_empty() {
             if project.claude_sessions.is_empty() {
                 session.claude_tabs.push(ClaudeTab {
@@ -311,17 +316,18 @@ impl App {
                     session_id: None,
                     status_id: new_status_id(),
                     pane: None,
-                    detect_session_id: false,
+                    detect_session_id: true,
                     spawn_time: None,
                 });
             } else {
                 for sr in &project.claude_sessions {
+                    let needs_detect = sr.session_id.is_none();
                     session.claude_tabs.push(ClaudeTab {
                         name: sr.name.clone(),
                         session_id: sr.session_id.clone(),
                         status_id: new_status_id(),
                         pane: None,
-                        detect_session_id: false,
+                        detect_session_id: needs_detect,
                         spawn_time: None,
                     });
                 }
@@ -333,12 +339,7 @@ impl App {
         for tab in &mut session.claude_tabs {
             let dead = tab.pane.as_mut().is_some_and(|p| p.child_finished());
             if tab.pane.is_none() || dead {
-                let cmd = claude_command(
-                    &self.settings,
-                    tab.session_id.as_deref(),
-                    false,
-                    &project.path,
-                );
+                let cmd = claude_command(&self.settings, tab.session_id.as_deref());
                 let status_path = status::status_file_for_tab(&tab.status_id);
                 let env = vec![(
                     "WRK_STATUS_FILE".to_string(),
@@ -450,12 +451,7 @@ impl App {
         };
 
         let new_session = session_id.is_none();
-        let cmd = claude_command(
-            &self.settings,
-            session_id.as_deref(),
-            new_session,
-            &project_path,
-        );
+        let cmd = claude_command(&self.settings, session_id.as_deref());
         let status_id = new_status_id();
         let status_path = status::status_file_for_tab(&status_id);
         let env = vec![(
@@ -556,11 +552,11 @@ impl App {
             .iter_mut()
             .find(|p| p.name == project_name)
         {
-            // Don't save the synthetic single default tab with no session_id
-            // (that's the backwards-compat case — keep the TOML clean).
-            let is_default_single =
-                tabs.len() == 1 && tabs[0].name == "claude" && tabs[0].session_id.is_none();
-            p.claude_sessions = if is_default_single { vec![] } else { tabs };
+            // Persist the live tab list faithfully. A tab without a session_id
+            // (newly spawned, ID not yet discovered) is intentionally kept —
+            // detect_new_session_ids will re-persist with the real ID once
+            // claude has written its session file (~3 s post-spawn).
+            p.claude_sessions = tabs;
         }
         if let Err(e) = store::save(&self.store) {
             push_error(&mut self.error, format!("save failed: {e}"));
@@ -611,33 +607,19 @@ impl App {
 }
 
 /// Build the claude launch command for a tab.
-///  - `session_id = Some(id)` → `claude --resume <id>`
-///  - `new_session = true`    → `claude` (no args; start a fresh session)
-///  - otherwise              → `claude --continue` only when prior sessions
-///    exist on disk; bare `claude` for a new project
-fn claude_command(
-    settings: &Settings,
-    session_id: Option<&str>,
-    new_session: bool,
-    project_path: &std::path::Path,
-) -> Vec<String> {
+///  - `session_id = Some(id)` → `claude --resume <id>` (deterministic resume)
+///  - `session_id = None`     → bare `claude` (fresh new session — its ID is
+///    captured shortly after spawn by `detect_new_session_ids` and persisted)
+///
+/// `claude --continue` is intentionally not used. It resumes "the most recent
+/// session in this directory", which is non-deterministic when multiple wrk
+/// projects share a path: project A could end up attached to a session that
+/// actually belongs to project B simply because B was used more recently.
+fn claude_command(settings: &Settings, session_id: Option<&str>) -> Vec<String> {
     let mut cmd = settings.claude_base();
-    match session_id {
-        Some(id) => {
-            cmd.push("--resume".to_string());
-            cmd.push(id.to_string());
-        }
-        None if new_session => {
-            // bare `claude` — Claude will create a fresh session
-        }
-        None => {
-            // Use --continue only when a prior session actually exists; if the
-            // project is brand-new there is nothing to continue and --continue
-            // may exit immediately.
-            if !session::discover_sessions(project_path).is_empty() {
-                cmd.push("--continue".to_string());
-            }
-        }
+    if let Some(id) = session_id {
+        cmd.push("--resume".to_string());
+        cmd.push(id.to_string());
     }
     cmd
 }
