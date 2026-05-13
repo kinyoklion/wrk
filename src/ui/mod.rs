@@ -432,10 +432,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         // Transient feedback like "copied N chars" — no prefix, hint-colored
         // so it reads as status rather than an alert. Cleared on the next
         // key or mouse event.
-        spans.push(Span::styled(
-            info.clone(),
-            Style::default().fg(theme.info),
-        ));
+        spans.push(Span::styled(info.clone(), Style::default().fg(theme.info)));
     } else {
         let hint = build_hint(app);
         spans.push(Span::styled(hint, Style::default().fg(theme.hint)));

@@ -1651,13 +1651,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
 /// Scroll events still page the alacritty scrollback of the pane under the
 /// cursor so a user can scroll back, then drag to select content that
 /// scrolled off-screen.
-fn handle_select_mouse(
-    app: &mut App,
-    layout: &LayoutRects,
-    m: MouseEvent,
-    pos_x: u16,
-    pos_y: u16,
-) {
+fn handle_select_mouse(app: &mut App, layout: &LayoutRects, m: MouseEvent, pos_x: u16, pos_y: u16) {
     match m.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let Some((focus, inner)) = pane_at(app, layout, pos_x, pos_y) else {
