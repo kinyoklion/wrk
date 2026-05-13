@@ -414,10 +414,27 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    if app.select_mode {
+        spans.push(Span::styled(
+            "[select] ",
+            Style::default()
+                .fg(theme.accent_fg)
+                .bg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if let Some(err) = &app.error {
         spans.push(Span::styled(
             format!("error: {err}"),
             Style::default().fg(theme.error),
+        ));
+    } else if let Some(info) = &app.info {
+        // Transient feedback like "copied N chars" — no prefix, hint-colored
+        // so it reads as status rather than an alert. Cleared on the next
+        // key or mouse event.
+        spans.push(Span::styled(
+            info.clone(),
+            Style::default().fg(theme.info),
         ));
     } else {
         let hint = build_hint(app);
@@ -432,6 +449,13 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 /// they're spliced in literally.
 fn build_hint(app: &App) -> String {
     let km = &app.keymap;
+    if app.select_mode {
+        return format!(
+            "select: drag to highlight, release to copy, {esc}/{toggle} cancel",
+            esc = "Esc",
+            toggle = km.display(crate::keymap::GlobalAction::EnterSelectMode),
+        );
+    }
     let passthrough_active = app.shell_passthrough && app.focus == Focus::Shell;
     if passthrough_active {
         return format!(

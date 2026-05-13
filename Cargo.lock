@@ -2509,6 +2509,7 @@ version = "0.1.5"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
+ "base64",
  "clap",
  "crossterm",
  "directories",

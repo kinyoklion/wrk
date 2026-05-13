@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::Term;
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, TermMode, viewport_to_point};
 use anyhow::{Context, Result};
@@ -206,6 +207,58 @@ impl PtyPane {
             .lock()
             .map(|t| t.mode().contains(TermMode::BRACKETED_PASTE))
             .unwrap_or(false)
+    }
+
+    /// Anchor a new selection at the viewport cell `(col, row)`, replacing
+    /// any prior selection. `(col, row)` are 0-indexed and relative to the
+    /// inner pane rect (the same shape `url_at` accepts).
+    pub fn selection_anchor(&self, col: usize, row: usize) {
+        let Ok(mut term) = self.term.lock() else {
+            return;
+        };
+        if row >= term.screen_lines() || col >= term.columns() {
+            return;
+        }
+        let display_offset = term.grid().display_offset();
+        let point = viewport_to_point(display_offset, Point::new(row, Column(col)));
+        term.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+    }
+
+    /// Extend the in-progress selection to viewport cell `(col, row)`. No-op
+    /// if no selection is anchored. `col`/`row` are clamped to the grid so
+    /// drag past the pane edges still updates to the nearest cell.
+    pub fn selection_update(&self, col: usize, row: usize) {
+        let Ok(mut term) = self.term.lock() else {
+            return;
+        };
+        let cols = term.columns();
+        let rows = term.screen_lines();
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        let col = col.min(cols - 1);
+        let row = row.min(rows - 1);
+        let display_offset = term.grid().display_offset();
+        let point = viewport_to_point(display_offset, Point::new(row, Column(col)));
+        if let Some(sel) = term.selection.as_mut() {
+            sel.update(point, Side::Right);
+        }
+    }
+
+    /// Clear any in-progress selection on this pane.
+    pub fn selection_clear(&self) {
+        if let Ok(mut term) = self.term.lock() {
+            term.selection = None;
+        }
+    }
+
+    /// Materialize the current selection to a string, or `None` if there is
+    /// no selection or it is empty. Mirrors alacritty's own copy semantics
+    /// (handles wide chars, line wrapping, and scrollback correctly).
+    pub fn selection_text(&self) -> Option<String> {
+        let term = self.term.lock().ok()?;
+        let s = term.selection_to_string()?;
+        if s.is_empty() { None } else { Some(s) }
     }
 
     /// Snapshot of the terminal's current mouse-reporting flags.
@@ -409,6 +462,7 @@ impl<'a> Widget for PtyPaneWidget<'a> {
         let cols = term.columns();
         let lines = term.screen_lines();
         let display_offset = content.display_offset as i32;
+        let selection = content.selection;
 
         for indexed in content.display_iter {
             let cell = indexed.cell;
@@ -422,6 +476,9 @@ impl<'a> Widget for PtyPaneWidget<'a> {
             if x >= area.x + area.width || y >= area.y + area.height {
                 continue;
             }
+            let selected = selection
+                .as_ref()
+                .is_some_and(|r| r.contains(indexed.point));
             let cell_buf = &mut buf[(x, y)];
 
             // The right half of a wide character (and the leading-spacer column-0
@@ -452,7 +509,11 @@ impl<'a> Widget for PtyPaneWidget<'a> {
                 }
             }
             cell_buf.set_symbol(&symbol);
-            cell_buf.set_style(cell_style(cell.fg, cell.bg, cell.flags));
+            let mut style = cell_style(cell.fg, cell.bg, cell.flags);
+            if selected {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            cell_buf.set_style(style);
         }
     }
 }
