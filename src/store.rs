@@ -22,7 +22,10 @@ pub enum LayoutMode {
 pub struct SessionRef {
     pub name: String,
     /// Claude session UUID. When present, wrk launches `claude --resume <id>`.
-    /// When absent, wrk launches `claude --continue` (most-recent session).
+    /// When absent, wrk spawns a fresh new Claude session for this tab and
+    /// fills in the ID a few seconds later (via session-file discovery).
+    /// Once persisted with an ID, subsequent project opens resume the same
+    /// session deterministically — `claude --continue` is not used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
 }
@@ -49,7 +52,7 @@ pub struct Project {
     )]
     pub shell_passthrough: Option<bool>,
     /// Named Claude sessions associated with this project. When empty wrk
-    /// spawns one default `claude --continue` tab (backwards-compatible).
+    /// spawns one fresh new Claude session on open and records its ID here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub claude_sessions: Vec<SessionRef>,
 }
@@ -189,5 +192,33 @@ mod tests {
     fn remove_missing_errors() {
         let mut store = ProjectStore::default();
         assert!(store.remove("nope").is_err());
+    }
+
+    /// Regression: a single tab named "claude" with no session_id used to be
+    /// erased by a "default-tab" special case in `App::persist_claude_sessions`,
+    /// which made closing the only tab respawn a fresh `--continue` tab on
+    /// next open. The special case is gone; the entry must round-trip.
+    #[test]
+    fn round_trip_single_unnamed_session() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("projects.toml");
+        let mut store = ProjectStore::default();
+        store
+            .add(Project {
+                name: "p".into(),
+                path: PathBuf::from("/tmp/p"),
+                tags: vec![],
+                layout_mode: None,
+                shell_passthrough: None,
+                claude_sessions: vec![SessionRef {
+                    name: "claude".into(),
+                    session_id: None,
+                }],
+            })
+            .unwrap();
+        save_to(&store, &path).unwrap();
+        let loaded = load_from(&path).unwrap();
+        assert_eq!(loaded, store);
+        assert_eq!(loaded.projects[0].claude_sessions.len(), 1);
     }
 }

@@ -7,7 +7,7 @@ project. Linux-only, native rendering (via your terminal), built on
 
 ```
 ┌── projects ──┐┌── claude ──────────────┐┌── shell ────────────┐
-│  ● wrk *     ││ (claude --continue,    ││ $ cargo build       │
+│  ● wrk *     ││ (claude --resume …,    ││ $ cargo build       │
 │  · notes-app ││  embedded PTY → grid   ││                     │
 │    scratch   ││  → ratatui widget)     ││                     │
 │              ││                        ││                     │
@@ -19,18 +19,24 @@ project. Linux-only, native rendering (via your terminal), built on
 
 - **One sidebar of projects**, hand-editable plain-text store at
   `~/.config/wrk/projects.toml`. No DB, syncable to a dotfiles repo.
-- **Per-project sessions** — claude (`claude --continue`) and a shell, both
-  embedded as PTYs. Switching projects keeps every prior session alive in the
-  background; switching back resumes the existing grid + scrollback, no
-  respawn.
+- **Per-project sessions** — claude and a shell, both embedded as PTYs.
+  Switching projects keeps every prior session alive in the background;
+  switching back resumes the existing grid + scrollback, no respawn.
 - **Multiple Claude sessions per project**: each project can hold any number of
   named Claude tabs. Switch with `Alt+<` / `Alt+>`, open a new one with
   `Alt+n` (session picker shows sessions discovered on disk), close the active
-  tab with `Alt+w`. Sessions are persisted in `projects.toml` so wrk resumes
-  the same conversations (`claude --resume <session-id>`) on restart.
+  tab with `Alt+w`. Resumption is **deterministic**: every tab is tied to a
+  specific Claude session ID, persisted to `projects.toml`, and restored via
+  `claude --resume <id>`. A tab with no recorded ID yet (brand-new project, or
+  a hand-written entry) spawns a fresh new session; wrk captures its ID a few
+  seconds later and writes it back to `projects.toml`. wrk does **not** use
+  `claude --continue`, which would non-deterministically attach to whatever
+  session was newest in the directory — wrong when multiple projects share a
+  path.
 - **Multiple projects per directory**: project names are unique; paths need
   not be, so you can have `wrk-feature` and `wrk-bugfix` both pointing at the
-  same directory with separate Claude sessions each.
+  same directory with separate Claude sessions each. Each project resumes its
+  own sessions independently.
 - **Two layouts per project, persisted**: split (claude | shell side-by-side,
   resizable) or tabbed (one content area, claude/shell as tabs). Stored in
   `projects.toml` as `layout = "split" | "tabbed"`.
@@ -45,6 +51,8 @@ project. Linux-only, native rendering (via your terminal), built on
   for OSC 8 hyperlinks and plain `http(s)://` / `ftp://` URLs. For keyboard
   access, **`Alt+u`** opens a picker over every URL in the focused pane's
   scrollback (newest first, filter by typing).
+- **Configurable claude command** for quirky setups (e.g. `steam-run claude`
+  on NixOS).
 - **Per-pane select + copy**: press **`Alt+s`** to enter select mode (status
   bar shows a `[select]` chip), drag with the mouse to highlight cells in the
   focused pane, release to copy via OSC 52 — works through SSH and bypasses
@@ -142,7 +150,8 @@ path = "/home/rlamb/projects/wrk"
 layout = "tabbed"   # optional, defaults to split
 claude_sessions = [
   { name = "main",      session_id = "5d1f9f10-56bc-43f2-9dd5-ca711af4f3f9" },
-  { name = "refactor" },   # no session_id → uses --continue
+  { name = "refactor" },   # no session_id → spawns a fresh new session; wrk
+                           # fills in the ID on first run and persists it
 ]
 
 [[project]]
@@ -152,7 +161,13 @@ tags = ["personal"]
 ```
 
 Multiple projects can share the same `path` — they are differentiated by name
-and each carries its own `claude_sessions` list.
+and each carries its own `claude_sessions` list. Resumption is keyed on the
+recorded `session_id`, so two projects pointing at the same directory each
+reopen their own Claude session, never each other's.
+
+Closing every Claude tab leaves `claude_sessions = []`; the next time you open
+the project, a fresh new session is spawned (not the one you just closed). Use
+`Alt+n` to bring back a previously-used session from the on-disk session list.
 
 The TUI watches this file (notify-rs) and reloads on external edits.
 
@@ -161,8 +176,11 @@ The TUI watches this file (notify-rs) and reloads on external edits.
 Optional. Lets you override the commands wrk launches per pane.
 
 ```toml
-# Defaults: claude_command = ["claude", "--continue"]
-claude_command = ["steam-run", "claude", "--continue"]
+# Defaults: claude_command = ["claude"]
+# wrk appends --resume <id> per tab; do not add --continue here (it's
+# stripped for backwards compat and otherwise unused — resumption is
+# always driven by a specific recorded session ID).
+claude_command = ["steam-run", "claude"]
 
 # Optional. Defaults to $SHELL, then /bin/bash.
 # shell_command = ["zsh"]

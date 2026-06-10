@@ -9,7 +9,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     /// Full command + args used to launch the Claude pane.
-    /// e.g. `["claude", "--continue"]` or `["steam-run", "claude", "--continue"]`.
+    /// e.g. `["claude"]` or `["steam-run", "claude"]`. wrk appends
+    /// `--resume <id>` per tab from this base; do not include `--continue`
+    /// (it's stripped by [`Self::claude_base`] for backwards compatibility
+    /// with older configs since wrk no longer uses it — resumption is always
+    /// driven by a specific session ID).
     #[serde(default = "default_claude")]
     pub claude_command: Vec<String>,
 
@@ -44,9 +48,9 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// The Claude binary + wrapper args without any session flag.
-    /// Strips a trailing `--continue` if present so callers can append
-    /// `--continue` or `--resume <id>` as needed.
+    /// The Claude binary + wrapper args without any session flag. Strips a
+    /// trailing `--continue` if present (older default; no longer used by
+    /// wrk) so the caller can append `--resume <id>` as needed.
     pub fn claude_base(&self) -> Vec<String> {
         let mut cmd = self.claude_command.clone();
         if cmd.last().map(|s| s == "--continue").unwrap_or(false) {
@@ -67,7 +71,7 @@ impl Settings {
 }
 
 fn default_claude() -> Vec<String> {
-    vec!["claude".into(), "--continue".into()]
+    vec!["claude".into()]
 }
 
 pub fn settings_path() -> Result<PathBuf> {
