@@ -53,6 +53,12 @@ project. Linux-only, native rendering (via your terminal), built on
   scrollback (newest first, filter by typing).
 - **Configurable claude command** for quirky setups (e.g. `steam-run claude`
   on NixOS).
+- **Per-pane select + copy**: press **`Alt+s`** to enter select mode (status
+  bar shows a `[select]` chip), drag with the mouse to highlight cells in the
+  focused pane, release to copy via OSC 52 — works through SSH and bypasses
+  the host terminal's whole-row selection. Esc cancels without copying.
+- **Configurable claude command** for quirky setups (e.g. `steam-run claude
+  --continue` on NixOS).
 
 ## Build
 
@@ -88,6 +94,7 @@ The Nix flake provides the toolchain. Without Nix, any Rust ≥ 1.85 (edition
 | `Alt+h` / `Alt+l` | shrink / grow claude pane (split mode) |
 | `Alt+q` | quit |
 | `Alt+u` | open URL picker (scans the focused pane's scrollback) |
+| `Alt+s` | enter select mode — drag to highlight, release to copy via OSC 52 |
 | `Ctrl+Space` | jump back to projects from any pane |
 | `F12` | toggle shell-pane passthrough (persisted per project) |
 
@@ -98,6 +105,15 @@ the focused shell pane is affected; the claude and projects panes still see
 wrk's normal shortcuts. `F12` itself is always intercepted so you can toggle
 it back off. The current state is shown as a `[passthru]` chip in the status
 bar and persisted per project as `passthrough = true` in `projects.toml`.
+
+**Select mode.** `Alt+s` enters a transient text-selection mode (status bar
+shows a `[select]` chip): plain mouse-drag highlights cells in whichever pane
+the drag started on — bypassing both PTY mouse capture and the host
+terminal's whole-row selection — and releasing the button copies the
+selection to your clipboard via OSC 52. The mode auto-exits after the copy;
+press `Esc` to cancel without copying. OSC 52 must be allowed by your outer
+terminal for the clipboard write to land (xterm/Ghostty/kitty/foot allow it
+by default; tmux needs `set -g allow-passthrough on`).
 
 **On the projects pane:**
 
@@ -210,6 +226,7 @@ next_claude_tab          = "Alt+>"
 leader_focus_projects    = "Ctrl+Space"
 toggle_shell_passthrough = "F12"
 open_link_picker         = "Alt+u"
+enter_select_mode        = "Alt+s"
 dump_grid                = "Alt+x"   # diagnostic: dump the focused PTY grid
 ```
 
