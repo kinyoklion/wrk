@@ -43,7 +43,9 @@ project. Linux-only, native rendering (via your terminal), built on
 - **Status indicators** in the sidebar — green ● when claude is waiting for
   input, yellow · while busy, red ● on a Notification (permission prompt).
   Driven by Claude Code hooks when installed (precise), with a
-  time-since-output heuristic as fallback.
+  time-since-output heuristic as fallback. A trailing `*` marks a project with
+  a live session — bright on the active project, dim on ones loaded in the
+  background. Press `u` on the projects pane to unload one.
 - **Mouse**: click panes / tabs / projects to focus, double-click a project to
   open it, scroll wheel paginates the alacritty scrollback (10k lines).
   **Ctrl+click** (or **Shift+click**, if your outer terminal swallows Ctrl) on
@@ -123,6 +125,7 @@ by default; tmux needs `set -g allow-passthrough on`).
 | `Enter` (or double-click) | open the selected project |
 | `+` | add a project (modal) |
 | `d` | delete the selected project (modal) |
+| `u` | unload the selected project — kill its claude + shell, free the session (modal) |
 | `/` | fuzzy filter |
 | `r` | reload `projects.toml` from disk |
 | `q` | quit |

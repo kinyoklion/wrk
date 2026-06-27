@@ -89,6 +89,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             &app.store,
             &theme,
             |name| project_status_for(sessions, name),
+            |name| sessions.contains_key(name),
         );
     }
 
@@ -155,6 +156,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 frame.set_cursor_position(cursor);
             }
             ModalState::ConfirmDelete(m) => {
+                m.render(area, frame.buffer_mut(), &theme);
+            }
+            ModalState::ConfirmUnload(m) => {
                 m.render(area, frame.buffer_mut(), &theme);
             }
             ModalState::ClaudeTabPicker(m) => {
@@ -468,7 +472,7 @@ fn build_hint(app: &App) -> String {
     let quit = km.display(A::Quit);
     match app.focus {
         Focus::Projects => format!(
-            "↑/↓ Enter/dbl-click  +/d/r  /  {toggle_sidebar} sidebar  \
+            "↑/↓ Enter/dbl-click  +/d/u/r  /  {toggle_sidebar} sidebar  \
              {toggle_layout} layout  {shrink}/{grow} resize  {quit} quit",
         ),
         _ => format!(
@@ -491,6 +495,7 @@ fn build_hint(app: &App) -> String {
 pub enum ModalState {
     Add(modal::AddProjectModal),
     ConfirmDelete(modal::ConfirmDeleteModal),
+    ConfirmUnload(modal::ConfirmUnloadModal),
     ClaudeTabPicker(modal::ClaudeTabPickerModal),
     UrlPicker(modal::UrlPickerModal),
 }
