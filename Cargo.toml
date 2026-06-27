@@ -35,6 +35,12 @@ tempfile = "3"
 # library and standalone viewer live as additional workspace members.
 [workspace]
 members = ["crates/markdown", "crates/viewer"]
+# wrk is the root package, so bare `cargo build`/`test`/`clippy` (no --workspace)
+# would otherwise touch only wrk and silently skip the new crates — including in
+# CI, which runs those bare commands. Listing every member as a default keeps the
+# whole workspace built, tested, and linted. (The release build still finds
+# target/release/wrk for its tarball.)
+default-members = [".", "crates/markdown", "crates/viewer"]
 
 [workspace.package]
 edition = "2024"
