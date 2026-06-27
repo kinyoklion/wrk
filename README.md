@@ -73,6 +73,25 @@ cargo build --release
 The Nix flake provides the toolchain. Without Nix, any Rust ≥ 1.85 (edition
 2024) works.
 
+`wrk` is a Cargo workspace. `cargo build --release` produces two binaries:
+`target/release/wrk` (the TUI) and `target/release/wrk-md` (the standalone
+markdown viewer, below). The markdown renderer itself lives in the reusable
+`wrk-markdown` library crate under `crates/markdown`.
+
+## Standalone markdown viewer (`wrk-md`)
+
+`wrk-md` renders a markdown file in the terminal — headings, emphasis, lists,
+tables, block quotes, and syntax-highlighted code blocks — using the same
+engine that backs wrk's in-TUI markdown. Mermaid (and other diagram) fences are
+shown as a code block with a "preview not enabled" note for now; live diagram
+rendering is planned.
+
+```sh
+wrk-md README.md            # scrollable pager (j/k, PgUp/PgDn, g/G, r reload, q quit)
+wrk-md --no-highlight FILE  # disable code syntax highlighting
+wrk-md --print FILE         # plain-text render to stdout (for piping)
+```
+
 ## CLI
 
 | | |

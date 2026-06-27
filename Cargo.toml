@@ -13,17 +13,46 @@ path = "src/main.rs"
 alacritty_terminal = "0.26"
 vte = { version = "0.15", default-features = false, features = ["std", "ansi"] }
 portable-pty = "0.9"
-ratatui = "0.30"
-crossterm = "0.29"
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 toml = "0.8"
 notify = "8"
 nucleo-matcher = "0.3"
-directories = "6"
-clap = { version = "4", features = ["derive"] }
-anyhow = "1"
+directories = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
 base64 = "0.22"
+wrk-markdown = { workspace = true, features = ["highlight"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+# wrk keeps its package manifest at the repo root (rather than moving under
+# crates/) so the synthase release tooling — which is configured against path
+# "." and writes CHANGELOG.md here — keeps working unchanged. The rendering
+# library and standalone viewer live as additional workspace members.
+[workspace]
+members = ["crates/markdown", "crates/viewer"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+# `unstable-rendered-line-info` exposes Paragraph::line_count, which the markdown
+# view uses to clamp scrolling to the wrapped content height. Pinned to 0.30.
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+crossterm = "0.29"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+directories = "6"
+# Shared so the ratatui types that cross crate boundaries (Text/Line/Widget)
+# are guaranteed identical between wrk-markdown and its consumers. Default
+# features are off here so each member opts into `highlight` explicitly
+# (workspace inheritance can add features but cannot disable defaults).
+wrk-markdown = { path = "crates/markdown", default-features = false }

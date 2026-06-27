@@ -1,0 +1,18 @@
+[package]
+name = "wrk-markdown"
+description = "CommonMark/GFM markdown rendering into ratatui text plus a scrollable view widget, used by the wrk TUI and the wrk-md standalone viewer."
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["highlight"]
+# Syntax-highlight fenced code blocks via syntect (pure-Rust fancy-regex engine,
+# no C/oniguruma). When off, code blocks render as plain dimmed text.
+highlight = ["dep:syntect"]
+
+[dependencies]
+ratatui = { workspace = true }
+pulldown-cmark = { version = "0.13", default-features = false }
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"], optional = true }
