@@ -36,7 +36,8 @@ use crate::settings::{Settings, Theme};
 use crate::store::{LayoutMode, Project, ProjectStore, SessionRef};
 use crate::ui::ModalState;
 use crate::ui::modal::{
-    AddProjectModal, ClaudeTabPickerModal, ConfirmDeleteModal, ConfirmUnloadModal, UrlPickerModal,
+    AddProjectModal, ClaudeTabPickerModal, ConfirmDeleteModal, ConfirmUnloadModal,
+    OpenMarkdownModal, UrlPickerModal,
 };
 
 #[derive(Parser)]
@@ -183,25 +184,87 @@ fn new_status_id() -> String {
     )
 }
 
+/// A read-only markdown document tab within a project's primary pane. Unlike
+/// Claude tabs these are ephemeral — they hold no PTY, aren't persisted to
+/// `projects.toml`, and are dropped when the project is unloaded.
+pub struct MarkdownTab {
+    /// Display name shown in the tab strip (the file's name).
+    pub name: String,
+    /// Absolute path to the source file (used for reload).
+    pub path: PathBuf,
+    /// Pre-rendered styled lines. Re-rendered on reload.
+    pub rendered: ratatui::text::Text<'static>,
+    /// Scroll/viewport state for the markdown view widget.
+    pub state: wrk_markdown::MarkdownViewState,
+}
+
+/// A tab in a project's primary pane: either a Claude PTY session or a markdown
+/// document viewer.
+pub enum Tab {
+    Claude(ClaudeTab),
+    Markdown(MarkdownTab),
+}
+
+impl Tab {
+    pub fn name(&self) -> &str {
+        match self {
+            Tab::Claude(t) => &t.name,
+            Tab::Markdown(t) => &t.name,
+        }
+    }
+    pub fn as_claude(&self) -> Option<&ClaudeTab> {
+        match self {
+            Tab::Claude(t) => Some(t),
+            Tab::Markdown(_) => None,
+        }
+    }
+    pub fn as_claude_mut(&mut self) -> Option<&mut ClaudeTab> {
+        match self {
+            Tab::Claude(t) => Some(t),
+            Tab::Markdown(_) => None,
+        }
+    }
+    pub fn is_markdown(&self) -> bool {
+        matches!(self, Tab::Markdown(_))
+    }
+}
+
 #[derive(Default)]
 pub struct ProjectSession {
-    pub claude_tabs: Vec<ClaudeTab>,
-    pub active_claude: usize,
+    /// All tabs in the primary pane, Claude and markdown intermixed in the
+    /// order they appear in the tab strip.
+    pub tabs: Vec<Tab>,
+    /// Index into `tabs` of the currently shown tab.
+    pub active_tab: usize,
     pub shell: Option<PtyPane>,
 }
 
 impl ProjectSession {
+    pub fn current(&self) -> Option<&Tab> {
+        self.tabs.get(self.active_tab)
+    }
+    pub fn current_mut(&mut self) -> Option<&mut Tab> {
+        self.tabs.get_mut(self.active_tab)
+    }
     pub fn active_claude_tab(&self) -> Option<&ClaudeTab> {
-        self.claude_tabs.get(self.active_claude)
+        self.current()?.as_claude()
     }
     pub fn active_claude_tab_mut(&mut self) -> Option<&mut ClaudeTab> {
-        self.claude_tabs.get_mut(self.active_claude)
+        self.current_mut()?.as_claude_mut()
     }
     pub fn active_claude_pane(&self) -> Option<&PtyPane> {
         self.active_claude_tab()?.pane.as_ref()
     }
     pub fn active_claude_pane_mut(&mut self) -> Option<&mut PtyPane> {
         self.active_claude_tab_mut()?.pane.as_mut()
+    }
+    /// Iterator over just the Claude tabs (for spawning/resizing/reaping PTYs,
+    /// status, and persistence — markdown tabs are skipped).
+    pub fn claude_tabs(&self) -> impl Iterator<Item = &ClaudeTab> {
+        self.tabs.iter().filter_map(Tab::as_claude)
+    }
+    pub fn claude_tabs_mut(&mut self) -> impl Iterator<Item = &mut ClaudeTab> {
+        self.tabs.iter_mut().filter_map(Tab::as_claude_mut)
     }
 }
 
@@ -325,34 +388,34 @@ impl App {
         // via `--resume <id>`. Entries that already have a `session_id` resume
         // it directly; entries with no ID (hand-written, or new since last
         // run) also spawn fresh and capture the ID on first run.
-        if session.claude_tabs.is_empty() {
+        if session.tabs.is_empty() {
             if project.claude_sessions.is_empty() {
-                session.claude_tabs.push(ClaudeTab {
+                session.tabs.push(Tab::Claude(ClaudeTab {
                     name: "claude".to_string(),
                     session_id: None,
                     status_id: new_status_id(),
                     pane: None,
                     detect_session_id: true,
                     spawn_time: None,
-                });
+                }));
             } else {
                 for sr in &project.claude_sessions {
                     let needs_detect = sr.session_id.is_none();
-                    session.claude_tabs.push(ClaudeTab {
+                    session.tabs.push(Tab::Claude(ClaudeTab {
                         name: sr.name.clone(),
                         session_id: sr.session_id.clone(),
                         status_id: new_status_id(),
                         pane: None,
                         detect_session_id: needs_detect,
                         spawn_time: None,
-                    });
+                    }));
                 }
             }
         }
 
         // Spawn any missing or dead claude panes.
-        let claude_content = claude_pane_split(claude_inner, session.claude_tabs.len()).1;
-        for tab in &mut session.claude_tabs {
+        let claude_content = claude_pane_split(claude_inner, session.tabs.len()).1;
+        for tab in session.claude_tabs_mut() {
             let dead = tab.pane.as_mut().is_some_and(|p| p.child_finished());
             if tab.pane.is_none() || dead {
                 let cmd = claude_command(&self.settings, tab.session_id.as_deref());
@@ -400,7 +463,7 @@ impl App {
         }
 
         // Resize live panes to current geometry (covers terminal resize while inactive).
-        for tab in &mut session.claude_tabs {
+        for tab in session.claude_tabs_mut() {
             if let Some(p) = tab.pane.as_mut() {
                 let _ = p.resize(claude_content.height, claude_content.width);
             }
@@ -458,7 +521,7 @@ impl App {
         let existing = self
             .sessions
             .get(&project_name)
-            .map(|s| s.claude_tabs.len())
+            .map(|s| s.tabs.len())
             .unwrap_or(0);
         let claude_content = claude_pane_split(claude_inner, existing + 1).1;
 
@@ -496,38 +559,95 @@ impl App {
         };
 
         let session = self.sessions.entry(project_name.clone()).or_default();
-        session.claude_tabs.push(ClaudeTab {
+        session.tabs.push(Tab::Claude(ClaudeTab {
             name,
             session_id: session_id.clone(),
             status_id,
             pane,
             detect_session_id: new_session,
             spawn_time,
-        });
-        let new_idx = session.claude_tabs.len() - 1;
-        session.active_claude = new_idx;
+        }));
+        let new_idx = session.tabs.len() - 1;
+        session.active_tab = new_idx;
 
         // Persist to store.
         self.persist_claude_sessions(&project_name);
     }
 
-    /// Close (kill) the currently active Claude tab.  If it is the only tab,
-    /// does nothing — a project always keeps at least one tab.
-    fn close_active_claude_tab(&mut self) {
+    /// Open a markdown file as a new tab in the active project's primary pane.
+    /// `input` is resolved relative to the project directory (or used as-is if
+    /// absolute). On success the new tab becomes active and the primary pane is
+    /// focused. Markdown tabs are ephemeral — never persisted to `projects.toml`.
+    fn open_markdown_tab(&mut self, input: &str) -> Result<()> {
+        let project_name = self
+            .active_project_name
+            .clone()
+            .ok_or_else(|| anyhow!("no active project — open one first"))?;
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!("enter a file path"));
+        }
+        let raw = PathBuf::from(trimmed);
+        let joined = if raw.is_absolute() {
+            raw
+        } else if let Some(base) = self.active_project().map(|p| p.path.clone()) {
+            base.join(raw)
+        } else {
+            raw
+        };
+        let path = joined
+            .canonicalize()
+            .with_context(|| format!("resolving {}", joined.display()))?;
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("markdown")
+            .to_string();
+        let rendered =
+            wrk_markdown::render_document(&content, &wrk_markdown::RenderOptions::default());
+
+        let session = self
+            .sessions
+            .get_mut(&project_name)
+            .ok_or_else(|| anyhow!("open a project first"))?;
+        session.tabs.push(Tab::Markdown(MarkdownTab {
+            name,
+            path,
+            rendered,
+            state: wrk_markdown::MarkdownViewState::new(),
+        }));
+        session.active_tab = session.tabs.len() - 1;
+        self.focus = Focus::Claude;
+        Ok(())
+    }
+
+    /// Close the currently active tab. Markdown tabs are closed freely; a Claude
+    /// tab is only closed when another Claude tab remains, so a project always
+    /// keeps at least one Claude session. Persists only when a Claude tab was
+    /// removed (markdown tabs aren't tracked in `projects.toml`).
+    fn close_active_tab(&mut self) {
         let Some(project_name) = self.active_project_name.clone() else {
             return;
         };
         let Some(session) = self.sessions.get_mut(&project_name) else {
             return;
         };
-        if session.claude_tabs.len() <= 1 {
+        let Some(tab) = session.current() else {
+            return;
+        };
+        let removed_claude = matches!(tab, Tab::Claude(_));
+        if removed_claude && session.claude_tabs().count() <= 1 {
             return;
         }
-        session.claude_tabs.remove(session.active_claude);
-        if session.active_claude >= session.claude_tabs.len() {
-            session.active_claude = session.claude_tabs.len() - 1;
+        session.tabs.remove(session.active_tab);
+        if session.active_tab >= session.tabs.len() {
+            session.active_tab = session.tabs.len().saturating_sub(1);
         }
-        self.persist_claude_sessions(&project_name);
+        if removed_claude {
+            self.persist_claude_sessions(&project_name);
+        }
     }
 
     /// Unload a project's running session: tear down its Claude tabs and shell
@@ -543,7 +663,7 @@ impl App {
         };
         // Best-effort: remove the per-tab status files so a stale status dot
         // doesn't linger for a project that's no longer loaded.
-        for tab in &session.claude_tabs {
+        for tab in session.claude_tabs() {
             status::remove_tab_status(&tab.status_id);
         }
         // Dropping `session` here kills its child processes and joins their
@@ -560,22 +680,22 @@ impl App {
         true
     }
 
-    fn next_claude_tab(&mut self) {
+    fn next_tab(&mut self) {
         let Some(session) = self.active_session_mut() else {
             return;
         };
-        if session.claude_tabs.len() > 1 {
-            session.active_claude = (session.active_claude + 1) % session.claude_tabs.len();
+        if session.tabs.len() > 1 {
+            session.active_tab = (session.active_tab + 1) % session.tabs.len();
         }
     }
 
-    fn prev_claude_tab(&mut self) {
+    fn prev_tab(&mut self) {
         let Some(session) = self.active_session_mut() else {
             return;
         };
-        if session.claude_tabs.len() > 1 {
-            let n = session.claude_tabs.len();
-            session.active_claude = (session.active_claude + n - 1) % n;
+        if session.tabs.len() > 1 {
+            let n = session.tabs.len();
+            session.active_tab = (session.active_tab + n - 1) % n;
         }
     }
 
@@ -583,8 +703,7 @@ impl App {
     fn persist_claude_sessions(&mut self, project_name: &str) {
         let tabs = match self.sessions.get(project_name) {
             Some(s) => s
-                .claude_tabs
-                .iter()
+                .claude_tabs()
                 .map(|t| SessionRef {
                     name: t.name.clone(),
                     session_id: t.session_id.clone(),
@@ -685,7 +804,7 @@ fn detect_new_session_ids(app: &mut App) {
     };
 
     let mut any_detected = false;
-    for tab in &mut session.claude_tabs {
+    for tab in session.claude_tabs_mut() {
         if !tab.detect_session_id || tab.session_id.is_some() {
             continue;
         }
@@ -845,8 +964,8 @@ fn event_loop(
 
         // Resize only the active session's panes; inactive sessions keep their grids.
         if let Some(session) = app.active_session_mut() {
-            let claude_content = claude_pane_split(claude_inner, session.claude_tabs.len()).1;
-            for tab in &mut session.claude_tabs {
+            let claude_content = claude_pane_split(claude_inner, session.tabs.len()).1;
+            for tab in session.claude_tabs_mut() {
                 if let Some(p) = tab.pane.as_mut() {
                     let _ = p.resize(claude_content.height, claude_content.width);
                 }
@@ -882,7 +1001,7 @@ fn event_loop(
 
         // Reap dead children on the active session so the placeholder shows.
         if let Some(session) = app.active_session_mut() {
-            for tab in &mut session.claude_tabs {
+            for tab in session.claude_tabs_mut() {
                 if tab.pane.as_mut().is_some_and(|p| p.child_finished()) {
                     tab.pane = None;
                 }
@@ -1090,10 +1209,51 @@ fn handle_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
 
     match app.focus {
         Focus::Projects => handle_projects_key(app, key, body),
+        // When the active primary tab is a markdown viewer, keys drive the
+        // viewer (scroll/reload) instead of being forwarded to a PTY.
+        Focus::Claude if active_tab_is_markdown(app) => {
+            handle_markdown_key(app, key);
+            Ok(())
+        }
         Focus::Claude | Focus::Shell => {
             forward_key_to_focused_pty(app, key);
             Ok(())
         }
+    }
+}
+
+/// True when the active project's currently-shown primary tab is a markdown
+/// viewer (so input/scroll route to the viewer rather than a PTY).
+fn active_tab_is_markdown(app: &App) -> bool {
+    app.active_session()
+        .and_then(|s| s.current())
+        .is_some_and(Tab::is_markdown)
+}
+
+/// Handle a key while a markdown tab is focused: scrolling, paging, and reload.
+fn handle_markdown_key(app: &mut App, key: KeyEvent) {
+    let Some(session) = app.active_session_mut() else {
+        return;
+    };
+    let Some(Tab::Markdown(md)) = session.current_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => md.state.scroll_by(1),
+        KeyCode::Char('k') | KeyCode::Up => md.state.scroll_by(-1),
+        KeyCode::Char('d') | KeyCode::PageDown | KeyCode::Char(' ') => md.state.page_down(),
+        KeyCode::Char('u') | KeyCode::PageUp => md.state.page_up(),
+        KeyCode::Char('g') | KeyCode::Home => md.state.scroll_to_top(),
+        KeyCode::Char('G') | KeyCode::End => md.state.scroll_to_bottom(),
+        KeyCode::Char('r') => {
+            if let Ok(content) = std::fs::read_to_string(&md.path) {
+                md.rendered = wrk_markdown::render_document(
+                    &content,
+                    &wrk_markdown::RenderOptions::default(),
+                );
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1163,13 +1323,20 @@ fn dispatch_global_action(app: &mut App, action: GlobalAction, body: Rect) -> bo
             )));
         }
         GlobalAction::CloseClaudeTab => {
-            app.close_active_claude_tab();
+            app.close_active_tab();
         }
         GlobalAction::PrevClaudeTab => {
-            app.prev_claude_tab();
+            app.prev_tab();
         }
         GlobalAction::NextClaudeTab => {
-            app.next_claude_tab();
+            app.next_tab();
+        }
+        GlobalAction::OpenMarkdown => {
+            if app.active_project_name.is_none() {
+                push_error(&mut app.error, "open markdown: open a project first".into());
+                return false;
+            }
+            app.modal = Some(ModalState::OpenMarkdown(OpenMarkdownModal::default()));
         }
         // Handled in handle_key before passthrough check.
         GlobalAction::ToggleShellPassthrough => {
@@ -1259,6 +1426,7 @@ fn handle_paste(app: &mut App, content: String, body: Rect) {
     if let Some(modal) = app.modal.as_mut() {
         match modal {
             ModalState::Add(m) => m.current_input_mut().push_str(&payload),
+            ModalState::OpenMarkdown(m) => m.path_input.push_str(&payload),
             ModalState::ClaudeTabPicker(m) if m.name_focused => m.tab_name.push_str(&payload),
             ModalState::UrlPicker(m) => {
                 for c in payload.chars() {
@@ -1429,6 +1597,9 @@ fn handle_filter_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
 
 fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
     let mut consumed_modal = None;
+    // Deferred so the markdown file is opened after `m`'s borrow of `app.modal`
+    // ends (opening needs `&mut app`).
+    let mut open_md_input: Option<String> = None;
     match app.modal.as_mut().unwrap() {
         ModalState::Add(m) => match key.code {
             KeyCode::Esc => {
@@ -1477,6 +1648,15 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                     Err(e) => m.error = Some(e.to_string()),
                 }
             }
+            _ => {}
+        },
+        ModalState::OpenMarkdown(m) => match key.code {
+            KeyCode::Esc => consumed_modal = Some(()),
+            KeyCode::Backspace => {
+                m.path_input.pop();
+            }
+            KeyCode::Char(c) => m.path_input.push(c),
+            KeyCode::Enter => open_md_input = Some(m.path_input.clone()),
             _ => {}
         },
         ModalState::ConfirmDelete(m) => match key.code {
@@ -1579,6 +1759,18 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                 }
             }
             _ => {}
+        }
+    }
+    // Deferred markdown open: succeed → close the modal; fail → keep it open and
+    // show the error inline.
+    if let Some(input) = open_md_input {
+        match app.open_markdown_tab(&input) {
+            Ok(()) => app.modal = None,
+            Err(e) => {
+                if let Some(ModalState::OpenMarkdown(m)) = app.modal.as_mut() {
+                    m.error = Some(e.to_string());
+                }
+            }
         }
     }
     Ok(())
@@ -1778,10 +1970,7 @@ fn pane_at(app: &App, layout: &LayoutRects, x: u16, y: u16) -> Option<(Focus, Re
         }
     };
     let inner = if is_claude_pane {
-        let count = app
-            .active_session()
-            .map(|s| s.claude_tabs.len())
-            .unwrap_or(0);
+        let count = app.active_session().map(|s| s.tabs.len()).unwrap_or(0);
         claude_pane_split(inset(outer), count).1
     } else {
         inset(outer)
@@ -1804,10 +1993,7 @@ fn inner_rect_for_focus(app: &App, layout: &LayoutRects, focus: Focus) -> Option
         _ => return None,
     };
     let inner = if is_claude_pane {
-        let count = app
-            .active_session()
-            .map(|s| s.claude_tabs.len())
-            .unwrap_or(0);
+        let count = app.active_session().map(|s| s.tabs.len()).unwrap_or(0);
         claude_pane_split(inset(outer), count).1
     } else {
         inset(outer)
@@ -1873,10 +2059,7 @@ fn forward_mouse_to_pane(
     // session tab strip — adjust the inner rect so pane-local coords match
     // the cells the user can actually see.
     let inner = if target_focus == Focus::Claude {
-        let count = app
-            .active_session()
-            .map(|s| s.claude_tabs.len())
-            .unwrap_or(0);
+        let count = app.active_session().map(|s| s.tabs.len()).unwrap_or(0);
         claude_pane_split(inset(outer), count).1
     } else {
         inset(outer)
@@ -1978,31 +2161,43 @@ fn handle_left_click(app: &mut App, layout: &LayoutRects, _body: Rect, pos_x: u1
     }
 }
 
-fn scroll_at(app: &App, layout: &LayoutRects, x: u16, y: u16, delta: i32) {
+fn scroll_at(app: &mut App, layout: &LayoutRects, x: u16, y: u16, delta: i32) {
+    // Which logical pane is the cursor over? In Tabbed mode only the focused
+    // side is visible in the shared content rect.
+    let (over_primary, over_shell) = match app.layout_mode {
+        LayoutMode::Split => (
+            rect_contains(layout.claude, x, y),
+            rect_contains(layout.shell, x, y),
+        ),
+        LayoutMode::Tabbed => {
+            let on = rect_contains(layout.claude, x, y);
+            (
+                on && app.focus == Focus::Claude,
+                on && app.focus == Focus::Shell,
+            )
+        }
+    };
+
+    // A markdown tab scrolls its view state (wheel-up, positive delta like PTY
+    // scrollback, moves the view toward the top → decreasing offset).
+    if over_primary && active_tab_is_markdown(app) {
+        if let Some(session) = app.active_session_mut()
+            && let Some(Tab::Markdown(md)) = session.current_mut()
+        {
+            md.state.scroll_by(-delta);
+        }
+        return;
+    }
+
     let Some(session) = app.active_session() else {
         return;
     };
-    let pane = match app.layout_mode {
-        LayoutMode::Split => {
-            if rect_contains(layout.claude, x, y) {
-                session.active_claude_pane()
-            } else if rect_contains(layout.shell, x, y) {
-                session.shell.as_ref()
-            } else {
-                None
-            }
-        }
-        LayoutMode::Tabbed => {
-            if !rect_contains(layout.claude, x, y) {
-                None
-            } else {
-                match app.focus {
-                    Focus::Claude => session.active_claude_pane(),
-                    Focus::Shell => session.shell.as_ref(),
-                    _ => None,
-                }
-            }
-        }
+    let pane = if over_primary {
+        session.active_claude_pane()
+    } else if over_shell {
+        session.shell.as_ref()
+    } else {
+        None
     };
     if let Some(p) = pane {
         p.scroll(delta);
@@ -2041,7 +2236,7 @@ fn try_open_url(app: &App, layout: &LayoutRects, pos_x: u16, pos_y: u16) -> bool
         return false;
     };
     let inner = if is_claude_pane {
-        claude_pane_split(inset(outer), session.claude_tabs.len()).1
+        claude_pane_split(inset(outer), session.tabs.len()).1
     } else {
         inset(outer)
     };
@@ -2094,7 +2289,7 @@ fn handle_sidebar_click(app: &mut App, sidebar: Rect, row: u16, body: Rect) {
 /// only when focus is not Shell in Tabbed).
 fn visible_claude_tab_strip(app: &App, layout: &LayoutRects) -> Option<Rect> {
     let session = app.active_session()?;
-    let count = session.claude_tabs.len();
+    let count = session.tabs.len();
     if count == 0 {
         return None;
     }
@@ -2110,7 +2305,7 @@ fn handle_claude_tab_click(app: &mut App, strip: Rect, x: u16) {
     let Some(session) = app.active_session_mut() else {
         return;
     };
-    let n = session.claude_tabs.len();
+    let n = session.tabs.len();
     if n == 0 || strip.width == 0 || x < strip.x {
         return;
     }
@@ -2119,7 +2314,7 @@ fn handle_claude_tab_click(app: &mut App, strip: Rect, x: u16) {
     if idx >= n {
         idx = n - 1;
     }
-    session.active_claude = idx;
+    session.active_tab = idx;
     app.focus = Focus::Claude;
 }
 
@@ -2129,10 +2324,118 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, Focus, ProjectSession, ProjectStore, Settings, normalize_paste};
+    use super::{
+        App, ClaudeTab, Focus, MarkdownTab, Project, ProjectSession, ProjectStore, Settings, Tab,
+        normalize_paste,
+    };
+    use std::path::PathBuf;
 
     fn empty_app() -> App {
         App::new(ProjectStore::default(), Settings::default())
+    }
+
+    fn claude_tab(name: &str) -> Tab {
+        Tab::Claude(ClaudeTab {
+            name: name.to_string(),
+            session_id: None,
+            status_id: String::new(),
+            pane: None,
+            detect_session_id: false,
+            spawn_time: None,
+        })
+    }
+
+    fn md_tab(name: &str) -> Tab {
+        Tab::Markdown(MarkdownTab {
+            name: name.to_string(),
+            path: PathBuf::from(name),
+            rendered: wrk_markdown::render_document("x", &wrk_markdown::RenderOptions::default()),
+            state: wrk_markdown::MarkdownViewState::new(),
+        })
+    }
+
+    /// An app with one active project "p" whose session holds `tabs`.
+    fn app_with_tabs(tabs: Vec<Tab>) -> App {
+        let mut app = empty_app();
+        let name = "p".to_string();
+        app.active_project_name = Some(name.clone());
+        let session = ProjectSession {
+            tabs,
+            ..Default::default()
+        };
+        app.sessions.insert(name, session);
+        app
+    }
+
+    #[test]
+    fn claude_tabs_iterator_skips_markdown() {
+        let session = ProjectSession {
+            tabs: vec![claude_tab("a"), md_tab("m"), claude_tab("b")],
+            ..Default::default()
+        };
+        assert_eq!(session.claude_tabs().count(), 2);
+        let names: Vec<_> = session.claude_tabs().map(|t| t.name.clone()).collect();
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn next_tab_cycles_across_mixed_tabs() {
+        let mut app = app_with_tabs(vec![claude_tab("c"), md_tab("m")]);
+        app.next_tab();
+        assert_eq!(app.active_session().unwrap().active_tab, 1);
+        app.next_tab();
+        assert_eq!(app.active_session().unwrap().active_tab, 0);
+        app.prev_tab();
+        assert_eq!(app.active_session().unwrap().active_tab, 1);
+    }
+
+    #[test]
+    fn close_active_tab_removes_markdown() {
+        let mut app = app_with_tabs(vec![claude_tab("c"), md_tab("m")]);
+        app.sessions.get_mut("p").unwrap().active_tab = 1;
+        app.close_active_tab();
+        let s = app.active_session().unwrap();
+        assert_eq!(s.tabs.len(), 1);
+        assert!(matches!(s.tabs[0], Tab::Claude(_)));
+    }
+
+    #[test]
+    fn close_active_tab_keeps_last_claude() {
+        // Closing the only Claude tab is a no-op (a project keeps ≥1 session).
+        let mut app = app_with_tabs(vec![claude_tab("c")]);
+        app.close_active_tab();
+        assert_eq!(app.active_session().unwrap().tabs.len(), 1);
+    }
+
+    #[test]
+    fn open_markdown_tab_appends_and_focuses() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("doc.md"), "# Hi\n\nbody").unwrap();
+        let mut app = empty_app();
+        let name = "p".to_string();
+        app.store.projects.push(Project {
+            name: name.clone(),
+            path: dir.path().to_path_buf(),
+            tags: vec![],
+            layout_mode: None,
+            shell_passthrough: None,
+            claude_sessions: vec![],
+        });
+        app.active_project_name = Some(name.clone());
+        let session = ProjectSession {
+            tabs: vec![claude_tab("claude")],
+            ..Default::default()
+        };
+        app.sessions.insert(name.clone(), session);
+
+        app.open_markdown_tab("doc.md").unwrap();
+        let s = app.active_session().unwrap();
+        assert_eq!(s.tabs.len(), 2);
+        assert!(matches!(s.current(), Some(Tab::Markdown(_))));
+        assert_eq!(app.focus, Focus::Claude);
+
+        // Missing files surface an error rather than opening a tab.
+        assert!(app.open_markdown_tab("does-not-exist.md").is_err());
     }
 
     #[test]

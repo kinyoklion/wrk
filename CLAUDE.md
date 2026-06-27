@@ -47,6 +47,8 @@ CLI subcommands (also documented in `README.md`): `wrk`, `wrk ls`, `wrk add <pat
 
 The event loop in `event_loop()` does five things per tick: draw, resize the active session's PTYs to current geometry, drain `notify` file-watch events (reload `projects.toml`), poll crossterm for input (33 ms), and reap dead children on the active session.
 
+The primary pane hosts a `Vec<Tab>` where `Tab` is `Claude(ClaudeTab)` or `Markdown(MarkdownTab)` (`active_tab` indexes it). Only Claude tabs own a PTY and are persisted to `projects.toml`; markdown tabs (opened with `Alt+m`, rendered via the `wrk-markdown` crate) are ephemeral. Use `ProjectSession::claude_tabs()/claude_tabs_mut()` to iterate just the Claude tabs (spawn/resize/reap/persist), and `current()`/`active_claude_pane()` for the active tab. When the active tab is markdown, key/scroll input routes to its `MarkdownViewState` instead of a PTY (`active_tab_is_markdown`, `handle_markdown_key`, `scroll_at`).
+
 ### Layout & focus
 
 `compute_layout` produces a `LayoutRects` with `sidebar` (optional), `claude`, `shell`, and an optional `tab_strip`. `LayoutMode` is per-project (`Split` or `Tabbed`, persisted to `projects.toml` via `set_layout_mode` → `store::save`). In `Tabbed` mode `claude` and `shell` rects point at the same content area and only the focused pane renders.

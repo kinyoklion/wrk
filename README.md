@@ -155,9 +155,16 @@ by default; tmux needs `set -g allow-passthrough on`).
 | Key | Action |
 |---|---|
 | `Alt+n` | new Claude tab (session picker) — only fires while the claude pane is focused |
-| `Alt+w` | close active Claude tab |
-| `Alt+<` | previous Claude tab |
-| `Alt+>` | next Claude tab |
+| `Alt+m` | open a markdown file as a tab in the primary pane |
+| `Alt+w` | close active tab (Claude or markdown; keeps ≥1 Claude tab) |
+| `Alt+<` | previous tab |
+| `Alt+>` | next tab |
+
+A markdown tab renders the file with the bundled `wrk-markdown` engine
+(headings, lists, tables, syntax-highlighted code; mermaid shows as a code block
+with a "preview not enabled" note for now). When focused, scroll with `j`/`k`,
+`PgUp`/`PgDn`, `Space`, `g`/`G`, and reload from disk with `r`. Markdown tabs are
+ephemeral — they aren't recorded in `projects.toml` and are dropped on unload.
 
 Anywhere else the pane has focus, all keys (including `Tab`) pass through to
 the embedded PTY child.
@@ -246,6 +253,7 @@ new_claude_tab           = "Alt+n"   # only fires while the claude pane is focus
 close_claude_tab         = "Alt+w"
 prev_claude_tab          = "Alt+<"
 next_claude_tab          = "Alt+>"
+open_markdown            = "Alt+m"
 leader_focus_projects    = "Ctrl+Space"
 toggle_shell_passthrough = "F12"
 open_link_picker         = "Alt+u"
