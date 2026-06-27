@@ -139,6 +139,42 @@ impl ConfirmDeleteModal {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ConfirmUnloadModal {
+    pub project_name: String,
+}
+
+impl ConfirmUnloadModal {
+    pub fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
+        let popup = centered_rect(50, 20, area);
+        Clear.render(popup, buf);
+        let block = Block::default()
+            .title(" confirm unload ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.error));
+        let inner = block.inner(popup);
+        block.render(popup, buf);
+
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+
+        Paragraph::new(format!(
+            "unload '{}'? (kills its claude + shell)",
+            self.project_name
+        ))
+        .render(layout[0], buf);
+        Paragraph::new("y: confirm   n / Esc: cancel")
+            .style(Style::default().fg(theme.hint))
+            .render(layout[2], buf);
+    }
+}
+
 /// Modal for picking which Claude session to attach to a new tab.
 ///
 /// Index 0 is always the synthetic "New session" entry. Indices ≥ 1 are

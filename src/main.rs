@@ -35,7 +35,9 @@ use crate::pane::terminal::PtyPane;
 use crate::settings::{Settings, Theme};
 use crate::store::{LayoutMode, Project, ProjectStore, SessionRef};
 use crate::ui::ModalState;
-use crate::ui::modal::{AddProjectModal, ClaudeTabPickerModal, ConfirmDeleteModal, UrlPickerModal};
+use crate::ui::modal::{
+    AddProjectModal, ClaudeTabPickerModal, ConfirmDeleteModal, ConfirmUnloadModal, UrlPickerModal,
+};
 
 #[derive(Parser)]
 #[command(
@@ -526,6 +528,36 @@ impl App {
             session.active_claude = session.claude_tabs.len() - 1;
         }
         self.persist_claude_sessions(&project_name);
+    }
+
+    /// Unload a project's running session: tear down its Claude tabs and shell
+    /// PTYs and drop all in-memory state so the project is as if it had never
+    /// been opened. The project stays in the store (`d` deletes from config).
+    ///
+    /// Killing the child processes and joining the reader threads happens via
+    /// `PtyPane`'s `Drop` when the `ProjectSession` is removed from the map.
+    /// Returns `false` if the project had no live session (nothing to unload).
+    fn unload_project(&mut self, name: &str) -> bool {
+        let Some(session) = self.sessions.remove(name) else {
+            return false;
+        };
+        // Best-effort: remove the per-tab status files so a stale status dot
+        // doesn't linger for a project that's no longer loaded.
+        for tab in &session.claude_tabs {
+            status::remove_tab_status(&tab.status_id);
+        }
+        // Dropping `session` here kills its child processes and joins their
+        // reader threads (see `PtyPane`'s Drop impl).
+        drop(session);
+
+        // If we just unloaded the active project, return to the empty state so
+        // the content area shows the placeholder instead of a dead session.
+        if self.active_project_name.as_deref() == Some(name) {
+            self.active_project_name = None;
+            self.sidebar.active = None;
+            self.focus = Focus::Projects;
+        }
+        true
     }
 
     fn next_claude_tab(&mut self) {
@@ -1342,6 +1374,20 @@ fn handle_projects_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                 }));
             }
         }
+        KeyCode::Char('u') => {
+            if let Some(idx) = app.sidebar.selected_store_index()
+                && let Some(p) = app.store.projects.get(idx)
+            {
+                let name = p.name.clone();
+                if app.sessions.contains_key(&name) {
+                    app.modal = Some(ModalState::ConfirmUnload(ConfirmUnloadModal {
+                        project_name: name,
+                    }));
+                } else {
+                    app.info = Some(format!("'{name}' is not loaded"));
+                }
+            }
+        }
         KeyCode::Char('/') => {
             app.sidebar.filter = Some(String::new());
             app.sidebar.refresh(&app.store);
@@ -1441,6 +1487,19 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                 store::save(&store)?;
                 consumed_modal = Some(());
                 app.reload_store()?;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                consumed_modal = Some(());
+            }
+            _ => {}
+        },
+        ModalState::ConfirmUnload(m) => match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let name = m.project_name.clone();
+                if app.unload_project(&name) {
+                    app.info = Some(format!("unloaded '{name}'"));
+                }
+                consumed_modal = Some(());
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 consumed_modal = Some(());
@@ -2070,7 +2129,54 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_paste;
+    use super::{App, Focus, ProjectSession, ProjectStore, Settings, normalize_paste};
+
+    fn empty_app() -> App {
+        App::new(ProjectStore::default(), Settings::default())
+    }
+
+    #[test]
+    fn unload_active_project_resets_state() {
+        let mut app = empty_app();
+        app.sessions
+            .insert("foo".to_string(), ProjectSession::default());
+        app.active_project_name = Some("foo".to_string());
+        app.sidebar.active = Some("foo".to_string());
+        app.focus = Focus::Shell;
+
+        assert!(app.unload_project("foo"));
+        assert!(!app.sessions.contains_key("foo"));
+        assert_eq!(app.active_project_name, None);
+        assert_eq!(app.sidebar.active, None);
+        assert_eq!(app.focus, Focus::Projects);
+    }
+
+    #[test]
+    fn unload_missing_project_is_noop() {
+        let mut app = empty_app();
+        // Never loaded → nothing to unload.
+        assert!(!app.unload_project("nope"));
+        assert_eq!(app.focus, Focus::Projects);
+    }
+
+    #[test]
+    fn unload_background_project_keeps_active() {
+        let mut app = empty_app();
+        app.sessions
+            .insert("bg".to_string(), ProjectSession::default());
+        app.sessions
+            .insert("active".to_string(), ProjectSession::default());
+        app.active_project_name = Some("active".to_string());
+        app.sidebar.active = Some("active".to_string());
+        app.focus = Focus::Claude;
+
+        assert!(app.unload_project("bg"));
+        assert!(!app.sessions.contains_key("bg"));
+        // Unloading a background project leaves the active one untouched.
+        assert_eq!(app.active_project_name.as_deref(), Some("active"));
+        assert_eq!(app.sidebar.active.as_deref(), Some("active"));
+        assert_eq!(app.focus, Focus::Claude);
+    }
 
     #[test]
     fn crlf_collapses_to_single_cr() {

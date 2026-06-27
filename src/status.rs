@@ -51,6 +51,12 @@ pub fn status_file_for_tab(tab_status_id: &str) -> PathBuf {
     status_dir().join(format!("{}.status", sanitize(tab_status_id)))
 }
 
+/// Remove a tab's status file (best-effort). Called when a project's session
+/// is unloaded so a stale status dot doesn't linger in the sidebar.
+pub fn remove_tab_status(tab_status_id: &str) {
+    let _ = fs::remove_file(status_file_for_tab(tab_status_id));
+}
+
 pub fn read_tab_status(tab_status_id: &str) -> Option<HookEvent> {
     let path = status_file_for_tab(tab_status_id);
     let content = fs::read_to_string(&path).ok()?;

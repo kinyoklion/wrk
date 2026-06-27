@@ -104,15 +104,17 @@ impl ProjectSidebar {
         self.state.select(Some(i));
     }
 
-    pub fn render<F>(
+    pub fn render<F, G>(
         &mut self,
         area: Rect,
         buf: &mut Buffer,
         store: &ProjectStore,
         theme: &crate::settings::Theme,
         status_for: F,
+        loaded_for: G,
     ) where
         F: Fn(&str) -> ProjectStatus,
+        G: Fn(&str) -> bool,
     {
         let title = match &self.filter {
             Some(f) => format!(" projects /{f} "),
@@ -147,15 +149,20 @@ impl ProjectSidebar {
                     }
                     ProjectStatus::None => Span::raw("  "),
                 };
-                let active_marker = if active {
+                // `*` marks a project with a live session. The active
+                // (currently shown) project's marker is accent-colored; other
+                // loaded-in-background projects get a dimmer hint-colored one.
+                let loaded_marker = if active {
                     Span::styled(" *", Style::default().fg(theme.accent))
+                } else if loaded_for(&p.name) {
+                    Span::styled(" *", Style::default().fg(theme.hint))
                 } else {
                     Span::raw("")
                 };
                 ListItem::new(Line::from(vec![
                     prefix,
                     Span::raw(p.name.clone()),
-                    active_marker,
+                    loaded_marker,
                 ]))
             })
             .collect();
