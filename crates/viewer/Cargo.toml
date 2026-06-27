@@ -1,0 +1,22 @@
+[package]
+name = "wrk-md"
+description = "Standalone terminal markdown viewer (pager) built on the wrk-markdown renderer."
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wrk-md"
+path = "src/main.rs"
+
+[features]
+default = ["highlight"]
+highlight = ["wrk-markdown/highlight"]
+
+[dependencies]
+wrk-markdown = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

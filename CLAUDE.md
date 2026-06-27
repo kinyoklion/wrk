@@ -4,15 +4,33 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`wrk` is a single-binary Linux TUI for juggling concurrent Claude Code sessions, one per project. It pairs Ratatui chrome with `alacritty_terminal` for ANSI parsing and `portable-pty` for spawning child processes. Rust edition 2024, MSRV 1.85.
+`wrk` is a Linux TUI for juggling concurrent Claude Code sessions, one per project. It pairs Ratatui chrome with `alacritty_terminal` for ANSI parsing and `portable-pty` for spawning child processes. Rust edition 2024, MSRV 1.85.
+
+### Workspace layout
+
+A Cargo workspace. The `wrk` package keeps its manifest and `src/` at the repo
+root (so the synthase release tooling, configured against path `.`, and the
+root `CHANGELOG.md` keep working); the other members live under `crates/`:
+
+- root (`./`) — `wrk` binary, the TUI.
+- `crates/markdown` — `wrk-markdown` library: CommonMark/GFM → ratatui `Text`
+  plus a scrollable `MarkdownView` widget. `highlight` feature (default, syntect
+  via pure-Rust fancy-regex) and a pluggable `DiagramBackend` (default
+  `NullBackend` renders mermaid as a code block + hint).
+- `crates/viewer` — `wrk-md` binary: a standalone markdown pager over
+  `wrk-markdown`, usable in any shell (`--print` for a plain stdout dump).
+
+Shared deps that cross crate boundaries (notably `ratatui`) live in
+`[workspace.dependencies]` so the types stay identical across crates.
 
 ## Commands
 
 ```sh
 nix develop                       # rust toolchain + dev tools (rust-analyzer, clippy, rustfmt)
-cargo build                       # debug build
-cargo build --release             # release build → target/release/wrk
-cargo test                        # all tests (store + status modules; 7 unit tests)
+cargo build                       # debug build (whole workspace)
+cargo build --release             # release build → target/release/{wrk,wrk-md}
+cargo test                        # all tests (workspace-wide)
+cargo test -p wrk-markdown        # tests for a single crate
 cargo test <name>                 # single test, e.g. `cargo test round_trip_with_projects`
 cargo test -- --nocapture         # show println! during tests
 cargo clippy --all-targets        # lint

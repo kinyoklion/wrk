@@ -35,14 +35,14 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Build release binary
-        run: cargo build --release --locked
+      - name: Build release binaries
+        run: cargo build --release --locked -p wrk -p wrk-md
 
-      - name: Package binary
+      - name: Package binaries
         run: |
           mkdir -p dist
           tar -czf "dist/wrk-${{ needs.release.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz" \
-            -C target/release wrk
+            -C target/release wrk wrk-md
 
       - name: Upload artifact to draft release
         env:
