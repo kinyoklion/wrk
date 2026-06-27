@@ -76,7 +76,8 @@ The Nix flake provides the toolchain. Without Nix, any Rust ≥ 1.85 (edition
 `wrk` is a Cargo workspace. `cargo build --release` produces two binaries:
 `target/release/wrk` (the TUI) and `target/release/wrk-md` (the standalone
 markdown viewer, below). The markdown renderer itself lives in the reusable
-`wrk-markdown` library crate under `crates/markdown`.
+`wrk-markdown` library crate under `crates/markdown`. Release tarballs bundle
+both `wrk` and `wrk-md`.
 
 ## Standalone markdown viewer (`wrk-md`)
 
