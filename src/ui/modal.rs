@@ -7,6 +7,61 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 use crate::session::DiscoveredSession;
 use crate::settings::Theme;
 
+/// Single-field modal for opening a markdown file as a tab in the active
+/// project's primary pane.
+#[derive(Debug, Clone, Default)]
+pub struct OpenMarkdownModal {
+    pub path_input: String,
+    pub error: Option<String>,
+}
+
+impl OpenMarkdownModal {
+    pub fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) -> Position {
+        let popup = centered_rect(60, 20, area);
+        Clear.render(popup, buf);
+        let block = Block::default()
+            .title(" open markdown ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.border_focused));
+        let inner = block.inner(popup);
+        block.render(popup, buf);
+
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+
+        Paragraph::new("file (relative to project dir, or absolute):").render(layout[0], buf);
+        let input_row = layout[1];
+        Paragraph::new(self.path_input.as_str())
+            .style(field_style(true, theme))
+            .render(input_row, buf);
+
+        let footer = if let Some(err) = &self.error {
+            Line::from(vec![Span::styled(
+                err.clone(),
+                Style::default().fg(theme.error),
+            )])
+        } else {
+            Line::from("Enter: open   Esc: cancel")
+        };
+        Paragraph::new(footer)
+            .style(Style::default().fg(theme.hint))
+            .render(layout[3], buf);
+
+        let len = self.path_input.chars().count() as u16;
+        Position {
+            x: input_row.x + len.min(input_row.width.saturating_sub(1)),
+            y: input_row.y,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddField {
     Path,

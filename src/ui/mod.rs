@@ -16,7 +16,8 @@ use crate::settings::Theme;
 use crate::status::{self, HookEvent};
 use crate::store::LayoutMode;
 use crate::ui::projects::ProjectStatus;
-use crate::{App, ClaudeTab, ProjectSession, claude_pane_split, compute_layout};
+use crate::{App, ClaudeTab, ProjectSession, Tab, claude_pane_split, compute_layout};
+use wrk_markdown::MarkdownView;
 
 const WAITING_THRESHOLD: Duration = Duration::from_millis(500);
 
@@ -45,12 +46,12 @@ fn project_status_for(sessions: &HashMap<String, ProjectSession>, name: &str) ->
     let Some(session) = sessions.get(name) else {
         return ProjectStatus::None;
     };
-    if session.claude_tabs.is_empty() {
+    if session.claude_tabs().next().is_none() {
         return ProjectStatus::None;
     }
     // Worst-case across all tabs: Attention > Busy > Waiting > None.
     let mut result = ProjectStatus::None;
-    for tab in &session.claude_tabs {
+    for tab in session.claude_tabs() {
         let s = tab_status(tab);
         result = match (result, s) {
             (_, ProjectStatus::Attention) => ProjectStatus::Attention,
@@ -93,30 +94,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
     }
 
-    let session = app.active_session();
-    let claude_tabs: Option<&[ClaudeTab]> = session.map(|s| s.claude_tabs.as_slice());
-    let active_claude_idx = session.map(|s| s.active_claude).unwrap_or(0);
-    let claude_pane = app.active_claude();
-    let shell_pane = app.active_shell();
+    const SHELL_PLACEHOLDER: &str = "no project selected — press Enter on a project";
 
     match app.layout_mode {
         LayoutMode::Split => {
-            draw_claude_pane(
-                frame,
-                layout.claude,
-                app.focus == Focus::Claude,
-                claude_tabs,
-                active_claude_idx,
-                claude_pane,
-                &theme,
-            );
+            let focused = app.focus == Focus::Claude;
+            draw_primary_pane(frame, layout.claude, focused, app, &theme);
+            let shell_focused = app.focus == Focus::Shell;
+            let shell_pane = app.active_shell();
             draw_terminal_pane(
                 frame,
                 layout.shell,
                 " shell ",
-                app.focus == Focus::Shell,
+                shell_focused,
                 shell_pane,
-                "no project selected — press Enter on a project",
+                SHELL_PLACEHOLDER,
                 &theme,
             );
         }
@@ -125,24 +117,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 draw_tab_strip(frame, strip, app.focus, &theme);
             }
             match app.focus {
-                Focus::Shell => draw_terminal_pane(
-                    frame,
-                    layout.claude,
-                    " shell ",
-                    true,
-                    shell_pane,
-                    "no project selected — press Enter on a project",
-                    &theme,
-                ),
-                _ => draw_claude_pane(
-                    frame,
-                    layout.claude,
-                    true,
-                    claude_tabs,
-                    active_claude_idx,
-                    claude_pane,
-                    &theme,
-                ),
+                Focus::Shell => {
+                    let shell_pane = app.active_shell();
+                    draw_terminal_pane(
+                        frame,
+                        layout.claude,
+                        " shell ",
+                        true,
+                        shell_pane,
+                        SHELL_PLACEHOLDER,
+                        &theme,
+                    );
+                }
+                _ => draw_primary_pane(frame, layout.claude, true, app, &theme),
             }
         }
     }
@@ -152,6 +139,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(modal) = &app.modal {
         match modal {
             ModalState::Add(m) => {
+                let cursor = m.render(area, frame.buffer_mut(), &theme);
+                frame.set_cursor_position(cursor);
+            }
+            ModalState::OpenMarkdown(m) => {
                 let cursor = m.render(area, frame.buffer_mut(), &theme);
                 frame.set_cursor_position(cursor);
             }
@@ -176,23 +167,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     // Position the cursor inside the focused terminal pane.
-    // For the claude pane we must account for the 1-row tab strip.
-    let claude_content_area = {
+    // For the primary pane we must account for the 1-row tab strip. When the
+    // active primary tab is a markdown viewer there's no PTY (and no cursor):
+    // `active_claude()` returns `None` in that case, so the cursor is left alone.
+    let primary_content_area = {
         let inner = inner_area(layout.claude);
-        let count = claude_tabs.map(|t| t.len()).unwrap_or(0);
+        let count = app.active_session().map(|s| s.tabs.len()).unwrap_or(0);
         claude_pane_split(inner, count).1
     };
     match app.focus {
         Focus::Claude => {
-            if let Some(pane) = claude_pane {
-                if let Some(pos) = crate::pane::terminal::cursor_position(pane, claude_content_area)
+            if let Some(pane) = app.active_claude() {
+                if let Some(pos) =
+                    crate::pane::terminal::cursor_position(pane, primary_content_area)
                 {
                     frame.set_cursor_position(pos);
                 }
             }
         }
         Focus::Shell => {
-            if let Some(pane) = shell_pane {
+            if let Some(pane) = app.active_shell() {
                 let inner = inner_area(layout.shell);
                 if let Some(pos) = crate::pane::terminal::cursor_position(pane, inner) {
                     frame.set_cursor_position(pos);
@@ -203,16 +197,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
-/// Renders the Claude pane: border + optional per-tab strip + terminal content.
-fn draw_claude_pane(
-    frame: &mut Frame,
-    area: Rect,
-    focused: bool,
-    tabs: Option<&[ClaudeTab]>,
-    active_idx: usize,
-    pane: Option<&crate::pane::terminal::PtyPane>,
-    theme: &Theme,
-) {
+/// Renders the primary pane: border + tab strip + the active tab's content
+/// (a Claude PTY or a markdown viewer). Takes `&mut App` because the markdown
+/// view is a stateful widget needing `&mut` scroll state.
+fn draw_primary_pane(frame: &mut Frame, area: Rect, focused: bool, app: &mut App, theme: &Theme) {
     let border_style = Style::default().fg(if focused {
         theme.border_focused
     } else {
@@ -225,28 +213,57 @@ fn draw_claude_pane(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let tab_count = tabs.map(|t| t.len()).unwrap_or(0);
+    // Snapshot tab geometry/state immutably before any mutable borrow below.
+    let (tab_count, active_idx, active_is_md, has_session) = match app.active_session() {
+        Some(s) => (
+            s.tabs.len(),
+            s.active_tab,
+            s.current().map(Tab::is_markdown).unwrap_or(false),
+            true,
+        ),
+        None => (0, 0, false, false),
+    };
     let (tab_strip_area, content_area) = claude_pane_split(inner, tab_count);
 
-    if let (Some(strip_area), Some(tabs)) = (tab_strip_area, tabs) {
-        draw_claude_tab_strip(frame, strip_area, tabs, active_idx, theme);
+    if let Some(strip_area) = tab_strip_area {
+        if let Some(s) = app.active_session() {
+            draw_primary_tab_strip(frame, strip_area, &s.tabs, active_idx, theme);
+        }
     }
 
-    match pane {
-        Some(p) => frame.render_widget(PtyPaneWidget(p), content_area),
-        None => {
-            let para = Paragraph::new("no project selected — press Enter on a project")
-                .style(Style::default().fg(theme.hint));
-            frame.render_widget(para, content_area);
+    let placeholder = |frame: &mut Frame| {
+        let para = Paragraph::new("no project selected — press Enter on a project")
+            .style(Style::default().fg(theme.hint));
+        frame.render_widget(para, content_area);
+    };
+
+    if !has_session {
+        placeholder(frame);
+    } else if active_is_md {
+        if let Some(s) = app.active_session_mut() {
+            if let Some(Tab::Markdown(md)) = s.tabs.get_mut(active_idx) {
+                // Disjoint field borrows: `&md.rendered` and `&mut md.state`.
+                frame.render_stateful_widget(
+                    MarkdownView::new(&md.rendered),
+                    content_area,
+                    &mut md.state,
+                );
+            }
+        }
+    } else {
+        match app.active_claude() {
+            Some(p) => frame.render_widget(PtyPaneWidget(p), content_area),
+            None => placeholder(frame),
         }
     }
 }
 
-/// Tab strip for Claude sessions within a project.
-fn draw_claude_tab_strip(
+/// Tab strip for a project's primary pane: Claude tabs show a status dot, a
+/// markdown tab shows a document glyph and its filename.
+fn draw_primary_tab_strip(
     frame: &mut Frame,
     area: Rect,
-    tabs: &[ClaudeTab],
+    tabs: &[Tab],
     active_idx: usize,
     theme: &Theme,
 ) {
@@ -270,19 +287,26 @@ fn draw_claude_tab_strip(
             width: w,
             height: 1,
         };
-        let status_char = match tab_status(tab) {
-            ProjectStatus::Attention => "● ",
-            ProjectStatus::Busy => "· ",
-            ProjectStatus::Waiting => "● ",
-            ProjectStatus::None => "  ",
+        let (status_char, status_color) = match tab {
+            Tab::Claude(c) => {
+                let st = tab_status(c);
+                let ch = match st {
+                    ProjectStatus::Attention => "● ",
+                    ProjectStatus::Busy => "· ",
+                    ProjectStatus::Waiting => "● ",
+                    ProjectStatus::None => "  ",
+                };
+                let col = match st {
+                    ProjectStatus::Attention => theme.status_attention,
+                    ProjectStatus::Busy => theme.status_busy,
+                    ProjectStatus::Waiting => theme.status_waiting,
+                    ProjectStatus::None => theme.hint,
+                };
+                (ch, col)
+            }
+            Tab::Markdown(_) => ("▤ ", theme.hint),
         };
-        let status_color = match tab_status(tab) {
-            ProjectStatus::Attention => theme.status_attention,
-            ProjectStatus::Busy => theme.status_busy,
-            ProjectStatus::Waiting => theme.status_waiting,
-            ProjectStatus::None => theme.hint,
-        };
-        let label = format!("{status_char}{}", tab.name);
+        let name = tab.name();
         let style = if i == active_idx {
             Style::default()
                 .fg(theme.accent_fg)
@@ -292,11 +316,11 @@ fn draw_claude_tab_strip(
             Style::default().fg(status_color)
         };
         let spans = if i == active_idx {
-            Line::from(vec![Span::raw(label)])
+            Line::from(vec![Span::raw(format!("{status_char}{name}"))])
         } else {
             Line::from(vec![
                 Span::styled(status_char.to_string(), Style::default().fg(status_color)),
-                Span::styled(tab.name.clone(), Style::default().fg(theme.hint)),
+                Span::styled(name.to_string(), Style::default().fg(theme.hint)),
             ])
         };
         frame.render_widget(
@@ -476,13 +500,14 @@ fn build_hint(app: &App) -> String {
              {toggle_layout} layout  {shrink}/{grow} resize  {quit} quit",
         ),
         _ => format!(
-            "{focus_p}/{focus_c}/{focus_s} panes  {new} new-claude  \
+            "{focus_p}/{focus_c}/{focus_s} panes  {new} new-claude  {md} markdown  \
              {close} close  {prev}/{next} tabs  {toggle_layout} layout  \
              {passthru} passthru  {quit} quit",
             focus_p = km.display(A::FocusProjects),
             focus_c = km.display(A::FocusClaude),
             focus_s = km.display(A::FocusShell),
             new = km.display(A::NewClaudeTab),
+            md = km.display(A::OpenMarkdown),
             close = km.display(A::CloseClaudeTab),
             prev = km.display(A::PrevClaudeTab),
             next = km.display(A::NextClaudeTab),
@@ -494,6 +519,7 @@ fn build_hint(app: &App) -> String {
 #[derive(Debug, Clone)]
 pub enum ModalState {
     Add(modal::AddProjectModal),
+    OpenMarkdown(modal::OpenMarkdownModal),
     ConfirmDelete(modal::ConfirmDeleteModal),
     ConfirmUnload(modal::ConfirmUnloadModal),
     ClaudeTabPicker(modal::ClaudeTabPickerModal),

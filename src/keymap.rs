@@ -32,6 +32,8 @@ pub enum GlobalAction {
     CloseClaudeTab,
     PrevClaudeTab,
     NextClaudeTab,
+    /// Open a markdown file as a tab in the active project's primary pane.
+    OpenMarkdown,
     /// Secondary "jump back to projects" binding — usable from inside a PTY
     /// where `FocusProjects`'s default Alt+1 might collide with an app.
     LeaderFocusProjects,
@@ -58,6 +60,7 @@ impl GlobalAction {
             Self::CloseClaudeTab => "Alt+w",
             Self::PrevClaudeTab => "Alt+<",
             Self::NextClaudeTab => "Alt+>",
+            Self::OpenMarkdown => "Alt+m",
             Self::LeaderFocusProjects => "Ctrl+Space",
             Self::ToggleShellPassthrough => "F12",
             Self::OpenLinkPicker => "Alt+u",
@@ -81,6 +84,7 @@ impl GlobalAction {
         Self::CloseClaudeTab,
         Self::PrevClaudeTab,
         Self::NextClaudeTab,
+        Self::OpenMarkdown,
         Self::LeaderFocusProjects,
         Self::ToggleShellPassthrough,
         Self::OpenLinkPicker,
@@ -295,6 +299,7 @@ fn action_name(a: GlobalAction) -> &'static str {
         GlobalAction::CloseClaudeTab => "close_claude_tab",
         GlobalAction::PrevClaudeTab => "prev_claude_tab",
         GlobalAction::NextClaudeTab => "next_claude_tab",
+        GlobalAction::OpenMarkdown => "open_markdown",
         GlobalAction::LeaderFocusProjects => "leader_focus_projects",
         GlobalAction::ToggleShellPassthrough => "toggle_shell_passthrough",
         GlobalAction::OpenLinkPicker => "open_link_picker",
