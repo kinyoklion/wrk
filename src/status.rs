@@ -93,8 +93,79 @@ fn hook_command(event: &str) -> String {
 }
 
 fn settings_path() -> Result<PathBuf> {
+    Ok(claude_dir()?.join("settings.json"))
+}
+
+fn claude_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME env var not set")?;
-    Ok(PathBuf::from(home).join(".claude/settings.json"))
+    Ok(PathBuf::from(home).join(".claude"))
+}
+
+/// Marker embedded in the generated SKILL.md so `uninstall_skill` only removes a
+/// skill wrk itself wrote (never a user's own skill of the same name).
+const SKILL_INSTALL_MARKER: &str = "installed by `wrk install-hooks`";
+
+/// The `wrk-view` skill markdown. Teaches Claude to open files with `wrk view`.
+/// The frontmatter `description` doubles as the trigger; `allowed-tools`
+/// pre-approves `wrk view` so it runs without a permission prompt.
+fn skill_markdown() -> String {
+    format!(
+        "---\n\
+name: wrk-view\n\
+description: Open a markdown file, README, or diagram in the wrk viewer. Use when the user asks to view, open, preview, show, or visualize a markdown/text file or diagram in the terminal.\n\
+allowed-tools: Bash(wrk view *)\n\
+---\n\
+<!-- {SKILL_INSTALL_MARKER}; safe to delete, or run `wrk uninstall-hooks` -->\n\
+\n\
+# View a file in the wrk viewer\n\
+\n\
+Run `wrk view <absolute-path>` to open a file in wrk's markdown viewer. Inside a\n\
+wrk session it opens as a new tab beside the conversation; in a plain shell it\n\
+opens a scrollable pager. It is read-only and never modifies the file.\n\
+\n\
+When the user asks to view, open, preview, show, or visualize a markdown file or\n\
+diagram:\n\
+\n\
+1. Resolve it to an absolute path (search with grep/find if they described the\n\
+   file rather than naming it).\n\
+2. Run `wrk view <absolute-path>`.\n\
+3. Briefly confirm it is open.\n"
+    )
+}
+
+/// Write the `wrk-view` skill to `~/.claude/skills/wrk-view/SKILL.md`,
+/// overwriting any prior copy (so content fixes propagate). Returns the path.
+pub fn install_skill() -> Result<PathBuf> {
+    install_skill_in(&claude_dir()?)
+}
+
+/// Remove the wrk-installed `wrk-view` skill. Returns the removed directory, or
+/// `None` if it was absent or not one wrk wrote.
+pub fn uninstall_skill() -> Result<Option<PathBuf>> {
+    uninstall_skill_in(&claude_dir()?)
+}
+
+fn install_skill_in(claude_dir: &Path) -> Result<PathBuf> {
+    let dir = claude_dir.join("skills/wrk-view");
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join("SKILL.md");
+    fs::write(&path, skill_markdown()).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
+fn uninstall_skill_in(claude_dir: &Path) -> Result<Option<PathBuf>> {
+    let dir = claude_dir.join("skills/wrk-view");
+    let path = dir.join("SKILL.md");
+    if !path.exists() {
+        return Ok(None);
+    }
+    // Only remove a skill we wrote — identified by our marker.
+    let content = fs::read_to_string(&path).unwrap_or_default();
+    if !content.contains(SKILL_INSTALL_MARKER) {
+        return Ok(None);
+    }
+    fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
+    Ok(Some(dir))
 }
 
 fn read_settings(path: &Path) -> Result<Value> {
@@ -239,6 +310,46 @@ fn entry_has_marker(entry: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skill_markdown_has_name_and_marker() {
+        let md = skill_markdown();
+        assert!(md.contains("name: wrk-view"));
+        assert!(md.contains("allowed-tools: Bash(wrk view *)"));
+        assert!(md.contains(SKILL_INSTALL_MARKER));
+        // description + triggers keep the frontmatter well under the 1536-char cap.
+        assert!(md.len() < 1536);
+    }
+
+    #[test]
+    fn install_then_uninstall_skill_round_trip() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+
+        let path = install_skill_in(&claude).unwrap();
+        assert!(path.exists());
+        assert!(path.ends_with("skills/wrk-view/SKILL.md"));
+
+        let removed = uninstall_skill_in(&claude).unwrap();
+        assert_eq!(removed, Some(claude.join("skills/wrk-view")));
+        assert!(!path.exists());
+
+        // Second uninstall is a no-op.
+        assert_eq!(uninstall_skill_in(&claude).unwrap(), None);
+    }
+
+    #[test]
+    fn uninstall_leaves_foreign_skill_untouched() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        let dir = claude.join("skills/wrk-view");
+        fs::create_dir_all(&dir).unwrap();
+        // A user's own skill that happens to share the name (no wrk marker).
+        fs::write(dir.join("SKILL.md"), "---\nname: wrk-view\n---\nmine\n").unwrap();
+
+        assert_eq!(uninstall_skill_in(&claude).unwrap(), None);
+        assert!(dir.join("SKILL.md").exists());
+    }
 
     #[test]
     fn sanitize_strips_unsafe_chars() {

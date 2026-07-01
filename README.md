@@ -101,8 +101,19 @@ wrk-md --print FILE         # plain-text render to stdout (for piping)
 | `wrk ls` | list configured projects |
 | `wrk add <path> [--name N]` | append to `projects.toml` |
 | `wrk rm <name>` | remove from `projects.toml` |
-| `wrk install-hooks` | merge wrk hook entries into `~/.claude/settings.json` |
-| `wrk uninstall-hooks` | remove them |
+| `wrk view <file>` | open a markdown file — as a tab in the running wrk (from inside a pane), else in the `wrk-md` pager |
+| `wrk install-hooks` | merge wrk hooks into `~/.claude/settings.json` **and** install the `wrk-view` skill |
+| `wrk uninstall-hooks` | remove both |
+
+### Letting Claude open files
+
+`wrk install-hooks` also writes a `wrk-view` skill to `~/.claude/skills/` that
+teaches Claude to run `wrk view <file>`. When Claude runs it from within a wrk
+pane, wrk opens the file as a markdown tab in that project (over a per-instance
+Unix socket exported to the pane as `WRK_SOCK`, with `WRK_PROJECT` naming the
+project). Ask Claude to "preview the README" and it renders in a tab beside the
+conversation. Run the same command in a plain shell and it opens the `wrk-md`
+pager instead.
 
 ## Keybindings (in the TUI)
 
