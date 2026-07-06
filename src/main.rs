@@ -1,3 +1,4 @@
+mod ipc;
 mod keymap;
 mod pane;
 mod proc;
@@ -63,10 +64,13 @@ enum Command {
     },
     /// Remove a project by name
     Rm { name: String },
-    /// Install Claude Code hooks into ~/.claude/settings.json so the
-    /// sidebar can show precise per-project status.
+    /// Open a markdown file in the wrk viewer. Inside a wrk pane it opens as a
+    /// tab in the running instance; in a plain shell it opens a pager.
+    View { path: PathBuf },
+    /// Install Claude Code hooks into ~/.claude/settings.json (sidebar status)
+    /// and a `wrk-view` skill into ~/.claude/skills so Claude can open files.
     InstallHooks,
-    /// Remove the wrk-installed hooks from ~/.claude/settings.json.
+    /// Remove the wrk-installed hooks and the `wrk-view` skill.
     UninstallHooks,
 }
 
@@ -76,10 +80,55 @@ fn main() -> Result<()> {
         Some(Command::Ls) => cmd_ls(),
         Some(Command::Add { path, name }) => cmd_add(&path, name),
         Some(Command::Rm { name }) => cmd_rm(&name),
+        Some(Command::View { path }) => cmd_view(&path),
         Some(Command::InstallHooks) => cmd_install_hooks(),
         Some(Command::UninstallHooks) => cmd_uninstall_hooks(),
         None => run_tui(),
     }
+}
+
+/// Open a markdown file. When invoked from inside a wrk pane (`WRK_SOCK` set)
+/// the request is sent to the running instance, which opens it as a tab in the
+/// originating project (`WRK_PROJECT`). Otherwise — or if that socket is stale —
+/// fall back to the standalone `wrk-md` pager.
+fn cmd_view(path: &Path) -> Result<()> {
+    let abs = path
+        .canonicalize()
+        .with_context(|| format!("resolving {}", path.display()))?;
+
+    if let Ok(sock) = std::env::var("WRK_SOCK") {
+        let req = ipc::OpenRequest {
+            path: abs.to_string_lossy().into_owned(),
+            project: std::env::var("WRK_PROJECT").ok(),
+        };
+        if ipc::send_open(Path::new(&sock), &req).is_ok() {
+            println!("opened {} in wrk", abs.display());
+            return Ok(());
+        }
+        // Stale socket (instance exited) → fall through to the standalone viewer.
+    }
+
+    let prog = viewer_binary();
+    let status = std::process::Command::new(&prog)
+        .arg(&abs)
+        .status()
+        .with_context(|| format!("launching {}", prog.display()))?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Locate the `wrk-md` viewer binary: prefer a sibling next to the current
+/// executable (so it works from `target/release` without installing), else rely
+/// on `PATH`.
+fn viewer_binary() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let sibling = dir.join("wrk-md");
+        if sibling.is_file() {
+            return sibling;
+        }
+    }
+    PathBuf::from("wrk-md")
 }
 
 fn cmd_install_hooks() -> Result<()> {
@@ -88,12 +137,21 @@ fn cmd_install_hooks() -> Result<()> {
     println!("installed hooks in {}", path.display());
     println!("status files will live under {}", dir.display());
     println!("(no-op for any Claude session not launched by wrk)");
+    match status::install_skill() {
+        Ok(skill) => println!("installed wrk-view skill in {}", skill.display()),
+        Err(e) => eprintln!("warning: could not install wrk-view skill: {e}"),
+    }
     Ok(())
 }
 
 fn cmd_uninstall_hooks() -> Result<()> {
     let (path, removed) = status::uninstall_hooks()?;
     println!("removed {removed} wrk hook entries from {}", path.display());
+    match status::uninstall_skill() {
+        Ok(Some(dir)) => println!("removed wrk-view skill from {}", dir.display()),
+        Ok(None) => {}
+        Err(e) => eprintln!("warning: could not remove wrk-view skill: {e}"),
+    }
     Ok(())
 }
 
@@ -303,6 +361,9 @@ pub struct App {
     /// While in select mode, which pane the mouse-down landed on. Drag and
     /// up events route to this pane regardless of where the cursor moves.
     pub select_anchor_pane: Option<Focus>,
+    /// Path to this instance's IPC socket, exported to spawned PTYs as
+    /// `WRK_SOCK`. `None` when the socket couldn't be created.
+    pub socket_path: Option<PathBuf>,
 }
 
 impl App {
@@ -338,6 +399,7 @@ impl App {
             shell_passthrough: false,
             select_mode: false,
             select_anchor_pane: None,
+            socket_path: None,
         }
     }
 
@@ -364,6 +426,17 @@ impl App {
         self.active_session().and_then(|s| s.shell.as_ref())
     }
 
+    /// Environment common to every PTY wrk spawns for a project: `WRK_PROJECT`
+    /// (so `wrk view` can name its originating project) and `WRK_SOCK` (this
+    /// instance's IPC socket). Claude tabs additionally get `WRK_STATUS_FILE`.
+    fn base_pty_env(&self, project_name: &str) -> Vec<(String, String)> {
+        let mut env = vec![("WRK_PROJECT".to_string(), project_name.to_string())];
+        if let Some(sock) = &self.socket_path {
+            env.push(("WRK_SOCK".to_string(), sock.to_string_lossy().into_owned()));
+        }
+        env
+    }
+
     fn open_selected(&mut self, body: Rect) {
         let Some(idx) = self.sidebar.selected_store_index() else {
             return;
@@ -378,6 +451,7 @@ impl App {
         let layout = compute_layout(body, self);
         let claude_inner = layout.claude_inner();
         let shell_inner = layout.shell_inner();
+        let base_env = self.base_pty_env(&project.name);
 
         let session = self.sessions.entry(project.name.clone()).or_default();
 
@@ -420,10 +494,11 @@ impl App {
             if tab.pane.is_none() || dead {
                 let cmd = claude_command(&self.settings, tab.session_id.as_deref());
                 let status_path = status::status_file_for_tab(&tab.status_id);
-                let env = vec![(
+                let mut env = base_env.clone();
+                env.push((
                     "WRK_STATUS_FILE".to_string(),
                     status_path.to_string_lossy().into_owned(),
-                )];
+                ));
                 let spawned = PtyPane::spawn(
                     &cmd,
                     &project.path,
@@ -452,7 +527,7 @@ impl App {
                 &project.path,
                 shell_inner.height,
                 shell_inner.width,
-                &[],
+                &base_env,
             ) {
                 Ok(p) => Some(p),
                 Err(e) => {
@@ -533,10 +608,11 @@ impl App {
         let cmd = claude_command(&self.settings, session_id.as_deref());
         let status_id = new_status_id();
         let status_path = status::status_file_for_tab(&status_id);
-        let env = vec![(
+        let mut env = self.base_pty_env(&project_name);
+        env.push((
             "WRK_STATUS_FILE".to_string(),
             status_path.to_string_lossy().into_owned(),
-        )];
+        ));
 
         let spawn_result = PtyPane::spawn(
             &cmd,
@@ -598,29 +674,38 @@ impl App {
         let path = joined
             .canonicalize()
             .with_context(|| format!("resolving {}", joined.display()))?;
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("markdown")
-            .to_string();
-        let rendered =
-            wrk_markdown::render_document(&content, &wrk_markdown::RenderOptions::default());
+        self.add_markdown_tab(&project_name, path)
+    }
 
+    /// Add a markdown tab for an already-resolved absolute `path` to the given
+    /// project's session (must be loaded). If that project is the active one,
+    /// focus the new tab. Shared by the modal (`open_markdown_tab`) and IPC.
+    fn add_markdown_tab(&mut self, project_name: &str, path: PathBuf) -> Result<()> {
+        let tab = build_markdown_tab(path)?;
         let session = self
             .sessions
-            .get_mut(&project_name)
-            .ok_or_else(|| anyhow!("open a project first"))?;
-        session.tabs.push(Tab::Markdown(MarkdownTab {
-            name,
-            path,
-            rendered,
-            state: wrk_markdown::MarkdownViewState::new(),
-        }));
+            .get_mut(project_name)
+            .ok_or_else(|| anyhow!("project '{project_name}' is not loaded"))?;
+        session.tabs.push(tab);
         session.active_tab = session.tabs.len() - 1;
-        self.focus = Focus::Claude;
+        if self.active_project_name.as_deref() == Some(project_name) {
+            self.focus = Focus::Claude;
+        }
         Ok(())
+    }
+
+    /// Handle an [`ipc::OpenRequest`] from `wrk view`: open the file in its
+    /// originating project (or the active one when unspecified). Errors surface
+    /// in the status bar rather than interrupting the session.
+    fn handle_open_request(&mut self, req: ipc::OpenRequest) {
+        let project = req.project.or_else(|| self.active_project_name.clone());
+        let Some(project) = project else {
+            push_error(&mut self.error, "wrk view: no active project".into());
+            return;
+        };
+        if let Err(e) = self.add_markdown_tab(&project, PathBuf::from(&req.path)) {
+            push_error(&mut self.error, format!("wrk view: {e}"));
+        }
     }
 
     /// Close the currently active tab. Markdown tabs are closed freely; a Claude
@@ -789,6 +874,24 @@ fn claude_command(settings: &Settings, session_id: Option<&str>) -> Vec<String> 
     cmd
 }
 
+/// Read and render a markdown file at an absolute `path` into a [`Tab`].
+fn build_markdown_tab(path: PathBuf) -> Result<Tab> {
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("markdown")
+        .to_string();
+    let rendered = wrk_markdown::render_document(&content, &wrk_markdown::RenderOptions::default());
+    Ok(Tab::Markdown(MarkdownTab {
+        name,
+        path,
+        rendered,
+        state: wrk_markdown::MarkdownViewState::new(),
+    }))
+}
+
 /// For tabs spawned as new sessions, try to find the session ID that Claude
 /// created on disk. We wait at least 3 s after spawn to give Claude time to
 /// write its session file, then scan the project's session directory.
@@ -863,6 +966,16 @@ fn run_tui() -> Result<()> {
     let _ = status::ensure_status_dir();
     let mut app = App::new(store, settings);
 
+    // IPC socket for `wrk view` run inside a pane. Non-fatal if it can't bind.
+    let (socket_path, ipc_rx) = match ipc::serve() {
+        Ok((p, rx)) => (Some(p), Some(rx)),
+        Err(e) => {
+            eprintln!("warning: IPC socket unavailable ({e}); `wrk view` will use the pager");
+            (None, None)
+        }
+    };
+    app.socket_path = socket_path.clone();
+
     enable_raw_mode().context("enabling raw mode")?;
     let mut stdout = io::stdout();
     execute!(
@@ -897,7 +1010,7 @@ fn run_tui() -> Result<()> {
 
     let watch_rx = spawn_watcher()?;
 
-    let res = event_loop(&mut terminal, &mut app, watch_rx);
+    let res = event_loop(&mut terminal, &mut app, watch_rx, ipc_rx);
 
     disable_raw_mode().ok();
     let mut stdout = io::stdout();
@@ -912,6 +1025,12 @@ fn run_tui() -> Result<()> {
     )
     .ok();
     terminal.show_cursor().ok();
+
+    // Remove our IPC socket so a stale path can't linger for the next instance
+    // that happens to reuse this pid.
+    if let Some(p) = &socket_path {
+        let _ = std::fs::remove_file(p);
+    }
 
     res
 }
@@ -952,6 +1071,7 @@ fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
     watch_rx: Receiver<()>,
+    ipc_rx: Option<Receiver<ipc::OpenRequest>>,
 ) -> Result<()> {
     while !app.should_quit {
         terminal.draw(|frame| ui::draw(frame, app))?;
@@ -982,6 +1102,13 @@ fn event_loop(
         }
         if reload {
             let _ = app.reload_store();
+        }
+
+        // Drain IPC open-file requests from `wrk view`.
+        if let Some(rx) = &ipc_rx {
+            while let Ok(req) = rx.try_recv() {
+                app.handle_open_request(req);
+            }
         }
 
         if event::poll(Duration::from_millis(33))? {
@@ -2436,6 +2563,42 @@ mod tests {
 
         // Missing files surface an error rather than opening a tab.
         assert!(app.open_markdown_tab("does-not-exist.md").is_err());
+    }
+
+    #[test]
+    fn add_markdown_tab_into_background_project_keeps_focus() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("d.md"), "# x").unwrap();
+        let abs = dir.path().join("d.md").canonicalize().unwrap();
+        let mut app = empty_app();
+        app.sessions.insert(
+            "bg".to_string(),
+            ProjectSession {
+                tabs: vec![claude_tab("c")],
+                ..Default::default()
+            },
+        );
+        app.active_project_name = Some("active".to_string());
+        app.sessions.insert(
+            "active".to_string(),
+            ProjectSession {
+                tabs: vec![claude_tab("c")],
+                ..Default::default()
+            },
+        );
+        app.focus = Focus::Shell;
+
+        app.add_markdown_tab("bg", abs).unwrap();
+        // The background project gained the tab, but focus is unchanged since it
+        // isn't the active project.
+        assert_eq!(app.sessions["bg"].tabs.len(), 2);
+        assert_eq!(app.focus, Focus::Shell);
+
+        // An unloaded project is an error.
+        assert!(
+            app.add_markdown_tab("nope", dir.path().join("d.md"))
+                .is_err()
+        );
     }
 
     #[test]

@@ -84,6 +84,12 @@ The sidebar shows green ● (waiting), yellow · (busy), red ● (notification).
 
 `install_hooks` merges entries into the user's existing `settings.json` and re-running it refreshes the command (so command bug fixes propagate). `uninstall_hooks` only removes entries containing the `WRK_STATUS_FILE` marker. Hook entries are detected by that marker, not by exact-match — preserve it when editing.
 
+`install_hooks`/`uninstall_hooks` (the `install-hooks` subcommands) also write/remove the `wrk-view` **skill** at `~/.claude/skills/wrk-view/SKILL.md` (`install_skill`/`uninstall_skill`); the SKILL.md carries a marker comment so uninstall never deletes a user's own same-named skill.
+
+### `wrk view` and IPC (`src/ipc.rs`)
+
+Each running TUI binds a per-instance Unix socket at `<runtime>/wrk/sock/wrk-<pid>.sock` (`ipc::serve`), stored on `App.socket_path` and exported to every spawned PTY (Claude **and** shell) as `WRK_SOCK`, alongside `WRK_PROJECT` (see `App::base_pty_env`). `wrk view <file>` (`cmd_view`) canonicalizes the path; if `WRK_SOCK` is set and connectable it sends a one-line-JSON `ipc::OpenRequest` which the event loop drains and turns into a markdown tab in the named project (`App::handle_open_request` → `add_markdown_tab`); otherwise it execs the `wrk-md` pager (sibling of the current exe, else `PATH`). The socket file is removed on shutdown.
+
 ## Conventions
 
 - Errors bubble via `anyhow::Result`; UI-recoverable errors set `App.error` (rendered in the status bar) using `push_error` to concatenate.
