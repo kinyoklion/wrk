@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.9](https://github.com/kinyoklion/wrk/compare/wrk-v0.1.8...wrk-v0.1.9) (2026-07-06)
+
+### Features
+
+* **ipc:** `wrk view` opens files in the running TUI + Claude skill (#41) (#48) ([#41](https://github.com/kinyoklion/wrk/issues/41)) ([#48](https://github.com/kinyoklion/wrk/issues/48)) ([#41](https://github.com/kinyoklion/wrk/issues/41))
+* **tui:** markdown documents as tabs in the primary pane (#41) (#47) ([#41](https://github.com/kinyoklion/wrk/issues/41)) ([#47](https://github.com/kinyoklion/wrk/issues/47))
+* **markdown:** workspace split + render library + standalone viewer (#41) (#45) ([#41](https://github.com/kinyoklion/wrk/issues/41)) ([#45](https://github.com/kinyoklion/wrk/issues/45)) ([#41](https://github.com/kinyoklion/wrk/issues/41)) ([#41](https://github.com/kinyoklion/wrk/issues/41))
+* unload a project's session from the sidebar (#40) (#43) ([#40](https://github.com/kinyoklion/wrk/issues/40)) ([#43](https://github.com/kinyoklion/wrk/issues/43))
+
 ## 0.1.8 (2026-06-10)
 
 ### Features
