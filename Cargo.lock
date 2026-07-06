@@ -2659,7 +2659,7 @@ dependencies = [
 
 [[package]]
 name = "wrk"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -2681,7 +2681,7 @@ dependencies = [
 
 [[package]]
 name = "wrk-markdown"
-version = "0.1.0"
+version = "0.1.9"
 dependencies = [
  "pulldown-cmark",
  "ratatui",
@@ -2690,7 +2690,7 @@ dependencies = [
 
 [[package]]
 name = "wrk-md"
-version = "0.1.0"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "clap",
