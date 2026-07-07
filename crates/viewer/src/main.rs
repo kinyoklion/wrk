@@ -41,6 +41,10 @@ struct Cli {
     /// Render to stdout as plain text instead of opening the pager.
     #[arg(long)]
     print: bool,
+    /// Wrap width for `--print` (defaults to the terminal width, or 100 when
+    /// piped). Has no effect in the interactive pager, which uses the pane width.
+    #[arg(long)]
+    width: Option<usize>,
 }
 
 fn main() -> Result<()> {
@@ -51,7 +55,13 @@ fn main() -> Result<()> {
     let opts = RenderOptions::new(!cli.no_highlight);
 
     if cli.print {
-        let text = wrk_markdown::render_document(&source, &opts);
+        // Explicit `--width`, else the terminal width, else a default for pipes.
+        let width = cli.width.unwrap_or_else(|| {
+            crossterm::terminal::size()
+                .map(|(w, _)| w as usize)
+                .unwrap_or(100)
+        });
+        let text = wrk_markdown::render_document(&source, width, &opts);
         let mut out = io::stdout().lock();
         out.write_all(wrk_markdown::to_plain_string(&text).as_bytes())?;
         return Ok(());
@@ -61,9 +71,8 @@ fn main() -> Result<()> {
 }
 
 fn run_pager(path: &std::path::Path, opts: RenderOptions) -> Result<()> {
-    let mut source =
+    let source =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let mut text = wrk_markdown::render_document(&source, &opts);
     let title = format!(" {} ", path.display());
 
     enable_raw_mode().context("enabling raw mode")?;
@@ -72,7 +81,7 @@ fn run_pager(path: &std::path::Path, opts: RenderOptions) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("creating terminal")?;
 
-    let res = pager_loop(&mut terminal, &mut text, &title, path, &opts, &mut source);
+    let res = pager_loop(&mut terminal, &title, path, &opts, source);
 
     disable_raw_mode().ok();
     execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen).ok();
@@ -82,21 +91,31 @@ fn run_pager(path: &std::path::Path, opts: RenderOptions) -> Result<()> {
 
 fn pager_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    text: &mut ratatui::text::Text<'static>,
     title: &str,
     path: &std::path::Path,
     opts: &RenderOptions,
-    source: &mut String,
+    mut source: String,
 ) -> Result<()> {
     let mut state = MarkdownViewState::new();
+    let mut text = ratatui::text::Text::default();
+    // Re-render only when the content width changes (`0` forces the first render
+    // and a re-render after reload).
+    let mut rendered_width: u16 = 0;
     loop {
+        // Content sits inside the 1-cell block border on each side.
+        let inner_width = terminal.size()?.width.saturating_sub(2);
+        if inner_width != rendered_width && inner_width > 0 {
+            text = wrk_markdown::render_document(&source, inner_width as usize, opts);
+            rendered_width = inner_width;
+        }
+
         terminal.draw(|frame| {
             let area = frame.area();
             let block = Block::default()
                 .title(title)
                 .borders(Borders::ALL)
                 .border_style(Style::default().add_modifier(Modifier::DIM));
-            let view = MarkdownView::new(text).block(block);
+            let view = MarkdownView::new(&text).block(block);
             frame.render_stateful_widget(view, area, &mut state);
         })?;
 
@@ -119,8 +138,8 @@ fn pager_loop(
                     KeyCode::Char('G') | KeyCode::End => state.scroll_to_bottom(),
                     KeyCode::Char('r') => {
                         if let Ok(fresh) = std::fs::read_to_string(path) {
-                            *source = fresh;
-                            *text = wrk_markdown::render_document(source, opts);
+                            source = fresh;
+                            rendered_width = 0; // force re-render
                         }
                     }
                     _ => {}

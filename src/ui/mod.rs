@@ -242,6 +242,8 @@ fn draw_primary_pane(frame: &mut Frame, area: Rect, focused: bool, app: &mut App
     } else if active_is_md {
         if let Some(s) = app.active_session_mut() {
             if let Some(Tab::Markdown(md)) = s.tabs.get_mut(active_idx) {
+                // Lay tables out to the current pane width (re-renders on resize).
+                md.ensure_rendered(content_area.width);
                 // Disjoint field borrows: `&md.rendered` and `&mut md.state`.
                 frame.render_stateful_widget(
                     MarkdownView::new(&md.rendered),

@@ -250,10 +250,39 @@ pub struct MarkdownTab {
     pub name: String,
     /// Absolute path to the source file (used for reload).
     pub path: PathBuf,
-    /// Pre-rendered styled lines. Re-rendered on reload.
+    /// Raw markdown source. Re-rendered whenever the pane width changes so that
+    /// tables lay out to the available width.
+    pub source: String,
+    /// Rendered lines, valid for `render_width`.
     pub rendered: ratatui::text::Text<'static>,
+    /// Display width `rendered` was laid out at; `0` forces a (re-)render.
+    pub render_width: u16,
     /// Scroll/viewport state for the markdown view widget.
     pub state: wrk_markdown::MarkdownViewState,
+}
+
+impl MarkdownTab {
+    /// Re-render the document if the display width changed. Cheap no-op when the
+    /// width is unchanged (the common per-frame case).
+    fn ensure_rendered(&mut self, width: u16) {
+        if width == 0 || width == self.render_width {
+            return;
+        }
+        self.rendered = wrk_markdown::render_document(
+            &self.source,
+            width as usize,
+            &wrk_markdown::RenderOptions::default(),
+        );
+        self.render_width = width;
+    }
+
+    /// Re-read the file from disk; the next draw re-renders at the current width.
+    fn reload(&mut self) {
+        if let Ok(content) = std::fs::read_to_string(&self.path) {
+            self.source = content;
+            self.render_width = 0;
+        }
+    }
 }
 
 /// A tab in a project's primary pane: either a Claude PTY session or a markdown
@@ -874,20 +903,23 @@ fn claude_command(settings: &Settings, session_id: Option<&str>) -> Vec<String> 
     cmd
 }
 
-/// Read and render a markdown file at an absolute `path` into a [`Tab`].
+/// Read a markdown file at an absolute `path` into a [`Tab`]. Rendering is
+/// deferred to the first draw, when the pane width is known (see
+/// [`MarkdownTab::ensure_rendered`]).
 fn build_markdown_tab(path: PathBuf) -> Result<Tab> {
-    let content =
+    let source =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let name = path
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("markdown")
         .to_string();
-    let rendered = wrk_markdown::render_document(&content, &wrk_markdown::RenderOptions::default());
     Ok(Tab::Markdown(MarkdownTab {
         name,
         path,
-        rendered,
+        source,
+        rendered: ratatui::text::Text::default(),
+        render_width: 0,
         state: wrk_markdown::MarkdownViewState::new(),
     }))
 }
@@ -1372,14 +1404,7 @@ fn handle_markdown_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('u') | KeyCode::PageUp => md.state.page_up(),
         KeyCode::Char('g') | KeyCode::Home => md.state.scroll_to_top(),
         KeyCode::Char('G') | KeyCode::End => md.state.scroll_to_bottom(),
-        KeyCode::Char('r') => {
-            if let Ok(content) = std::fs::read_to_string(&md.path) {
-                md.rendered = wrk_markdown::render_document(
-                    &content,
-                    &wrk_markdown::RenderOptions::default(),
-                );
-            }
-        }
+        KeyCode::Char('r') => md.reload(),
         _ => {}
     }
 }
@@ -2476,7 +2501,9 @@ mod tests {
         Tab::Markdown(MarkdownTab {
             name: name.to_string(),
             path: PathBuf::from(name),
-            rendered: wrk_markdown::render_document("x", &wrk_markdown::RenderOptions::default()),
+            source: "x".to_string(),
+            rendered: ratatui::text::Text::default(),
+            render_width: 0,
             state: wrk_markdown::MarkdownViewState::new(),
         })
     }
