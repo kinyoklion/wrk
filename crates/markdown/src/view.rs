@@ -2,17 +2,59 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::Text;
 use ratatui::widgets::{Block, Paragraph, StatefulWidget, Widget, Wrap};
 
-/// Scroll position for a [`MarkdownView`]. The widget refreshes the viewport and
-/// content heights on each render, so the navigation methods clamp correctly to
-/// the last laid-out geometry.
+/// A text selection in *viewport* coordinates: `(row, col)` cell positions
+/// within the last-rendered visible area. Anchor is where the drag began.
+#[derive(Debug, Clone, Copy)]
+struct Selection {
+    anchor: (u16, u16),
+    cursor: (u16, u16),
+}
+
+impl Selection {
+    /// Start/end ordered in reading order (top-to-bottom, left-to-right).
+    fn ends(&self) -> ((u16, u16), (u16, u16)) {
+        if self.anchor <= self.cursor {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
+    }
+
+    /// The `[start_col, end_col)` selected on visible `row`, given the row width.
+    fn col_span(&self, row: u16, width: u16) -> (u16, u16) {
+        let ((r0, c0), (r1, c1)) = self.ends();
+        if row < r0 || row > r1 {
+            return (0, 0);
+        }
+        let start = if row == r0 { c0 } else { 0 };
+        let end = if row == r1 {
+            c1.saturating_add(1)
+        } else {
+            width
+        };
+        (start.min(width), end.min(width))
+    }
+}
+
+/// Scroll position and transient selection for a [`MarkdownView`]. The widget
+/// refreshes the viewport/content geometry and a snapshot of the visible glyphs
+/// on each render, so the navigation and selection methods work off the last
+/// laid-out frame.
 #[derive(Debug, Default, Clone)]
 pub struct MarkdownViewState {
     scroll: u16,
     viewport_h: u16,
     content_h: u16,
+    /// Active selection (viewport coords), set by the host on mouse drag.
+    selection: Option<Selection>,
+    /// Snapshot of the visible rows' text, captured each render for extraction.
+    glyphs: Vec<String>,
+    /// Width of the captured grid in cells.
+    grid_w: u16,
 }
 
 impl MarkdownViewState {
@@ -64,6 +106,80 @@ impl MarkdownViewState {
         self.viewport_h = viewport_h;
         self.scroll = self.scroll.min(self.max_scroll());
     }
+
+    /// Begin a selection at viewport cell `(col, row)`.
+    pub fn selection_anchor(&mut self, col: u16, row: u16) {
+        self.selection = Some(Selection {
+            anchor: (row, col),
+            cursor: (row, col),
+        });
+    }
+
+    /// Extend the active selection to viewport cell `(col, row)`.
+    pub fn selection_update(&mut self, col: u16, row: u16) {
+        if let Some(sel) = self.selection.as_mut() {
+            sel.cursor = (row, col);
+        }
+    }
+
+    /// Drop any active selection.
+    pub fn selection_clear(&mut self) {
+        self.selection = None;
+    }
+
+    /// The selected text (rows joined by `\n`, trailing padding trimmed), or
+    /// `None` when there is no selection or it is empty. Reads the glyph snapshot
+    /// from the last render.
+    pub fn selection_text(&self) -> Option<String> {
+        let sel = self.selection?;
+        let ((r0, _), (r1, _)) = sel.ends();
+        let mut out = String::new();
+        for row in r0..=r1 {
+            let Some(line) = self.glyphs.get(row as usize) else {
+                break;
+            };
+            let chars: Vec<char> = line.chars().collect();
+            let (c0, c1) = sel.col_span(row, self.grid_w);
+            let c1 = (c1 as usize).min(chars.len());
+            let c0 = (c0 as usize).min(c1);
+            let piece: String = chars[c0..c1].iter().collect();
+            out.push_str(piece.trim_end());
+            if row != r1 {
+                out.push('\n');
+            }
+        }
+        let trimmed = out.trim_end_matches('\n');
+        if trimmed.trim().is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+
+    /// Snapshot the visible glyphs from `buf` over `inner` and reverse-video any
+    /// selected cells. Called during render, after the content is drawn.
+    fn capture_and_highlight(&mut self, inner: Rect, buf: &mut Buffer) {
+        let mut glyphs = Vec::with_capacity(inner.height as usize);
+        for r in 0..inner.height {
+            let mut row = String::with_capacity(inner.width as usize);
+            for c in 0..inner.width {
+                row.push_str(buf[(inner.x + c, inner.y + r)].symbol());
+            }
+            glyphs.push(row);
+        }
+        self.glyphs = glyphs;
+        self.grid_w = inner.width;
+
+        if let Some(sel) = self.selection {
+            let highlight = Style::default().add_modifier(Modifier::REVERSED);
+            for r in 0..inner.height {
+                let (c0, c1) = sel.col_span(r, inner.width);
+                for c in c0..c1 {
+                    buf[(inner.x + c, inner.y + r)].set_style(highlight);
+                }
+            }
+        }
+    }
 }
 
 /// Widget that draws rendered markdown with vertical scrolling and word wrap.
@@ -103,6 +219,7 @@ impl StatefulWidget for MarkdownView<'_> {
         state.sync(content_h, inner.height);
 
         paragraph.scroll((state.scroll, 0)).render(inner, buf);
+        state.capture_and_highlight(inner, buf);
     }
 }
 
@@ -159,5 +276,43 @@ mod tests {
         assert_eq!(state.scroll(), 81);
         state.scroll_to_top();
         assert_eq!(state.scroll(), 0);
+    }
+
+    #[test]
+    fn selection_extracts_single_and_multi_row_text() {
+        let text = Text::from(vec![Line::from("hello world"), Line::from("second line")]);
+        let mut state = MarkdownViewState::new();
+        render_into(&text, 20, 5, &mut state);
+
+        // Single row: cols 0..=4 → "hello".
+        state.selection_anchor(0, 0);
+        state.selection_update(4, 0);
+        assert_eq!(state.selection_text().as_deref(), Some("hello"));
+
+        // Multi row: (row0,col6) → (row1,col5) = "world" + "second".
+        state.selection_anchor(6, 0);
+        state.selection_update(5, 1);
+        assert_eq!(state.selection_text().as_deref(), Some("world\nsecond"));
+
+        state.selection_clear();
+        assert_eq!(state.selection_text(), None);
+    }
+
+    #[test]
+    fn selection_reverse_video_highlights_only_selected_cells() {
+        let text = Text::from("abcdef");
+        let mut state = MarkdownViewState::new();
+        let area = Rect::new(0, 0, 10, 3);
+        let mut buf = Buffer::empty(area);
+        MarkdownView::new(&text).render(area, &mut buf, &mut state);
+
+        state.selection_anchor(0, 0);
+        state.selection_update(2, 0); // cols 0..=2
+        // Re-render to apply the highlight over the captured frame.
+        MarkdownView::new(&text).render(area, &mut buf, &mut state);
+
+        assert!(buf[(0, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(buf[(2, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(!buf[(3, 0)].modifier.contains(Modifier::REVERSED));
     }
 }
