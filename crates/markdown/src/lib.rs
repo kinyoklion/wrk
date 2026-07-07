@@ -61,11 +61,13 @@ impl RenderOptions {
 
 /// Render markdown `source` into a ratatui [`Text`] of styled lines.
 ///
-/// The returned text is unwrapped — wrapping happens at display time (the
-/// [`MarkdownView`] widget wraps to the viewport width). For a quick plain-text
-/// dump, use [`to_plain_string`].
-pub fn render_document(source: &str, opts: &RenderOptions) -> Text<'static> {
-    parse::render(source, opts)
+/// `width` is the display width in terminal cells the output will be shown at.
+/// It drives table column layout — columns are sized and their contents wrapped
+/// to fit. Prose lines are left long for the [`MarkdownView`] widget to word-wrap
+/// at display time, so pass the same width you render the view at. For a quick
+/// plain-text dump, use [`to_plain_string`].
+pub fn render_document(source: &str, width: usize, opts: &RenderOptions) -> Text<'static> {
+    parse::render(source, width, opts)
 }
 
 /// Flatten a rendered [`Text`] into a plain (unstyled) string, one logical line

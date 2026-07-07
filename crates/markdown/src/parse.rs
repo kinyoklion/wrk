@@ -13,7 +13,7 @@ use crate::RenderOptions;
 use crate::diagram::is_diagram_lang;
 use crate::theme::MdTheme;
 
-pub(crate) fn render(source: &str, opts: &RenderOptions) -> Text<'static> {
+pub(crate) fn render(source: &str, width: usize, opts: &RenderOptions) -> Text<'static> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
@@ -21,7 +21,7 @@ pub(crate) fn render(source: &str, opts: &RenderOptions) -> Text<'static> {
     options.insert(Options::ENABLE_FOOTNOTES);
 
     let parser = Parser::new_ext(source, options);
-    let mut r = Renderer::new(opts);
+    let mut r = Renderer::new(width, opts);
     for event in parser {
         r.handle(event);
     }
@@ -45,6 +45,8 @@ struct TableBuilder {
 struct Renderer<'o> {
     theme: MdTheme,
     highlight: bool,
+    /// Display width in cells; used to lay out tables.
+    width: usize,
     opts: &'o RenderOptions,
 
     lines: Vec<Line<'static>>,
@@ -75,10 +77,11 @@ struct Renderer<'o> {
 }
 
 impl<'o> Renderer<'o> {
-    fn new(opts: &'o RenderOptions) -> Self {
+    fn new(width: usize, opts: &'o RenderOptions) -> Self {
         Self {
             theme: opts.theme,
             highlight: opts.highlight,
+            width,
             opts,
             lines: Vec::new(),
             cur: Vec::new(),
@@ -398,64 +401,181 @@ impl<'o> Renderer<'o> {
             return;
         }
         let cols = t.rows.iter().map(|r| r.len()).max().unwrap_or(0);
-        let mut widths = vec![0usize; cols];
-        for row in &t.rows {
-            for (i, cell) in row.iter().enumerate() {
-                widths[i] = widths[i].max(cell.chars().count());
-            }
+        if cols == 0 {
+            return;
         }
 
-        for (ri, row) in t.rows.iter().enumerate() {
-            let mut rendered = String::new();
-            for (i, &col_w) in widths.iter().enumerate() {
-                let cell = row.get(i).map(String::as_str).unwrap_or("");
-                let pad = col_w.saturating_sub(cell.chars().count());
-                let align = t.aligns.get(i).copied().unwrap_or(Alignment::None);
-                rendered.push_str("│ ");
-                match align {
-                    Alignment::Right => {
-                        rendered.push_str(&" ".repeat(pad));
-                        rendered.push_str(cell);
-                    }
-                    Alignment::Center => {
-                        let left = pad / 2;
-                        rendered.push_str(&" ".repeat(left));
-                        rendered.push_str(cell);
-                        rendered.push_str(&" ".repeat(pad - left));
-                    }
-                    _ => {
-                        rendered.push_str(cell);
-                        rendered.push_str(&" ".repeat(pad));
-                    }
-                }
-                rendered.push(' ');
+        // Natural (unconstrained) width per column, then fit to the display
+        // width so wide tables wrap within their columns instead of overflowing.
+        let mut natural = vec![1usize; cols];
+        for row in &t.rows {
+            for (i, cell) in row.iter().enumerate() {
+                natural[i] = natural[i].max(cell.chars().count().max(1));
             }
-            rendered.push('│');
-            let style = if ri < t.head_rows {
+        }
+        let widths = fit_columns(&natural, self.width);
+
+        let rule = Style::default().fg(self.theme.rule);
+        self.lines.push(border_line(&widths, '┌', '┬', '┐', rule));
+
+        for (ri, row) in t.rows.iter().enumerate() {
+            // Each cell is wrapped to its column width; the row is as tall as
+            // its tallest cell.
+            let wrapped: Vec<Vec<String>> = (0..cols)
+                .map(|i| wrap_text(row.get(i).map(String::as_str).unwrap_or(""), widths[i]))
+                .collect();
+            let height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
+            let cell_style = if ri < t.head_rows {
                 Style::default()
                     .fg(self.theme.heading)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
-            self.lines.push(Line::from(Span::styled(rendered, style)));
 
-            // Separator under the header row.
-            if ri + 1 == t.head_rows {
-                let mut sep = String::new();
-                for w in &widths {
-                    sep.push_str("├─");
-                    sep.push_str(&"─".repeat(*w));
-                    sep.push('─');
+            for k in 0..height {
+                let mut spans: Vec<Span<'static>> = Vec::with_capacity(cols * 3 + 1);
+                for (i, &w) in widths.iter().enumerate() {
+                    let cell = wrapped[i].get(k).map(String::as_str).unwrap_or("");
+                    let align = t.aligns.get(i).copied().unwrap_or(Alignment::None);
+                    spans.push(Span::styled("│ ".to_string(), rule));
+                    spans.push(Span::styled(pad_align(cell, w, align), cell_style));
+                    spans.push(Span::styled(" ".to_string(), rule));
                 }
-                sep.push('┤');
-                self.lines.push(Line::from(Span::styled(
-                    sep,
-                    Style::default().fg(self.theme.rule),
-                )));
+                spans.push(Span::styled("│".to_string(), rule));
+                self.lines.push(Line::from(spans));
+            }
+
+            if ri + 1 == t.head_rows {
+                self.lines.push(border_line(&widths, '├', '┼', '┤', rule));
             }
         }
+
+        self.lines.push(border_line(&widths, '└', '┴', '┘', rule));
     }
+}
+
+/// Choose per-column widths so the whole table fits in `width` cells. Each
+/// column costs its width plus 3 (`"│ "` + trailing space); the table adds a
+/// final `"│"`.
+///
+/// When the natural widths don't fit, the *widest* column is shrunk one cell at
+/// a time until they do. This keeps narrow columns at their natural width and
+/// only wraps the genuinely-long ones, rather than squeezing every column
+/// proportionally (which mangles short headers next to one big column).
+fn fit_columns(natural: &[usize], width: usize) -> Vec<usize> {
+    let cols = natural.len();
+    let overhead = 3 * cols + 1;
+    let budget = width.saturating_sub(overhead).max(cols);
+
+    let mut widths = natural.to_vec();
+    let mut sum: usize = widths.iter().sum();
+    while sum > budget {
+        let idx = widest_index(&widths);
+        if widths[idx] <= 1 {
+            break; // every column is already at the 1-cell minimum
+        }
+        widths[idx] -= 1;
+        sum -= 1;
+    }
+    widths
+}
+
+/// Index of the widest column (ties resolve to the leftmost).
+fn widest_index(widths: &[usize]) -> usize {
+    let mut best = 0;
+    for (i, &w) in widths.iter().enumerate() {
+        if w > widths[best] {
+            best = i;
+        }
+    }
+    best
+}
+
+/// Pad/truncate `cell` to exactly `w` chars with the given alignment.
+fn pad_align(cell: &str, w: usize, align: Alignment) -> String {
+    let len = cell.chars().count();
+    if len >= w {
+        return cell.chars().take(w).collect();
+    }
+    let pad = w - len;
+    match align {
+        Alignment::Right => format!("{}{}", " ".repeat(pad), cell),
+        Alignment::Center => {
+            let left = pad / 2;
+            format!("{}{}{}", " ".repeat(left), cell, " ".repeat(pad - left))
+        }
+        _ => format!("{}{}", cell, " ".repeat(pad)),
+    }
+}
+
+/// A horizontal table border/junction line for the given column widths.
+fn border_line(
+    widths: &[usize],
+    left: char,
+    mid: char,
+    right: char,
+    style: Style,
+) -> Line<'static> {
+    let mut s = String::new();
+    s.push(left);
+    for (i, &w) in widths.iter().enumerate() {
+        if i > 0 {
+            s.push(mid);
+        }
+        // Column span = 1 leading + w + 1 trailing space.
+        s.push_str(&"─".repeat(w + 2));
+    }
+    s.push(right);
+    Line::from(Span::styled(s, style))
+}
+
+/// Word-wrap `s` to `w` columns, hard-breaking any word longer than `w`.
+/// Always returns at least one (possibly empty) line.
+fn wrap_text(s: &str, w: usize) -> Vec<String> {
+    if w == 0 {
+        return vec![String::new()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for word in s.split(' ') {
+        let wl = word.chars().count();
+        if wl > w {
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+                cur_w = 0;
+            }
+            let mut chars = word.chars().peekable();
+            while chars.peek().is_some() {
+                let chunk: String = chars.by_ref().take(w).collect();
+                if chunk.chars().count() == w {
+                    lines.push(chunk);
+                } else {
+                    cur_w = chunk.chars().count();
+                    cur = chunk;
+                }
+            }
+            continue;
+        }
+        let need = if cur.is_empty() { wl } else { cur_w + 1 + wl };
+        if need > w {
+            lines.push(std::mem::take(&mut cur));
+            cur = word.to_string();
+            cur_w = wl;
+        } else {
+            if !cur.is_empty() {
+                cur.push(' ');
+                cur_w += 1;
+            }
+            cur.push_str(word);
+            cur_w += wl;
+        }
+    }
+    if !cur.is_empty() || lines.is_empty() {
+        lines.push(cur);
+    }
+    lines
 }
 
 #[cfg(feature = "highlight")]
@@ -492,13 +612,13 @@ mod tests {
 
     fn render_default(src: &str) -> Text<'static> {
         // Highlighting off keeps code-block assertions deterministic.
-        render(src, &RenderOptions::new(false))
+        render(src, 80, &RenderOptions::new(false))
     }
 
     #[cfg(feature = "highlight")]
     #[test]
     fn rust_code_block_is_highlighted() {
-        let text = render("```rust\nlet x = 1;\n```", &RenderOptions::new(true));
+        let text = render("```rust\nlet x = 1;\n```", 80, &RenderOptions::new(true));
         // syntect splits the line into several colored spans, vs the single
         // dim span produced by the plain fallback.
         let line = &text.lines[0];
@@ -559,18 +679,65 @@ mod tests {
     }
 
     #[test]
-    fn table_renders_aligned_rows() {
+    fn table_renders_boxed_rows() {
         let text = render_default("| a | b |\n|---|---|\n| 1 | 2 |");
         let lines = plain(&text);
-        // Header, separator, one body row.
-        assert_eq!(lines.len(), 3);
-        assert!(lines[0].contains("a") && lines[0].contains("b"));
-        assert!(lines[2].contains('1') && lines[2].contains('2'));
+        // Top border, header, header separator, body row, bottom border.
+        assert_eq!(lines.len(), 5);
+        assert!(lines[0].starts_with('┌') && lines[0].ends_with('┐'));
+        assert!(lines[1].contains('a') && lines[1].contains('b'));
+        assert!(lines[2].starts_with('├'));
+        assert!(lines[3].contains('1') && lines[3].contains('2'));
+        assert!(lines[4].starts_with('└') && lines[4].ends_with('┘'));
+        // Every rendered row is the same width and fits the display width.
+        let widths: Vec<usize> = lines.iter().map(|l| l.chars().count()).collect();
+        assert!(widths.iter().all(|&w| w == widths[0] && w <= 80));
+    }
+
+    #[test]
+    fn wide_table_wraps_within_columns_and_fits_width() {
+        // A cell far wider than the display width must wrap, not overflow.
+        let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+        let src = format!("| word | text |\n|---|---|\n| x | {long} |");
+        let text = render(&src, 30, &RenderOptions::new(false));
+        let lines = plain(&text);
+        assert!(
+            lines.iter().all(|l| l.chars().count() <= 30),
+            "a line exceeded the 30-col width: {lines:?}"
+        );
+        // The long cell spans multiple physical rows (wrapped), so the table is
+        // taller than the un-wrapped 5 lines.
+        assert!(
+            lines.len() > 5,
+            "expected wrapped rows, got {}",
+            lines.len()
+        );
+    }
+
+    #[test]
+    fn wrap_text_hard_breaks_long_words() {
+        assert_eq!(wrap_text("hello world", 5), vec!["hello", "world"]);
+        assert_eq!(wrap_text("supercalifragilistic", 5).len(), 4);
+        assert_eq!(wrap_text("", 5), vec![String::new()]);
+    }
+
+    #[test]
+    fn fit_columns_shrinks_widest_and_keeps_short_columns() {
+        // Two short columns beside one very wide one, at width 54.
+        // overhead = 3*3+1 = 10, so budget = 44.
+        let widths = fit_columns(&[8, 90, 6], 54);
+        assert_eq!(widths[0], 8, "short column kept its natural width");
+        assert_eq!(widths[2], 6, "short column kept its natural width");
+        assert!(widths[1] < 90, "the widest column absorbed the shrink");
+        assert_eq!(widths.iter().sum::<usize>(), 44);
+
+        // When everything fits, widths are left at natural.
+        assert_eq!(fit_columns(&[3, 4, 5], 80), vec![3, 4, 5]);
     }
 
     #[test]
     fn emphasis_sets_modifiers() {
-        let text = render("**bold** and *italic*", &RenderOptions::new(false));
+        let text = render("**bold** and *italic*", 80, &RenderOptions::new(false));
         let bold = text.lines[0]
             .spans
             .iter()

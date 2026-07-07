@@ -82,15 +82,18 @@ both `wrk` and `wrk-md`.
 ## Standalone markdown viewer (`wrk-md`)
 
 `wrk-md` renders a markdown file in the terminal — headings, emphasis, lists,
-tables, block quotes, and syntax-highlighted code blocks — using the same
-engine that backs wrk's in-TUI markdown. Mermaid (and other diagram) fences are
-shown as a code block with a "preview not enabled" note for now; live diagram
+block quotes, and syntax-highlighted code blocks — using the same engine that
+backs wrk's in-TUI markdown. Tables are laid out to the display width, wrapping
+long cells within their columns (the widest column shrinks first, so short
+columns keep their natural width). Mermaid (and other diagram) fences are shown
+as a code block with a "preview not enabled" note for now; live diagram
 rendering is planned.
 
 ```sh
 wrk-md README.md            # scrollable pager (j/k, PgUp/PgDn, g/G, r reload, q quit)
 wrk-md --no-highlight FILE  # disable code syntax highlighting
 wrk-md --print FILE         # plain-text render to stdout (for piping)
+wrk-md --print --width 80 F # force a wrap width for --print (else terminal width)
 ```
 
 ## CLI
