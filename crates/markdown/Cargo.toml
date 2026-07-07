@@ -1,7 +1,7 @@
 [package]
 name = "wrk-markdown"
 description = "CommonMark/GFM markdown rendering into ratatui text plus a scrollable view widget, used by the wrk TUI and the wrk-md standalone viewer."
-version = "0.1.0"
+version = "0.1.9" # x-release-please-version
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
