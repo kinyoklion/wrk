@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.10](https://github.com/kinyoklion/wrk/compare/wrk-v0.1.9...wrk-v0.1.10) (2026-07-07)
+
+### Bug Fixes
+
+* **release:** keep workspace member versions in lockstep with release bumps (#51) ([#51](https://github.com/kinyoklion/wrk/issues/51))
+
 ## [0.1.9](https://github.com/kinyoklion/wrk/compare/wrk-v0.1.8...wrk-v0.1.9) (2026-07-06)
 
 ### Features

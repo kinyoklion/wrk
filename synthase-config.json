@@ -6,7 +6,11 @@
   "include-component-in-tag": true,
   "packages": {
     ".": {
-      "package-name": "wrk"
+      "package-name": "wrk",
+      "extra-files": [
+        "crates/markdown/Cargo.toml",
+        "crates/viewer/Cargo.toml"
+      ]
     }
   }
 }
