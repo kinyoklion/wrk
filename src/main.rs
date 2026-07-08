@@ -455,6 +455,20 @@ impl App {
         self.active_session().and_then(|s| s.shell.as_ref())
     }
 
+    /// The active project's currently-shown markdown tab, if that's what's up.
+    fn active_markdown(&self) -> Option<&MarkdownTab> {
+        match self.active_session()?.current()? {
+            Tab::Markdown(md) => Some(md),
+            Tab::Claude(_) => None,
+        }
+    }
+    fn active_markdown_mut(&mut self) -> Option<&mut MarkdownTab> {
+        match self.active_session_mut()?.current_mut()? {
+            Tab::Markdown(md) => Some(md),
+            Tab::Claude(_) => None,
+        }
+    }
+
     /// Environment common to every PTY wrk spawns for a project: `WRK_PROJECT`
     /// (so `wrk view` can name its originating project) and `WRK_SOCK` (this
     /// instance's IPC socket). Claude tabs additionally get `WRK_STATUS_FILE`.
@@ -1552,14 +1566,24 @@ fn enter_select_mode(app: &mut App) {
 }
 
 /// Cancel select mode without copying. Clears any in-progress selection on
-/// the pane the drag had anchored to.
+/// the pane (or markdown viewer) the drag had anchored to.
 fn exit_select_mode(app: &mut App) {
-    if let Some(focus) = app.select_anchor_pane.take()
-        && let Some(pane) = pane_for_focus(app, focus)
-    {
-        pane.selection_clear();
+    if let Some(focus) = app.select_anchor_pane.take() {
+        if md_select_target(app, focus) {
+            if let Some(md) = app.active_markdown_mut() {
+                md.state.selection_clear();
+            }
+        } else if let Some(pane) = pane_for_focus(app, focus) {
+            pane.selection_clear();
+        }
     }
     app.select_mode = false;
+}
+
+/// Whether select-mode input at `focus` targets a markdown viewer (which lives
+/// in the primary/claude pane) rather than a PTY.
+fn md_select_target(app: &App, focus: Focus) -> bool {
+    focus == Focus::Claude && active_tab_is_markdown(app)
 }
 
 /// Route a bracketed-paste payload from the host terminal. When a modal text
@@ -2046,7 +2070,11 @@ fn handle_select_mouse(app: &mut App, layout: &LayoutRects, m: MouseEvent, pos_x
             let row = (pos_y - inner.y) as usize;
             app.focus = focus;
             app.select_anchor_pane = Some(focus);
-            if let Some(pane) = pane_for_focus(app, focus) {
+            if md_select_target(app, focus) {
+                if let Some(md) = app.active_markdown_mut() {
+                    md.state.selection_anchor(col as u16, row as u16);
+                }
+            } else if let Some(pane) = pane_for_focus(app, focus) {
                 pane.selection_anchor(col, row);
             }
         }
@@ -2061,7 +2089,11 @@ fn handle_select_mouse(app: &mut App, layout: &LayoutRects, m: MouseEvent, pos_x
             // borders still extends to the edge cell.
             let col = pos_x.saturating_sub(inner.x) as usize;
             let row = pos_y.saturating_sub(inner.y) as usize;
-            if let Some(pane) = pane_for_focus(app, focus) {
+            if md_select_target(app, focus) {
+                if let Some(md) = app.active_markdown_mut() {
+                    md.state.selection_update(col as u16, row as u16);
+                }
+            } else if let Some(pane) = pane_for_focus(app, focus) {
                 pane.selection_update(col, row);
             }
         }
@@ -2070,10 +2102,21 @@ fn handle_select_mouse(app: &mut App, layout: &LayoutRects, m: MouseEvent, pos_x
                 Some(f) => f,
                 None => return,
             };
-            let text = pane_for_focus(app, focus).and_then(|p| p.selection_text());
-            if let Some(pane) = pane_for_focus(app, focus) {
-                pane.selection_clear();
-            }
+            let text = if md_select_target(app, focus) {
+                let t = app
+                    .active_markdown()
+                    .and_then(|md| md.state.selection_text());
+                if let Some(md) = app.active_markdown_mut() {
+                    md.state.selection_clear();
+                }
+                t
+            } else {
+                let t = pane_for_focus(app, focus).and_then(|p| p.selection_text());
+                if let Some(pane) = pane_for_focus(app, focus) {
+                    pane.selection_clear();
+                }
+                t
+            };
             app.select_mode = false;
             match text {
                 Some(s) => {

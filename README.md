@@ -144,9 +144,10 @@ bar and persisted per project as `passthrough = true` in `projects.toml`.
 
 **Select mode.** `Alt+s` enters a transient text-selection mode (status bar
 shows a `[select]` chip): plain mouse-drag highlights cells in whichever pane
-the drag started on — bypassing both PTY mouse capture and the host
-terminal's whole-row selection — and releasing the button copies the
-selection to your clipboard via OSC 52. The mode auto-exits after the copy;
+(a claude/shell PTY or a markdown tab) the drag started on — bypassing both PTY
+mouse capture and the host terminal's whole-row selection — and releasing the
+button copies the selection to your clipboard via OSC 52. In a markdown tab the
+selection covers the visible area (scroll first, then drag). The mode auto-exits after the copy;
 press `Esc` to cancel without copying. OSC 52 must be allowed by your outer
 terminal for the clipboard write to land (xterm/Ghostty/kitty/foot allow it
 by default; tmux needs `set -g allow-passthrough on`).
