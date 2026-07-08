@@ -6,7 +6,7 @@
 //! Output lines are left *unwrapped* — the view widget wraps to the viewport.
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 
 use crate::RenderOptions;
@@ -418,36 +418,66 @@ impl<'o> Renderer<'o> {
         let rule = Style::default().fg(self.theme.rule);
         self.lines.push(border_line(&widths, '┌', '┬', '┐', rule));
 
+        let with_bg = |style: Style, bg: Option<Color>| match bg {
+            Some(c) => style.bg(c),
+            None => style,
+        };
+
+        let last_ri = t.rows.len().saturating_sub(1);
+        let mut body_idx = 0usize;
         for (ri, row) in t.rows.iter().enumerate() {
+            let is_header = ri < t.head_rows;
+            // Zebra-stripe body rows so adjacent rows read apart. The stripe is
+            // applied to the border/padding spans too, for a continuous band.
+            let row_bg = if is_header {
+                None
+            } else if body_idx % 2 == 0 {
+                self.theme.table_row_bg
+            } else {
+                self.theme.table_row_alt_bg
+            };
+
             // Each cell is wrapped to its column width; the row is as tall as
             // its tallest cell.
             let wrapped: Vec<Vec<String>> = (0..cols)
                 .map(|i| wrap_text(row.get(i).map(String::as_str).unwrap_or(""), widths[i]))
                 .collect();
             let height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
-            let cell_style = if ri < t.head_rows {
+            let base_cell = if is_header {
                 Style::default()
                     .fg(self.theme.heading)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
+            let cell_style = with_bg(base_cell, row_bg);
+            let border_style = with_bg(rule, row_bg);
 
             for k in 0..height {
                 let mut spans: Vec<Span<'static>> = Vec::with_capacity(cols * 3 + 1);
                 for (i, &w) in widths.iter().enumerate() {
                     let cell = wrapped[i].get(k).map(String::as_str).unwrap_or("");
                     let align = t.aligns.get(i).copied().unwrap_or(Alignment::None);
-                    spans.push(Span::styled("│ ".to_string(), rule));
+                    spans.push(Span::styled("│ ".to_string(), border_style));
                     spans.push(Span::styled(pad_align(cell, w, align), cell_style));
-                    spans.push(Span::styled(" ".to_string(), rule));
+                    spans.push(Span::styled(" ".to_string(), border_style));
                 }
-                spans.push(Span::styled("│".to_string(), rule));
+                spans.push(Span::styled("│".to_string(), border_style));
                 self.lines.push(Line::from(spans));
             }
 
-            if ri + 1 == t.head_rows {
-                self.lines.push(border_line(&widths, '├', '┼', '┤', rule));
+            if is_header {
+                // Heavier divider under the header row.
+                if ri + 1 == t.head_rows {
+                    self.lines.push(border_line(&widths, '├', '┼', '┤', rule));
+                }
+            } else {
+                body_idx += 1;
+                // Thin line between adjacent body rows; the bottom border
+                // closes the last one.
+                if ri != last_ri {
+                    self.lines.push(border_line(&widths, '├', '┼', '┤', rule));
+                }
             }
         }
 
@@ -692,6 +722,33 @@ mod tests {
         // Every rendered row is the same width and fits the display width.
         let widths: Vec<usize> = lines.iter().map(|l| l.chars().count()).collect();
         assert!(widths.iter().all(|&w| w == widths[0] && w <= 80));
+    }
+
+    #[test]
+    fn table_body_rows_zebra_stripe_and_separate() {
+        // Two body rows: expect top border, header, header rule, row 1,
+        // inter-row separator, row 2, bottom border — 7 lines.
+        let text = render_default("| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |");
+        let lines = plain(&text);
+        assert_eq!(lines.len(), 7, "{lines:?}");
+        assert!(lines[3].contains('1'));
+        assert!(lines[4].starts_with('├'), "separator between body rows");
+        assert!(lines[5].contains('3'));
+
+        // The default theme leaves even rows bare and stripes odd rows, so the
+        // second body row's cell carries the alt background.
+        let alt = MdTheme::default().table_row_alt_bg;
+        assert!(alt.is_some());
+        let row2 = &text.lines[5];
+        assert!(
+            row2.spans.iter().all(|s| s.style.bg == alt),
+            "odd body row (border + cells) should carry the zebra bg: {row2:?}"
+        );
+        let row1 = &text.lines[3];
+        assert!(
+            row1.spans.iter().all(|s| s.style.bg.is_none()),
+            "even body row should inherit the surface: {row1:?}"
+        );
     }
 
     #[test]
