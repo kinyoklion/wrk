@@ -272,6 +272,10 @@ pub struct MarkdownConfig {
     pub marker: Option<String>,
     /// Dimmed accent (image placeholders, diagram hints).
     pub faint: Option<String>,
+    /// Background for even table body rows (unset = inherit the surface).
+    pub table_row_bg: Option<String>,
+    /// Background for odd table body rows — the alternating "zebra" stripe.
+    pub table_row_alt_bg: Option<String>,
 }
 
 impl MarkdownConfig {
@@ -297,6 +301,18 @@ impl MarkdownConfig {
             && let Some(c) = parse_color(s)
         {
             t.code_bg = Some(c);
+        }
+        // Table row backgrounds are Option<Color> too; only override on a valid
+        // color so the zebra-stripe default survives an unrelated `[markdown]`.
+        if let Some(s) = &self.table_row_bg
+            && let Some(c) = parse_color(s)
+        {
+            t.table_row_bg = Some(c);
+        }
+        if let Some(s) = &self.table_row_alt_bg
+            && let Some(c) = parse_color(s)
+        {
+            t.table_row_alt_bg = Some(c);
         }
         t
     }

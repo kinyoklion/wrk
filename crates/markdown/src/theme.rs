@@ -26,6 +26,10 @@ pub struct MdTheme {
     /// Dimmed accent for hints and placeholders (e.g. image links, the
     /// diagram-not-rendered note).
     pub faint: Color,
+    /// Background for even table body rows (`None` = inherit the surface).
+    pub table_row_bg: Option<Color>,
+    /// Background for odd table body rows — the alternating "zebra" stripe.
+    pub table_row_alt_bg: Option<Color>,
 }
 
 impl Default for MdTheme {
@@ -39,6 +43,8 @@ impl Default for MdTheme {
             rule: Color::DarkGray,
             marker: Color::Yellow,
             faint: Color::DarkGray,
+            table_row_bg: None,
+            table_row_alt_bg: Some(Color::Rgb(0x26, 0x26, 0x26)),
         }
     }
 }

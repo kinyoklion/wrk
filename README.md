@@ -259,6 +259,8 @@ quote    = "green"      # block-quote text + gutter
 rule     = "darkgray"   # thematic-break rules + table borders
 marker   = "yellow"     # list bullets/ordinals + task markers
 faint    = "darkgray"   # image placeholders, diagram hints
+table_row_bg     = "reset"     # even table body rows (unset = inherit surface)
+table_row_alt_bg = "#262626"   # odd table body rows — the alternating stripe
 
 # Optional shortcut overrides. Anything you don't set keeps the
 # default. Modifiers: Ctrl, Alt, Shift, Super (case-insensitive).
