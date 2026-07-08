@@ -75,6 +75,8 @@ When the file changes externally and we reload, sessions whose project was remov
 
 Optional `~/.config/wrk/settings.toml`. Key fields: `claude_command` (defaults to `["claude", "--continue"]`) and `shell_command` (falls back to `$SHELL`, then `/bin/bash`). Used to support quirky setups like `["steam-run", "claude", "--continue"]` on NixOS.
 
+Color config: `[theme]` (chrome) resolves via `ThemeConfig::resolve()` → `Theme`, and `[markdown]` (markdown viewer palette) resolves via `MarkdownConfig::resolve()` → `wrk_markdown::MdTheme`, both reusing `parse_color`. `App` caches the resolved `theme` and `md_theme` at startup; markdown tabs copy `md_theme` at open and pass it to the renderer via `RenderOptions::with_theme` in `MarkdownTab::ensure_rendered`.
+
 ### Status hooks (`src/status.rs`)
 
 The sidebar shows green ● (waiting), yellow · (busy), red ● (notification). Two signal sources:
