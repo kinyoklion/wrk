@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`wrk` is a Linux TUI for juggling concurrent Claude Code sessions, one per project. It pairs Ratatui chrome with `alacritty_terminal` for ANSI parsing and `portable-pty` for spawning child processes. Rust edition 2024, MSRV 1.85.
+`wrk` is a Linux TUI for juggling concurrent Claude Code sessions, one per project. It pairs Ratatui chrome with `alacritty_terminal` for ANSI parsing and `portable-pty` for spawning child processes. Rust edition 2024, MSRV 1.86.
 
 ### Workspace layout
 
@@ -13,10 +13,13 @@ root (so the synthase release tooling, configured against path `.`, and the
 root `CHANGELOG.md` keep working); the other members live under `crates/`:
 
 - root (`./`) — `wrk` binary, the TUI.
-- `crates/markdown` — `wrk-markdown` library: CommonMark/GFM → ratatui `Text`
-  plus a scrollable `MarkdownView` widget. `highlight` feature (default, syntect
-  via pure-Rust fancy-regex) and a pluggable `DiagramBackend` (default
-  `NullBackend` renders mermaid as a code block + hint).
+- `crates/markdown` — `wrk-markdown` library: CommonMark/GFM → a `RenderedDoc`
+  (a `Vec<MdBlock>` of `Text` runs + `ImageRef`s) plus a scrollable
+  `MarkdownView` widget. `highlight` feature (default, syntect via pure-Rust
+  fancy-regex); `images` feature (default, MSRV 1.86) renders image links —
+  incl. SVG via resvg + a bundled Liberation Sans — as terminal graphics through
+  ratatui-image; and a pluggable `DiagramBackend` (default `NullBackend` renders
+  mermaid as a code block + hint).
 - `crates/viewer` — `wrk-md` binary: a standalone markdown pager over
   `wrk-markdown`, usable in any shell (`--print` for a plain stdout dump).
 
@@ -76,6 +79,8 @@ When the file changes externally and we reload, sessions whose project was remov
 Optional `~/.config/wrk/settings.toml`. Key fields: `claude_command` (defaults to `["claude", "--continue"]`) and `shell_command` (falls back to `$SHELL`, then `/bin/bash`). Used to support quirky setups like `["steam-run", "claude", "--continue"]` on NixOS.
 
 Color config: `[theme]` (chrome) resolves via `ThemeConfig::resolve()` → `Theme`, and `[markdown]` (markdown viewer palette) resolves via `MarkdownConfig::resolve()` → `wrk_markdown::MdTheme`, both reusing `parse_color`. `App` caches the resolved `theme` and `md_theme` at startup; markdown tabs copy `md_theme` at open and pass it to the renderer via `RenderOptions::with_theme` in `MarkdownTab::ensure_rendered`.
+
+Markdown images: `render_blocks` produces a `RenderedDoc` (text + `ImageRef` blocks). `App.picker` is a `wrk_markdown::Picker` (re-exported ratatui-image), detected once via `Picker::from_query_stdio()` right after entering the alternate screen (it must run there). `MarkdownTab::ensure_rendered` re-renders on width change and returns whether it did; on a re-render the draw site (`ui::mod`) calls `state.prepare_images(&doc, picker)` to (re)rasterize image blocks into per-block protocols — once per render, not per frame. `RenderOptions::with_base_dir` (the doc's parent dir) resolves relative `![](x.png)` links. The `MarkdownView` widget keeps the flat single-`Paragraph` fast path when a doc has no images; otherwise it lays blocks out vertically and draws images with the terminal graphics protocol. SVG rasterization (`crates/markdown/src/image.rs`) uses resvg with a bundled Liberation Sans so `<text>` never depends on host fonts.
 
 ### Status hooks (`src/status.rs`)
 

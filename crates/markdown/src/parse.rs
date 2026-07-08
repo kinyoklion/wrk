@@ -5,15 +5,18 @@
 //! and tables / code blocks are buffered and emitted on their closing tag.
 //! Output lines are left *unwrapped* — the view widget wraps to the viewport.
 
+use std::path::PathBuf;
+
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 
 use crate::RenderOptions;
+use crate::block::{ImageRef, ImageSource, MdBlock, RenderedDoc};
 use crate::diagram::is_diagram_lang;
 use crate::theme::MdTheme;
 
-pub(crate) fn render(source: &str, width: usize, opts: &RenderOptions) -> Text<'static> {
+pub(crate) fn render_blocks(source: &str, width: usize, opts: &RenderOptions) -> RenderedDoc {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
@@ -26,6 +29,34 @@ pub(crate) fn render(source: &str, width: usize, opts: &RenderOptions) -> Text<'
         r.handle(event);
     }
     r.finish()
+}
+
+/// Extensions we can rasterize; anything else stays a placeholder link.
+const RENDERABLE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"];
+
+/// Resolve an image link to a local file [`ImageSource`], or `None` if it is a
+/// remote/data URL or lacks a renderable extension (those keep their inline
+/// placeholder text). Relative paths resolve against `base_dir`.
+fn resolve_image(dest: &str, base_dir: Option<&std::path::Path>) -> Option<ImageSource> {
+    // Skip URLs with a scheme (http:, https:, data:, …); `file:` is stripped.
+    let dest = dest.strip_prefix("file://").unwrap_or(dest);
+    if dest.contains("://") || dest.starts_with("data:") {
+        return None;
+    }
+    let path = PathBuf::from(dest);
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| RENDERABLE_EXTS.iter().any(|r| e.eq_ignore_ascii_case(r)));
+    if !ext_ok {
+        return None;
+    }
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        base_dir?.join(path)
+    };
+    Some(ImageSource::Path(resolved))
 }
 
 struct ListCtx {
@@ -49,6 +80,9 @@ struct Renderer<'o> {
     width: usize,
     opts: &'o RenderOptions,
 
+    /// Finished blocks. Text accumulates in `lines`/`cur` and is flushed into a
+    /// `MdBlock::Text` whenever an image splits the flow (and at the end).
+    blocks: Vec<MdBlock>,
     lines: Vec<Line<'static>>,
     cur: Vec<Span<'static>>,
 
@@ -83,6 +117,7 @@ impl<'o> Renderer<'o> {
             highlight: opts.highlight,
             width,
             opts,
+            blocks: Vec::new(),
             lines: Vec::new(),
             cur: Vec::new(),
             bold: 0,
@@ -103,9 +138,21 @@ impl<'o> Renderer<'o> {
         }
     }
 
-    fn finish(mut self) -> Text<'static> {
+    fn finish(mut self) -> RenderedDoc {
+        self.flush_text_block();
+        RenderedDoc {
+            blocks: self.blocks,
+        }
+    }
+
+    /// Push the accumulated text (if any) as a `MdBlock::Text`, ending the
+    /// current run so an image block can follow.
+    fn flush_text_block(&mut self) {
         self.flush_line();
-        Text::from(self.lines)
+        if !self.lines.is_empty() {
+            let lines = std::mem::take(&mut self.lines);
+            self.blocks.push(MdBlock::Text(Text::from(lines)));
+        }
     }
 
     fn handle(&mut self, event: Event<'_>) {
@@ -257,7 +304,23 @@ impl<'o> Renderer<'o> {
                 } else {
                     format!("🖼 {alt} ({dest})")
                 };
-                self.push_span(label, Style::default().fg(self.theme.faint));
+                let placeholder =
+                    Line::from(Span::styled(label, Style::default().fg(self.theme.faint)));
+                match resolve_image(&dest, self.opts.base_dir.as_deref()) {
+                    // A renderable local file: break the text flow and emit an
+                    // image block (the view rasterizes it, or shows the
+                    // placeholder if that fails / images are off).
+                    Some(source) => {
+                        self.flush_text_block();
+                        self.blocks.push(MdBlock::Image(ImageRef {
+                            alt,
+                            source,
+                            placeholder,
+                        }));
+                    }
+                    // Remote/data/unsupported: keep the inline placeholder text.
+                    None => self.cur.extend(placeholder.spans),
+                }
             }
             TagEnd::TableCell => {
                 if let Some(t) = self.table.as_mut() {
@@ -640,6 +703,11 @@ mod tests {
             .collect()
     }
 
+    /// Flatten to `Text` (images → placeholder) for the assertions below.
+    fn render(src: &str, width: usize, opts: &RenderOptions) -> Text<'static> {
+        render_blocks(src, width, opts).into_text()
+    }
+
     fn render_default(src: &str) -> Text<'static> {
         // Highlighting off keeps code-block assertions deterministic.
         render(src, 80, &RenderOptions::new(false))
@@ -769,6 +837,50 @@ mod tests {
             "expected wrapped rows, got {}",
             lines.len()
         );
+    }
+
+    #[test]
+    fn local_image_becomes_image_block_split_from_text() {
+        let opts = RenderOptions::new(false).with_base_dir("/docs");
+        let doc = render_blocks("before\n\n![a cat](cat.png)\n\nafter", 80, &opts);
+        // text (before) | image | text (after)
+        let images: Vec<_> = doc
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                MdBlock::Image(img) => Some(img),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images.len(), 1);
+        match &images[0].source {
+            ImageSource::Path(p) => assert_eq!(p, &PathBuf::from("/docs/cat.png")),
+            other => panic!("expected a path source, got {other:?}"),
+        }
+        assert_eq!(images[0].alt, "a cat");
+        // The surrounding prose is still present as text blocks.
+        let text: String = doc
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                MdBlock::Text(t) => Some(crate::to_plain_string(t)),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains("before") && text.contains("after"));
+    }
+
+    #[test]
+    fn remote_and_unsupported_images_stay_placeholder_text() {
+        let opts = RenderOptions::new(false).with_base_dir("/docs");
+        // Remote URL and a non-image extension both keep inline placeholder text.
+        let doc = render_blocks("![x](https://e.com/a.png) ![y](notes.txt)", 80, &opts);
+        assert!(
+            !doc.has_images(),
+            "remote/unsupported links must not become image blocks"
+        );
+        let text = crate::to_plain_string(&doc.into_text());
+        assert!(text.contains("🖼"));
     }
 
     #[test]
