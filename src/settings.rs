@@ -5,6 +5,7 @@ use anyhow::{Context, Result, anyhow};
 use directories::ProjectDirs;
 use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
+use wrk_markdown::MdTheme;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -28,6 +29,11 @@ pub struct Settings {
     #[serde(default)]
     pub theme: ThemeConfig,
 
+    /// Optional color overrides for the markdown viewer (headings, code, tables,
+    /// links, …). From the `[markdown]` section of `settings.toml`.
+    #[serde(default)]
+    pub markdown: MarkdownConfig,
+
     /// Optional shortcut overrides. Today only the `[keys.global]` namespace
     /// is consumed; the wrapper struct exists so we can grow into per-pane
     /// scopes (`[keys.projects]`, `[keys.modal]`, …) without renaming the
@@ -42,6 +48,7 @@ impl Default for Settings {
             claude_command: default_claude(),
             shell_command: None,
             theme: ThemeConfig::default(),
+            markdown: MarkdownConfig::default(),
             keys: KeyConfig::default(),
         }
     }
@@ -240,6 +247,62 @@ pub fn parse_color(s: &str) -> Option<Color> {
 }
 
 // -----------------------------------------------------------------------------
+// Markdown palette
+// -----------------------------------------------------------------------------
+
+/// On-disk color overrides for the markdown viewer (`[markdown]` in
+/// `settings.toml`). Each field is optional and falls back to the built-in
+/// [`MdTheme`] default; invalid color strings are ignored.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MarkdownConfig {
+    /// Heading text (all levels).
+    pub heading: Option<String>,
+    /// Inline code and code-block fallback text.
+    pub code: Option<String>,
+    /// Background behind code (unset = transparent).
+    pub code_bg: Option<String>,
+    /// Link text.
+    pub link: Option<String>,
+    /// Block-quote text and gutter.
+    pub quote: Option<String>,
+    /// Thematic-break rules and table borders.
+    pub rule: Option<String>,
+    /// List bullets / ordinals and task markers.
+    pub marker: Option<String>,
+    /// Dimmed accent (image placeholders, diagram hints).
+    pub faint: Option<String>,
+}
+
+impl MarkdownConfig {
+    /// Resolve overrides against the built-in [`MdTheme`] defaults.
+    pub fn resolve(&self) -> MdTheme {
+        let mut t = MdTheme::default();
+        let apply = |slot: &mut Color, value: &Option<String>| {
+            if let Some(s) = value
+                && let Some(c) = parse_color(s)
+            {
+                *slot = c;
+            }
+        };
+        apply(&mut t.heading, &self.heading);
+        apply(&mut t.code, &self.code);
+        apply(&mut t.link, &self.link);
+        apply(&mut t.quote, &self.quote);
+        apply(&mut t.rule, &self.rule);
+        apply(&mut t.marker, &self.marker);
+        apply(&mut t.faint, &self.faint);
+        // code_bg is Option<Color>: only set when the user provides a valid one.
+        if let Some(s) = &self.code_bg
+            && let Some(c) = parse_color(s)
+        {
+            t.code_bg = Some(c);
+        }
+        t
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Keys
 // -----------------------------------------------------------------------------
 
@@ -314,6 +377,32 @@ mod tests {
     #[test]
     fn parses_six_digit_hex() {
         assert_eq!(parse_color("#1d1f21"), Some(Color::Rgb(0x1d, 0x1f, 0x21)));
+    }
+
+    #[test]
+    fn markdown_config_overrides_and_keeps_defaults() {
+        let cfg = MarkdownConfig {
+            heading: Some("#ff8800".to_string()),
+            code_bg: Some("black".to_string()),
+            marker: Some("not-a-color".to_string()), // invalid → keeps default
+            ..Default::default()
+        };
+        let theme = cfg.resolve();
+        let default = MdTheme::default();
+        assert_eq!(theme.heading, Color::Rgb(0xff, 0x88, 0x00));
+        assert_eq!(theme.code_bg, Some(Color::Black));
+        // Invalid + unset fields keep the built-in defaults.
+        assert_eq!(theme.marker, default.marker);
+        assert_eq!(theme.link, default.link);
+    }
+
+    #[test]
+    fn markdown_config_default_matches_md_theme_default() {
+        let theme = MarkdownConfig::default().resolve();
+        let d = MdTheme::default();
+        assert_eq!(theme.heading, d.heading);
+        assert_eq!(theme.code_bg, d.code_bg);
+        assert_eq!(theme.rule, d.rule);
     }
 
     #[test]

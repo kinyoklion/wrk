@@ -257,6 +257,8 @@ pub struct MarkdownTab {
     pub rendered: ratatui::text::Text<'static>,
     /// Display width `rendered` was laid out at; `0` forces a (re-)render.
     pub render_width: u16,
+    /// Color theme applied when rendering (resolved from settings at open).
+    pub theme: wrk_markdown::MdTheme,
     /// Scroll/viewport state for the markdown view widget.
     pub state: wrk_markdown::MarkdownViewState,
 }
@@ -271,7 +273,7 @@ impl MarkdownTab {
         self.rendered = wrk_markdown::render_document(
             &self.source,
             width as usize,
-            &wrk_markdown::RenderOptions::default(),
+            &wrk_markdown::RenderOptions::default().with_theme(self.theme),
         );
         self.render_width = width;
     }
@@ -360,6 +362,9 @@ pub struct App {
     pub settings: Settings,
     /// Resolved chrome theme. Cached at startup from `settings.theme`.
     pub theme: Theme,
+    /// Resolved markdown palette. Cached at startup from `settings.markdown`;
+    /// applied to markdown tabs when they render.
+    pub md_theme: wrk_markdown::MdTheme,
     /// Resolved global key bindings. Cached at startup from `settings.keys.global`.
     pub keymap: KeyMap,
     pub sidebar: ui::projects::ProjectSidebar,
@@ -400,6 +405,7 @@ impl App {
         let mut sidebar = ui::projects::ProjectSidebar::default();
         sidebar.refresh(&store);
         let theme = settings.theme.resolve();
+        let md_theme = settings.markdown.resolve();
         let (keymap, keymap_warnings) = KeyMap::build(&settings.keys.global);
         // Surface any keymap warnings (invalid bindings, conflicts) via the
         // status-bar error slot; they remain visible until the user dismisses
@@ -412,6 +418,7 @@ impl App {
             store,
             settings,
             theme,
+            md_theme,
             keymap,
             sidebar,
             focus: Focus::Projects,
@@ -724,7 +731,7 @@ impl App {
     /// project's session (must be loaded). If that project is the active one,
     /// focus the new tab. Shared by the modal (`open_markdown_tab`) and IPC.
     fn add_markdown_tab(&mut self, project_name: &str, path: PathBuf) -> Result<()> {
-        let tab = build_markdown_tab(path)?;
+        let tab = build_markdown_tab(path, self.md_theme)?;
         let session = self
             .sessions
             .get_mut(project_name)
@@ -920,7 +927,7 @@ fn claude_command(settings: &Settings, session_id: Option<&str>) -> Vec<String> 
 /// Read a markdown file at an absolute `path` into a [`Tab`]. Rendering is
 /// deferred to the first draw, when the pane width is known (see
 /// [`MarkdownTab::ensure_rendered`]).
-fn build_markdown_tab(path: PathBuf) -> Result<Tab> {
+fn build_markdown_tab(path: PathBuf, theme: wrk_markdown::MdTheme) -> Result<Tab> {
     let source =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let name = path
@@ -934,6 +941,7 @@ fn build_markdown_tab(path: PathBuf) -> Result<Tab> {
         source,
         rendered: ratatui::text::Text::default(),
         render_width: 0,
+        theme,
         state: wrk_markdown::MarkdownViewState::new(),
     }))
 }
@@ -2547,6 +2555,7 @@ mod tests {
             source: "x".to_string(),
             rendered: ratatui::text::Text::default(),
             render_width: 0,
+            theme: wrk_markdown::MdTheme::default(),
             state: wrk_markdown::MarkdownViewState::new(),
         })
     }

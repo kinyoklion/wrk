@@ -57,6 +57,12 @@ impl RenderOptions {
             ..Self::default()
         }
     }
+
+    /// Set the color theme (builder style).
+    pub fn with_theme(mut self, theme: MdTheme) -> Self {
+        self.theme = theme;
+        self
+    }
 }
 
 /// Render markdown `source` into a ratatui [`Text`] of styled lines.

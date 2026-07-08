@@ -248,6 +248,18 @@ status_busy       = "#d7af00"   # sidebar/tab dot: claude is processing
 status_attention  = "#ff5f5f"   # sidebar/tab dot: claude needs attention
 focus_indicator   = "yellow"    # `[focus]` label in the status bar
 
+# Optional colors for the markdown viewer (Alt+m tabs and `wrk-md`).
+# Same color syntax as [theme]; anything unset keeps the built-in default.
+[markdown]
+heading  = "cyan"       # heading text (all levels)
+code     = "#d7d7af"    # inline code + code-block fallback text
+code_bg  = "#262626"    # background behind code (unset = transparent)
+link     = "blue"       # link text
+quote    = "green"      # block-quote text + gutter
+rule     = "darkgray"   # thematic-break rules + table borders
+marker   = "yellow"     # list bullets/ordinals + task markers
+faint    = "darkgray"   # image placeholders, diagram hints
+
 # Optional shortcut overrides. Anything you don't set keeps the
 # default. Modifiers: Ctrl, Alt, Shift, Super (case-insensitive).
 # Keys: a single char, F1–F24, or a named key (Space, Enter, Tab,
