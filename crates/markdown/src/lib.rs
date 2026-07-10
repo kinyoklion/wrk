@@ -25,7 +25,10 @@ mod highlight;
 mod image;
 
 pub use block::{ImageRef, ImageSource, MdBlock, RenderedDoc};
-pub use diagram::{DiagramBackend, NullBackend};
+pub use diagram::{DiagramBackend, DiagramOutput, NullBackend};
+
+#[cfg(feature = "mermaid")]
+pub use diagram::CarcimaidBackend;
 pub use theme::MdTheme;
 pub use view::{MarkdownView, MarkdownViewState};
 
@@ -55,12 +58,27 @@ pub struct RenderOptions {
     pub base_dir: Option<PathBuf>,
 }
 
+/// The diagram backend used unless a caller overrides it: [`CarcimaidBackend`]
+/// (mermaid → SVG) when the `mermaid` feature is on, else the source-dumping
+/// [`NullBackend`]. Consumers get real mermaid rendering just by enabling the
+/// feature — no code change at the call site.
+fn default_diagram_backend() -> Box<dyn DiagramBackend> {
+    #[cfg(feature = "mermaid")]
+    {
+        Box::new(diagram::CarcimaidBackend)
+    }
+    #[cfg(not(feature = "mermaid"))]
+    {
+        Box::new(NullBackend)
+    }
+}
+
 impl Default for RenderOptions {
     fn default() -> Self {
         Self {
             theme: MdTheme::default(),
             highlight: cfg!(feature = "highlight"),
-            diagram: Box::new(NullBackend),
+            diagram: default_diagram_backend(),
             base_dir: None,
         }
     }

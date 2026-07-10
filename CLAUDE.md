@@ -18,8 +18,10 @@ root `CHANGELOG.md` keep working); the other members live under `crates/`:
   `MarkdownView` widget. `highlight` feature (default, syntect via pure-Rust
   fancy-regex); `images` feature (default, MSRV 1.86) renders image links —
   incl. SVG via resvg + a bundled Liberation Sans — as terminal graphics through
-  ratatui-image; and a pluggable `DiagramBackend` (default `NullBackend` renders
-  mermaid as a code block + hint).
+  ratatui-image; and a pluggable `DiagramBackend`. The `mermaid` feature
+  (implies `images`) renders ```mermaid``` fences through `CarcimaidBackend`
+  (pure-Rust carcimaid → SVG → the image pipeline); without it the default
+  `NullBackend` shows the fence source with a hint.
 - `crates/viewer` — `wrk-md` binary: a standalone markdown pager over
   `wrk-markdown`, usable in any shell (`--print` for a plain stdout dump).
 
@@ -80,7 +82,7 @@ Optional `~/.config/wrk/settings.toml`. Key fields: `claude_command` (defaults t
 
 Color config: `[theme]` (chrome) resolves via `ThemeConfig::resolve()` → `Theme`, and `[markdown]` (markdown viewer palette) resolves via `MarkdownConfig::resolve()` → `wrk_markdown::MdTheme`, both reusing `parse_color`. `App` caches the resolved `theme` and `md_theme` at startup; markdown tabs copy `md_theme` at open and pass it to the renderer via `RenderOptions::with_theme` in `MarkdownTab::ensure_rendered`.
 
-Markdown images: `render_blocks` produces a `RenderedDoc` (text + `ImageRef` blocks). `App.picker` is a `wrk_markdown::Picker` (re-exported ratatui-image), detected once via `Picker::from_query_stdio()` right after entering the alternate screen (it must run there). `MarkdownTab::ensure_rendered` re-renders on width change and returns whether it did; on a re-render the draw site (`ui::mod`) calls `state.prepare_images(&doc, picker)` to (re)rasterize image blocks into per-block protocols — once per render, not per frame. `RenderOptions::with_base_dir` (the doc's parent dir) resolves relative `![](x.png)` links. The `MarkdownView` widget keeps the flat single-`Paragraph` fast path when a doc has no images; otherwise it lays blocks out vertically and draws images with the terminal graphics protocol. SVG rasterization (`crates/markdown/src/image.rs`) uses resvg with a bundled Liberation Sans so `<text>` never depends on host fonts.
+Markdown images: `render_blocks` produces a `RenderedDoc` (text + `ImageRef` blocks). `App.picker` is a `wrk_markdown::Picker` (re-exported ratatui-image), detected once via `Picker::from_query_stdio()` right after entering the alternate screen (it must run there). `MarkdownTab::ensure_rendered` re-renders on width change and returns whether it did; on a re-render the draw site (`ui::mod`) calls `state.prepare_images(&doc, picker)` to (re)rasterize image blocks into per-block protocols — once per render, not per frame. `RenderOptions::with_base_dir` (the doc's parent dir) resolves relative `![](x.png)` links. The `MarkdownView` widget keeps the flat single-`Paragraph` fast path when a doc has no images; otherwise it lays blocks out vertically and draws images with the terminal graphics protocol. SVG rasterization (`crates/markdown/src/image.rs`) uses resvg with a bundled Liberation Sans so `<text>` never depends on host fonts. Diagram fences route through the `DiagramBackend` seam (`crates/markdown/src/diagram.rs`): `render` returns a `DiagramOutput` of either `Lines` (spliced inline) or an `Image(ImageSource)`. With the `mermaid` feature, `CarcimaidBackend` calls `carcimaid::render_to_svg` and returns `Image(ImageSource::Svg(..))`, which becomes an `MdBlock::Image` sharing the SVG rasterizer; a carcimaid parse error falls back to a `Lines` source dump so a bad diagram never breaks the doc. carcimaid is a git dependency (pinned to a release tag, fetched over HTTPS).
 
 ### Status hooks (`src/status.rs`)
 

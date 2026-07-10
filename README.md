@@ -85,9 +85,11 @@ both `wrk` and `wrk-md`.
 block quotes, and syntax-highlighted code blocks — using the same engine that
 backs wrk's in-TUI markdown. Tables are laid out to the display width, wrapping
 long cells within their columns (the widest column shrinks first, so short
-columns keep their natural width). Mermaid (and other diagram) fences are shown
-as a code block with a "preview not enabled" note for now; live diagram
-rendering is planned.
+columns keep their natural width). ```mermaid``` fences render as real diagrams:
+[carcimaid] (pure-Rust) turns the mermaid source into SVG, which is drawn like
+any other image (see below). This is the `mermaid` feature (on by default,
+implies `images`); a diagram carcimaid can't parse falls back to its source with
+a note, and building `--no-default-features` shows all diagram fences that way.
 
 Image links (`![](photo.png)`, `![](diagram.svg)`) render as real images in
 terminals with a graphics protocol (kitty, sixel, iterm2), falling back to
@@ -100,6 +102,7 @@ build's MSRV back below 1.86). Remote (`http(s)://`) and `data:` links stay
 placeholders.
 
 [resvg]: https://github.com/linebender/resvg
+[carcimaid]: https://github.com/kinyoklion/carcimaid
 
 ```sh
 wrk-md README.md            # scrollable pager (j/k, PgUp/PgDn, g/G, r reload, q quit)

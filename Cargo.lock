@@ -276,6 +276,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f1fe948ff07f4bd06c30984e69f5b4899c516a3ef74f34df92a2df2ab535495"
 
 [[package]]
+name = "carcimaid"
+version = "0.1.1"
+source = "git+https://github.com/kinyoklion/carcimaid.git?tag=carcimaid-v0.1.1#bcf492350a865c83afaf06a675b8043bf87e236f"
+dependencies = [
+ "dagre",
+ "roughr",
+ "ttf-parser",
+]
+
+[[package]]
 name = "castaway"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -496,6 +506,17 @@ name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
+
+[[package]]
+name = "dagre"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9468ae6a4b98e7102e0e59ba8f9aacd2266cec71817c19b62b2d61ee260524c1"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "darling"
@@ -2105,6 +2126,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "roughr"
+version = "0.1.1"
+source = "git+https://github.com/kinyoklion/carcimaid.git?tag=carcimaid-v0.1.1#bcf492350a865c83afaf06a675b8043bf87e236f"
+
+[[package]]
 name = "roxmltree"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3514,6 +3540,7 @@ dependencies = [
 name = "wrk-markdown"
 version = "0.1.10"
 dependencies = [
+ "carcimaid",
  "image",
  "pulldown-cmark",
  "ratatui",

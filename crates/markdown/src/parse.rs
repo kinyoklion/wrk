@@ -13,7 +13,7 @@ use ratatui::text::{Line, Span, Text};
 
 use crate::RenderOptions;
 use crate::block::{ImageRef, ImageSource, MdBlock, RenderedDoc};
-use crate::diagram::is_diagram_lang;
+use crate::diagram::{DiagramOutput, is_diagram_lang};
 use crate::theme::MdTheme;
 
 pub(crate) fn render_blocks(source: &str, width: usize, opts: &RenderOptions) -> RenderedDoc {
@@ -433,8 +433,24 @@ impl<'o> Renderer<'o> {
         let source = source.strip_suffix('\n').unwrap_or(&source).to_string();
 
         if is_diagram_lang(&lang) {
-            let rendered = self.opts.diagram.render(&lang, &source, &self.theme);
-            self.lines.extend(rendered);
+            match self.opts.diagram.render(&lang, &source, &self.theme) {
+                DiagramOutput::Lines(rendered) => self.lines.extend(rendered),
+                // A backend that rasterizes the diagram (e.g. mermaid → SVG):
+                // break the text flow and emit an image block, exactly like a
+                // linked `.svg`. The placeholder shows if graphics are absent.
+                DiagramOutput::Image(source) => {
+                    let placeholder = Line::from(Span::styled(
+                        format!("[{lang} diagram]"),
+                        Style::default().fg(self.theme.faint),
+                    ));
+                    self.flush_text_block();
+                    self.blocks.push(MdBlock::Image(ImageRef {
+                        alt: lang,
+                        source,
+                        placeholder,
+                    }));
+                }
+            }
             return;
         }
 
@@ -768,12 +784,72 @@ mod tests {
         assert_eq!(lines, vec!["let x = 1;".to_string()]);
     }
 
+    #[cfg(not(feature = "mermaid"))]
     #[test]
     fn mermaid_routes_to_null_backend() {
         let text = render_default("```mermaid\ngraph TD\nA-->B\n```");
         let lines = plain(&text);
         assert_eq!(lines[0], "[mermaid diagram — preview not enabled]");
         assert!(lines.iter().any(|l| l == "graph TD"));
+    }
+
+    #[cfg(feature = "mermaid")]
+    #[test]
+    fn mermaid_becomes_svg_image_block() {
+        // With the carcimaid backend the fence renders to an SVG image block
+        // that splits the surrounding prose, rather than a source dump.
+        let doc = render_blocks(
+            "before\n\n```mermaid\ngraph TD\nA-->B\n```\n\nafter",
+            80,
+            &RenderOptions::new(false),
+        );
+        let images: Vec<_> = doc
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                MdBlock::Image(img) => Some(img),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images.len(), 1, "the mermaid fence should be one image");
+        match &images[0].source {
+            ImageSource::Svg(svg) => {
+                assert!(svg.contains("<svg"), "expected SVG markup, got {svg:.80}")
+            }
+            other => panic!("expected an inline SVG source, got {other:?}"),
+        }
+        // Surrounding prose survives as text blocks around the image.
+        let text: String = doc
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                MdBlock::Text(t) => Some(crate::to_plain_string(t)),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains("before") && text.contains("after"));
+    }
+
+    #[cfg(feature = "mermaid")]
+    #[test]
+    fn malformed_mermaid_falls_back_to_source_dump() {
+        // A fence carcimaid can't parse must degrade to readable source text,
+        // not vanish or become an image.
+        let doc = render_blocks(
+            "```mermaid\nnot a real diagram %%%\n```",
+            80,
+            &RenderOptions::new(false),
+        );
+        assert!(!doc.has_images(), "a parse failure must not yield an image");
+        let text = crate::to_plain_string(&doc.into_text());
+        assert!(
+            text.contains("render failed"),
+            "expected a fallback hint, got: {text}"
+        );
+        assert!(
+            text.contains("not a real diagram"),
+            "source should be shown"
+        );
     }
 
     #[test]

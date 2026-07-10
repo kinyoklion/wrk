@@ -18,6 +18,12 @@ highlight = ["dep:syntect"]
 # terminal-graphics stack, and raises the MSRV to 1.86); the `wrk` and `wrk-md`
 # binaries opt in.
 images = ["dep:ratatui-image", "dep:image", "dep:resvg"]
+# Render ```mermaid``` fences as real diagrams. carcimaid (pure-Rust) turns the
+# mermaid source into SVG, which flows through the same resvg rasterizer as any
+# other SVG image, so this implies `images`. When off, the default `NullBackend`
+# shows the fence source with a hint. On a parse error the backend falls back to
+# that same source dump, so a bad diagram never breaks the document.
+mermaid = ["images", "dep:carcimaid"]
 
 [dependencies]
 ratatui = { workspace = true }
@@ -31,3 +37,7 @@ syntect = { version = "5.3", default-features = false, features = ["default-fanc
 ratatui-image = { version = "11", default-features = false, features = ["crossterm"], optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"], optional = true }
 resvg = { version = "0.45", optional = true }
+# Pure-Rust mermaid → SVG renderer. Not on crates.io; pinned to a release tag
+# and fetched over HTTPS so no SSH auth is needed. Its in-repo `roughr` path dep
+# resolves inside the git clone.
+carcimaid = { git = "https://github.com/kinyoklion/carcimaid.git", tag = "carcimaid-v0.1.1", optional = true }
