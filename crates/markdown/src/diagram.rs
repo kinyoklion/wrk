@@ -71,16 +71,18 @@ fn source_dump(hint: &str, source: &str, theme: &MdTheme) -> Vec<Line<'static>> 
 
 /// Backend that renders mermaid fences as diagrams via [`carcimaid`], a
 /// pure-Rust mermaid → SVG renderer. The SVG rasterizes through the same resvg
-/// path as any `.svg` image. On a parse/render error it falls back to the
-/// [`NullBackend`]-style source dump with the error as the hint, so a malformed
-/// diagram degrades to readable source instead of vanishing.
+/// path as any `.svg` image. We request a transparent background so the diagram
+/// picks up the terminal's own background instead of carcimaid's default white
+/// box. On a parse/render error it falls back to the [`NullBackend`]-style
+/// source dump with the error as the hint, so a malformed diagram degrades to
+/// readable source instead of vanishing.
 #[cfg(feature = "mermaid")]
 pub struct CarcimaidBackend;
 
 #[cfg(feature = "mermaid")]
 impl DiagramBackend for CarcimaidBackend {
     fn render(&self, lang: &str, source: &str, theme: &MdTheme) -> DiagramOutput {
-        match carcimaid::render_to_svg(source) {
+        match carcimaid::render_to_svg_with(source, carcimaid::Background::Transparent) {
             Ok(svg) => DiagramOutput::Image(ImageSource::Svg(svg)),
             Err(e) => DiagramOutput::Lines(source_dump(
                 &format!("[{lang} diagram — render failed: {e}]"),

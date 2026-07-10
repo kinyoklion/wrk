@@ -814,7 +814,13 @@ mod tests {
         assert_eq!(images.len(), 1, "the mermaid fence should be one image");
         match &images[0].source {
             ImageSource::Svg(svg) => {
-                assert!(svg.contains("<svg"), "expected SVG markup, got {svg:.80}")
+                assert!(svg.contains("<svg"), "expected SVG markup, got {svg:.80}");
+                // We request a transparent background so the diagram picks up
+                // the terminal color — carcimaid's default white box must be gone.
+                assert!(
+                    !svg.contains("background-color: white"),
+                    "diagram SVG should have a transparent background, not white"
+                );
             }
             other => panic!("expected an inline SVG source, got {other:?}"),
         }
