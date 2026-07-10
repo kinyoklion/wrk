@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.12](https://github.com/kinyoklion/wrk/compare/wrk-v0.1.11...wrk-v0.1.12) (2026-07-10)
+
+### Features
+
+* **markdown:** render H1–H3 headings at true font size (#66) ([#66](https://github.com/kinyoklion/wrk/issues/66))
+
 ## [0.1.11](https://github.com/kinyoklion/wrk/compare/wrk-v0.1.10...wrk-v0.1.11) (2026-07-10)
 
 ### Features
