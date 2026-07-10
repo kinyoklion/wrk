@@ -59,6 +59,9 @@ fn main() -> Result<()> {
     }
 
     if cli.print {
+        // A plain-text dump would only flatten heading images back to text, so
+        // skip generating them.
+        opts.heading_images = false;
         // Explicit `--width`, else the terminal width, else a default for pipes.
         let width = cli.width.unwrap_or_else(|| {
             crossterm::terminal::size()
@@ -110,6 +113,9 @@ fn pager_loop(
     #[cfg(feature = "images")]
     if let Some(p) = &picker {
         opts.diagram_ctx.prefers_dark = wrk_markdown::terminal_prefers_dark(p).unwrap_or(false);
+        // Size heading images to the real terminal cell.
+        let f = p.font_size();
+        opts.cell_size = (f.width, f.height);
     }
     let mut doc = RenderedDoc::default();
     // Re-render only when the content width changes (`0` forces the first render

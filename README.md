@@ -109,6 +109,13 @@ the host. This is the `images` feature (on by default; drop it with
 build's MSRV back below 1.86). Remote (`http(s)://`) and `data:` links stay
 placeholders.
 
+On a graphics terminal, `H1`–`H3` headings render at a true, larger font size
+(the same SVG pipeline, in the bundled sans font and the heading color, with the
+`#` stripped); a heading wider than the pane scales down to fit. `H4`–`H6` stay
+as `#`-prefixed styled text. Turn it off with `heading_images = false` in the
+`[markdown]` settings; without a graphics protocol every heading falls back to
+text automatically.
+
 [resvg]: https://github.com/linebender/resvg
 [carcimaid]: https://github.com/kinyoklion/carcimaid
 
@@ -285,6 +292,7 @@ marker   = "yellow"     # list bullets/ordinals + task markers
 faint    = "darkgray"   # image placeholders, diagram hints
 table_row_bg     = "reset"     # even table body rows (unset = inherit surface)
 table_row_alt_bg = "#262626"   # odd table body rows — the alternating stripe
+heading_images = true          # render H1–H3 at true font size (false = # text)
 
 # Optional shortcut overrides. Anything you don't set keeps the
 # default. Modifiers: Ctrl, Alt, Shift, Super (case-insensitive).

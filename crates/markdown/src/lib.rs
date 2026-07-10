@@ -24,6 +24,9 @@ mod highlight;
 #[cfg(feature = "images")]
 mod image;
 
+#[cfg(feature = "images")]
+mod heading;
+
 pub use block::{ImageRef, ImageSource, MdBlock, RenderedDoc};
 pub use diagram::{DiagramBackend, DiagramCtx, DiagramOutput, NullBackend};
 
@@ -115,6 +118,16 @@ pub struct RenderOptions {
     /// Viewer conditions (dark terminal, opaque-background toggle) forwarded to
     /// the [`DiagramBackend`] for diagram fences. Defaults to all-`false`.
     pub diagram_ctx: DiagramCtx,
+    /// Render H1–H3 headings as true-size SVG images (the `images` feature)
+    /// instead of `#`-prefixed styled text. Defaults on when built with
+    /// `images`; ignored without it. The flattened text APIs
+    /// ([`render_document`], `--print`) are unaffected — heading images
+    /// collapse back to their styled text there.
+    pub heading_images: bool,
+    /// Terminal cell size in pixels `(width, height)`, used to size heading
+    /// images relative to body text. Set this from the graphics picker
+    /// (`Picker::font_size()`); the default is a typical cell.
+    pub cell_size: (u16, u16),
 }
 
 /// The diagram backend used unless a caller overrides it: [`CarcimaidBackend`]
@@ -140,6 +153,8 @@ impl Default for RenderOptions {
             diagram: default_diagram_backend(),
             base_dir: None,
             diagram_ctx: DiagramCtx::default(),
+            heading_images: cfg!(feature = "images"),
+            cell_size: (8, 16),
         }
     }
 }
@@ -171,6 +186,19 @@ impl RenderOptions {
     /// conditions forwarded to the diagram backend (builder style).
     pub fn with_diagram_ctx(mut self, ctx: DiagramCtx) -> Self {
         self.diagram_ctx = ctx;
+        self
+    }
+
+    /// Enable or disable true-size heading images (builder style).
+    pub fn with_heading_images(mut self, on: bool) -> Self {
+        self.heading_images = on;
+        self
+    }
+
+    /// Set the terminal cell size in pixels for sizing heading images (builder
+    /// style).
+    pub fn with_cell_size(mut self, cell: (u16, u16)) -> Self {
+        self.cell_size = cell;
         self
     }
 }

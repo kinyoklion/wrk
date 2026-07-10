@@ -96,6 +96,9 @@ struct Renderer<'o> {
     lists: Vec<ListCtx>,
     quote_depth: usize,
     heading: Option<usize>,
+    /// Plain heading text (no `#` prefix), accumulated while inside a heading so
+    /// it can be rendered as a true-size image.
+    heading_text: String,
 
     // Buffered constructs.
     in_code: bool,
@@ -127,6 +130,7 @@ impl<'o> Renderer<'o> {
             lists: Vec::new(),
             quote_depth: 0,
             heading: None,
+            heading_text: String::new(),
             in_code: false,
             code_lang: String::new(),
             code_buf: String::new(),
@@ -153,6 +157,33 @@ impl<'o> Renderer<'o> {
             let lines = std::mem::take(&mut self.lines);
             self.blocks.push(MdBlock::Text(Text::from(lines)));
         }
+    }
+
+    /// Build a true-size heading image block for the just-closed heading, or
+    /// `None` to keep it as styled text (H4–H6, images off, or the SVG couldn't
+    /// be built). Consumes the buffered heading spans as the fallback line.
+    #[cfg(feature = "images")]
+    fn heading_image_block(&mut self, level: usize) -> Option<MdBlock> {
+        if !self.opts.heading_images {
+            return None;
+        }
+        let (cw, ch) = self.opts.cell_size;
+        let svg =
+            crate::heading::heading_svg(&self.heading_text, level, self.theme.heading, cw, ch)?;
+        // The styled `# Text` line is the fallback shown when the image can't be
+        // drawn (no graphics protocol, or rasterization fails).
+        let placeholder = self.cur_to_line()?;
+        let alt = std::mem::take(&mut self.heading_text);
+        Some(MdBlock::Image(ImageRef {
+            alt,
+            source: ImageSource::Svg(svg),
+            placeholder,
+        }))
+    }
+
+    #[cfg(not(feature = "images"))]
+    fn heading_image_block(&mut self, _level: usize) -> Option<MdBlock> {
+        None
     }
 
     fn handle(&mut self, event: Event<'_>) {
@@ -192,6 +223,7 @@ impl<'o> Renderer<'o> {
             Tag::Heading { level, .. } => {
                 self.gap();
                 self.heading = Some(heading_num(level));
+                self.heading_text.clear();
                 let prefix = "#".repeat(heading_num(level));
                 self.push_span(
                     format!("{prefix} "),
@@ -270,8 +302,17 @@ impl<'o> Renderer<'o> {
                 self.need_gap = true;
             }
             TagEnd::Heading(_) => {
-                self.flush_line();
-                self.heading = None;
+                let level = self.heading.take().unwrap_or(1);
+                match self.heading_image_block(level) {
+                    // H1–H3 with images on: emit a true-size heading image,
+                    // splitting the text flow like any image block.
+                    Some(block) => {
+                        self.flush_text_block();
+                        self.blocks.push(block);
+                    }
+                    // H4–H6, images off, or no graphics font: styled text.
+                    None => self.flush_line(),
+                }
                 self.need_gap = true;
             }
             TagEnd::BlockQuote(_) => {
@@ -355,6 +396,9 @@ impl<'o> Renderer<'o> {
         } else if let Some(tb) = self.table.as_mut() {
             tb.cur_cell.push_str(t);
         } else {
+            if self.heading.is_some() {
+                self.heading_text.push_str(t);
+            }
             let style = self.inline_style();
             self.push_span(t.to_string(), style);
         }
@@ -401,11 +445,12 @@ impl<'o> Renderer<'o> {
         self.cur.push(Span::styled(content, style));
     }
 
-    /// Push the in-progress spans as a line, prefixing the block-quote gutter
-    /// when inside a quote. No-op when there's nothing buffered.
-    fn flush_line(&mut self) {
+    /// Take the in-progress spans as a line, prefixing the block-quote gutter
+    /// when inside a quote. `None` (leaving `cur` untouched) when nothing is
+    /// buffered.
+    fn cur_to_line(&mut self) -> Option<Line<'static>> {
         if self.cur.is_empty() {
-            return;
+            return None;
         }
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(self.cur.len() + 1);
         if self.quote_depth > 0 {
@@ -415,7 +460,14 @@ impl<'o> Renderer<'o> {
             ));
         }
         spans.append(&mut self.cur);
-        self.lines.push(Line::from(spans));
+        Some(Line::from(spans))
+    }
+
+    /// Push the in-progress spans as a line. No-op when there's nothing buffered.
+    fn flush_line(&mut self) {
+        if let Some(line) = self.cur_to_line() {
+            self.lines.push(line);
+        }
     }
 
     /// Emit a blank separator before a new top-level block, if one is owed and
@@ -745,6 +797,39 @@ mod tests {
             "expected highlighted spans, got {line:?}"
         );
         assert!(line.spans.iter().any(|s| s.style.fg.is_some()));
+    }
+
+    #[cfg(feature = "images")]
+    #[test]
+    fn h1_to_h3_become_image_blocks_h4_stays_text() {
+        // Images default-on: H1 is a true-size image; the body stays text.
+        let doc = render_blocks("# Big Title\n\nbody text", 80, &RenderOptions::new(false));
+        let imgs: Vec<_> = doc
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                MdBlock::Image(img) => Some(img),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(imgs.len(), 1, "H1 should be one image block");
+        assert_eq!(imgs[0].alt, "Big Title", "alt is the clean heading text");
+        assert!(matches!(imgs[0].source, ImageSource::Svg(_)));
+        // The fallback line keeps the `#` prefix so non-graphics viewers still
+        // read it as a heading.
+        assert!(crate::to_plain_string(&doc.into_text()).contains("# Big Title"));
+
+        // H4 is below the imaged range → plain styled text, no image.
+        let h4 = render_blocks("#### Small", 80, &RenderOptions::new(false));
+        assert!(!h4.has_images(), "H4 should stay text");
+    }
+
+    #[cfg(feature = "images")]
+    #[test]
+    fn heading_images_can_be_disabled() {
+        let opts = RenderOptions::new(false).with_heading_images(false);
+        let doc = render_blocks("# Title", 80, &opts);
+        assert!(!doc.has_images(), "disabled → heading stays text");
     }
 
     #[test]
