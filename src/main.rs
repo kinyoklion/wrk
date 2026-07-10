@@ -259,6 +259,9 @@ pub struct MarkdownTab {
     pub render_width: u16,
     /// Color theme applied when rendering (resolved from settings at open).
     pub theme: wrk_markdown::MdTheme,
+    /// Diagram rendering context: terminal dark/light (fixed at open) plus the
+    /// per-tab opaque-background toggle (`b`).
+    pub diagram_ctx: wrk_markdown::DiagramCtx,
     /// Scroll/viewport state for the markdown view widget.
     pub state: wrk_markdown::MarkdownViewState,
 }
@@ -271,7 +274,9 @@ impl MarkdownTab {
         if width == 0 || width == self.render_width {
             return false;
         }
-        let mut opts = wrk_markdown::RenderOptions::default().with_theme(self.theme);
+        let mut opts = wrk_markdown::RenderOptions::default()
+            .with_theme(self.theme)
+            .with_diagram_ctx(self.diagram_ctx);
         // Resolve relative image links against the document's own directory.
         if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
             opts = opts.with_base_dir(parent);
@@ -279,6 +284,14 @@ impl MarkdownTab {
         self.rendered = wrk_markdown::render_blocks(&self.source, width as usize, &opts);
         self.render_width = width;
         true
+    }
+
+    /// Toggle the diagram background between transparent (blends with the
+    /// terminal) and opaque (a high-contrast card, for diagrams that are hard to
+    /// read). Forces a re-render on the next draw so the change takes effect.
+    fn toggle_diagram_background(&mut self) {
+        self.diagram_ctx.opaque_background = !self.diagram_ctx.opaque_background;
+        self.render_width = 0;
     }
 
     /// Re-read the file from disk; the next draw re-renders at the current width.
@@ -405,6 +418,10 @@ pub struct App {
     /// at startup. `None` if detection failed — image blocks then render as
     /// their placeholder line.
     pub picker: Option<wrk_markdown::Picker>,
+    /// Whether the terminal reported a dark background (detected alongside
+    /// `picker`). New markdown tabs use it to auto-theme diagrams so they stay
+    /// legible against the terminal color.
+    pub prefers_dark: bool,
 }
 
 impl App {
@@ -444,6 +461,7 @@ impl App {
             select_anchor_pane: None,
             socket_path: None,
             picker: None,
+            prefers_dark: false,
         }
     }
 
@@ -739,7 +757,7 @@ impl App {
     /// project's session (must be loaded). If that project is the active one,
     /// focus the new tab. Shared by the modal (`open_markdown_tab`) and IPC.
     fn add_markdown_tab(&mut self, project_name: &str, path: PathBuf) -> Result<()> {
-        let tab = build_markdown_tab(path, self.md_theme)?;
+        let tab = build_markdown_tab(path, self.md_theme, self.prefers_dark)?;
         let session = self
             .sessions
             .get_mut(project_name)
@@ -935,7 +953,11 @@ fn claude_command(settings: &Settings, session_id: Option<&str>) -> Vec<String> 
 /// Read a markdown file at an absolute `path` into a [`Tab`]. Rendering is
 /// deferred to the first draw, when the pane width is known (see
 /// [`MarkdownTab::ensure_rendered`]).
-fn build_markdown_tab(path: PathBuf, theme: wrk_markdown::MdTheme) -> Result<Tab> {
+fn build_markdown_tab(
+    path: PathBuf,
+    theme: wrk_markdown::MdTheme,
+    prefers_dark: bool,
+) -> Result<Tab> {
     let source =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let name = path
@@ -950,6 +972,10 @@ fn build_markdown_tab(path: PathBuf, theme: wrk_markdown::MdTheme) -> Result<Tab
         rendered: wrk_markdown::RenderedDoc::default(),
         render_width: 0,
         theme,
+        diagram_ctx: wrk_markdown::DiagramCtx {
+            prefers_dark,
+            opaque_background: false,
+        },
         state: wrk_markdown::MarkdownViewState::new(),
     }))
 }
@@ -1050,7 +1076,15 @@ fn run_tui() -> Result<()> {
     // Detect the terminal's graphics protocol for markdown image tabs. Must run
     // after entering the alternate screen (per ratatui-image) and before the
     // event loop; failure leaves `picker` None so images show placeholders.
-    app.picker = wrk_markdown::Picker::from_query_stdio().ok();
+    app.picker = wrk_markdown::query_picker();
+    // The same query reports the terminal background; use it to auto-theme
+    // diagrams (dark terminal → dark diagram palette). Defaults to light when
+    // the terminal doesn't answer.
+    app.prefers_dark = app
+        .picker
+        .as_ref()
+        .and_then(wrk_markdown::terminal_prefers_dark)
+        .unwrap_or(false);
     // Ask the host terminal for disambiguated key reporting (Kitty Keyboard
     // Protocol). On supporting terminals this is what lets us tell Shift+Enter
     // apart from plain Enter; on terminals that don't support it the request
@@ -1439,6 +1473,7 @@ fn handle_markdown_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('g') | KeyCode::Home => md.state.scroll_to_top(),
         KeyCode::Char('G') | KeyCode::End => md.state.scroll_to_bottom(),
         KeyCode::Char('r') => md.reload(),
+        KeyCode::Char('b') => md.toggle_diagram_background(),
         _ => {}
     }
 }
@@ -2568,6 +2603,7 @@ mod tests {
             rendered: wrk_markdown::RenderedDoc::default(),
             render_width: 0,
             theme: wrk_markdown::MdTheme::default(),
+            diagram_ctx: wrk_markdown::DiagramCtx::default(),
             state: wrk_markdown::MarkdownViewState::new(),
         })
     }

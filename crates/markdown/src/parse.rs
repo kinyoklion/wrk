@@ -433,7 +433,11 @@ impl<'o> Renderer<'o> {
         let source = source.strip_suffix('\n').unwrap_or(&source).to_string();
 
         if is_diagram_lang(&lang) {
-            match self.opts.diagram.render(&lang, &source, &self.theme) {
+            match self
+                .opts
+                .diagram
+                .render(&lang, &source, &self.theme, self.opts.diagram_ctx)
+            {
                 DiagramOutput::Lines(rendered) => self.lines.extend(rendered),
                 // A backend that rasterizes the diagram (e.g. mermaid → SVG):
                 // break the text flow and emit an image block, exactly like a

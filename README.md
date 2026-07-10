@@ -91,6 +91,15 @@ any other image (see below). This is the `mermaid` feature (on by default,
 implies `images`); a diagram carcimaid can't parse falls back to its source with
 a note, and building `--no-default-features` shows all diagram fences that way.
 
+Diagrams are drawn on a transparent background and auto-themed to your terminal:
+on a dark terminal they use a dark palette (light lines and text) so they stay
+legible, on a light terminal the classic light palette. The terminal's
+background is detected once at startup (OSC 11); a diagram's own frontmatter
+`theme:` still wins. If a diagram is still hard to read (e.g. a `sequenceDiagram`,
+which carcimaid doesn't dark-theme yet), press `b` in the viewer to toggle an
+opaque white "card" behind it. (Flowcharts are dark-themed today; other diagram
+types follow as carcimaid gains them.)
+
 Image links (`![](photo.png)`, `![](diagram.svg)`) render as real images in
 terminals with a graphics protocol (kitty, sixel, iterm2), falling back to
 unicode half-blocks elsewhere; where no image can be drawn they show as a `🖼`
@@ -105,7 +114,7 @@ placeholders.
 [carcimaid]: https://github.com/kinyoklion/carcimaid
 
 ```sh
-wrk-md README.md            # scrollable pager (j/k, PgUp/PgDn, g/G, r reload, q quit)
+wrk-md README.md            # scrollable pager (j/k, PgUp/PgDn, g/G, r reload, b diagram bg, q quit)
 wrk-md --no-highlight FILE  # disable code syntax highlighting
 wrk-md --print FILE         # plain-text render to stdout (for piping)
 wrk-md --print --width 80 F # force a wrap width for --print (else terminal width)
@@ -191,11 +200,11 @@ by default; tmux needs `set -g allow-passthrough on`).
 | `Alt+>` | next tab |
 
 A markdown tab renders the file with the bundled `wrk-markdown` engine
-(headings, lists, tables, syntax-highlighted code, and inline images incl. SVG;
-mermaid shows as a code block with a "preview not enabled" note for now). When
-focused, scroll with `j`/`k`,
-`PgUp`/`PgDn`, `Space`, `g`/`G`, and reload from disk with `r`. Markdown tabs are
-ephemeral — they aren't recorded in `projects.toml` and are dropped on unload.
+(headings, lists, tables, syntax-highlighted code, inline images incl. SVG, and
+mermaid diagrams auto-themed to the terminal). When focused, scroll with `j`/`k`,
+`PgUp`/`PgDn`, `Space`, `g`/`G`, reload from disk with `r`, and toggle a diagram's
+opaque background with `b`. Markdown tabs are ephemeral — they aren't recorded in
+`projects.toml` and are dropped on unload.
 
 Anywhere else the pane has focus, all keys (including `Tab`) pass through to
 the embedded PTY child.
