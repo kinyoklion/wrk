@@ -81,6 +81,11 @@ both `wrk` and `wrk-md`.
 
 ## Standalone markdown viewer (`wrk-md`)
 
+For a single document that exercises every feature below — headings, tables,
+lists, code blocks, mermaid diagrams, and an inline image — see
+[`demo/showcase.md`](demo/showcase.md): `wrk-md demo/showcase.md` (or
+`wrk view demo/showcase.md` inside wrk).
+
 `wrk-md` renders a markdown file in the terminal — headings, emphasis, lists,
 block quotes, and syntax-highlighted code blocks — using the same engine that
 backs wrk's in-TUI markdown. Tables are laid out to the display width, wrapping
