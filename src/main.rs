@@ -262,6 +262,10 @@ pub struct MarkdownTab {
     /// Diagram rendering context: terminal dark/light (fixed at open) plus the
     /// per-tab opaque-background toggle (`b`).
     pub diagram_ctx: wrk_markdown::DiagramCtx,
+    /// Whether H1–H3 render as true-size images (from settings, fixed at open).
+    pub heading_images: bool,
+    /// Terminal cell size in pixels, for sizing heading images (fixed at open).
+    pub cell_size: (u16, u16),
     /// Scroll/viewport state for the markdown view widget.
     pub state: wrk_markdown::MarkdownViewState,
 }
@@ -276,7 +280,9 @@ impl MarkdownTab {
         }
         let mut opts = wrk_markdown::RenderOptions::default()
             .with_theme(self.theme)
-            .with_diagram_ctx(self.diagram_ctx);
+            .with_diagram_ctx(self.diagram_ctx)
+            .with_heading_images(self.heading_images)
+            .with_cell_size(self.cell_size);
         // Resolve relative image links against the document's own directory.
         if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
             opts = opts.with_base_dir(parent);
@@ -422,6 +428,10 @@ pub struct App {
     /// `picker`). New markdown tabs use it to auto-theme diagrams so they stay
     /// legible against the terminal color.
     pub prefers_dark: bool,
+    /// Whether markdown H1–H3 headings render as true-size images (from
+    /// `[markdown] heading_images`, default true). Copied onto each markdown tab
+    /// at open.
+    pub heading_images: bool,
 }
 
 impl App {
@@ -430,6 +440,7 @@ impl App {
         sidebar.refresh(&store);
         let theme = settings.theme.resolve();
         let md_theme = settings.markdown.resolve();
+        let heading_images = settings.markdown.heading_images.unwrap_or(true);
         let (keymap, keymap_warnings) = KeyMap::build(&settings.keys.global);
         // Surface any keymap warnings (invalid bindings, conflicts) via the
         // status-bar error slot; they remain visible until the user dismisses
@@ -462,6 +473,7 @@ impl App {
             socket_path: None,
             picker: None,
             prefers_dark: false,
+            heading_images,
         }
     }
 
@@ -753,11 +765,30 @@ impl App {
         self.add_markdown_tab(&project_name, path)
     }
 
+    /// Terminal cell size in pixels `(width, height)` from the graphics picker,
+    /// used to size heading images. Falls back to a typical cell when no picker
+    /// was detected (headings then render as their text fallback anyway).
+    fn cell_size(&self) -> (u16, u16) {
+        self.picker
+            .as_ref()
+            .map(|p| {
+                let f = p.font_size();
+                (f.width, f.height)
+            })
+            .unwrap_or((8, 16))
+    }
+
     /// Add a markdown tab for an already-resolved absolute `path` to the given
     /// project's session (must be loaded). If that project is the active one,
     /// focus the new tab. Shared by the modal (`open_markdown_tab`) and IPC.
     fn add_markdown_tab(&mut self, project_name: &str, path: PathBuf) -> Result<()> {
-        let tab = build_markdown_tab(path, self.md_theme, self.prefers_dark)?;
+        let tab = build_markdown_tab(
+            path,
+            self.md_theme,
+            self.prefers_dark,
+            self.heading_images,
+            self.cell_size(),
+        )?;
         let session = self
             .sessions
             .get_mut(project_name)
@@ -957,6 +988,8 @@ fn build_markdown_tab(
     path: PathBuf,
     theme: wrk_markdown::MdTheme,
     prefers_dark: bool,
+    heading_images: bool,
+    cell_size: (u16, u16),
 ) -> Result<Tab> {
     let source =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -976,6 +1009,8 @@ fn build_markdown_tab(
             prefers_dark,
             opaque_background: false,
         },
+        heading_images,
+        cell_size,
         state: wrk_markdown::MarkdownViewState::new(),
     }))
 }
@@ -2604,6 +2639,8 @@ mod tests {
             render_width: 0,
             theme: wrk_markdown::MdTheme::default(),
             diagram_ctx: wrk_markdown::DiagramCtx::default(),
+            heading_images: false,
+            cell_size: (8, 16),
             state: wrk_markdown::MarkdownViewState::new(),
         })
     }

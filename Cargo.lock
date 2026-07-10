@@ -3547,6 +3547,7 @@ dependencies = [
  "ratatui-image",
  "resvg",
  "syntect",
+ "ttf-parser",
 ]
 
 [[package]]

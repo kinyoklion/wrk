@@ -19,12 +19,13 @@ use crate::block::ImageSource;
 // into a shared fontdb; resvg substitutes these for the common sans families
 // (arial/helvetica/…) that SVGs reference.
 const FONT_REGULAR: &[u8] = include_bytes!("../assets/fonts/LiberationSans-Regular.ttf");
-const FONT_BOLD: &[u8] = include_bytes!("../assets/fonts/LiberationSans-Bold.ttf");
+/// Bold face, also used by the heading renderer to measure text.
+pub(crate) const FONT_BOLD: &[u8] = include_bytes!("../assets/fonts/LiberationSans-Bold.ttf");
 const FONT_ITALIC: &[u8] = include_bytes!("../assets/fonts/LiberationSans-Italic.ttf");
 const FONT_BOLD_ITALIC: &[u8] = include_bytes!("../assets/fonts/LiberationSans-BoldItalic.ttf");
 
 /// The bundled font family name (matches the faces' internal family).
-const SANS_FAMILY: &str = "Liberation Sans";
+pub(crate) const SANS_FAMILY: &str = "Liberation Sans";
 
 /// Shared font database, built once from the bundled faces. Parsing ~1.6 MB of
 /// fonts per SVG would be wasteful, so we build it lazily and clone the `Arc`

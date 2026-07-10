@@ -276,6 +276,9 @@ pub struct MarkdownConfig {
     pub table_row_bg: Option<String>,
     /// Background for odd table body rows — the alternating "zebra" stripe.
     pub table_row_alt_bg: Option<String>,
+    /// Render H1–H3 headings as true-size images (default `true`). Set `false`
+    /// to keep plain `#`-prefixed styled text.
+    pub heading_images: Option<bool>,
 }
 
 impl MarkdownConfig {
