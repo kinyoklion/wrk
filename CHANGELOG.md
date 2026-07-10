@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.11](https://github.com/kinyoklion/wrk/compare/wrk-v0.1.10...wrk-v0.1.11) (2026-07-10)
+
+### Features
+
+* **markdown:** transparent, auto-themed mermaid diagrams + background toggle (#65) ([#65](https://github.com/kinyoklion/wrk/issues/65))
+* **markdown:** render mermaid diagrams via carcimaid (#64) ([#64](https://github.com/kinyoklion/wrk/issues/64))
+* **markdown:** inline images incl. SVG in the viewer (#41) (#63) ([#41](https://github.com/kinyoklion/wrk/issues/41)) ([#63](https://github.com/kinyoklion/wrk/issues/63)) ([#41](https://github.com/kinyoklion/wrk/issues/41))
+* **markdown:** alternating table row stripes + delineation (#56) (#60) ([#56](https://github.com/kinyoklion/wrk/issues/56)) ([#60](https://github.com/kinyoklion/wrk/issues/60))
+* **markdown:** expose the markdown palette in settings (#57) (#59) ([#57](https://github.com/kinyoklion/wrk/issues/57)) ([#59](https://github.com/kinyoklion/wrk/issues/59)) ([#57](https://github.com/kinyoklion/wrk/issues/57))
+* **markdown:** text selection + OSC 52 copy in the viewer (#49) (#58) ([#49](https://github.com/kinyoklion/wrk/issues/49)) ([#58](https://github.com/kinyoklion/wrk/issues/58)) ([#49](https://github.com/kinyoklion/wrk/issues/49))
+* **markdown:** wrap table cells to the display width (#50) (#53) ([#50](https://github.com/kinyoklion/wrk/issues/50)) ([#53](https://github.com/kinyoklion/wrk/issues/53)) ([#50](https://github.com/kinyoklion/wrk/issues/50)) ([#50](https://github.com/kinyoklion/wrk/issues/50))
+
 ## [0.1.10](https://github.com/kinyoklion/wrk/compare/wrk-v0.1.9...wrk-v0.1.10) (2026-07-07)
 
 ### Bug Fixes
