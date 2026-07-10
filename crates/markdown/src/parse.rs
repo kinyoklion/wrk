@@ -433,7 +433,11 @@ impl<'o> Renderer<'o> {
         let source = source.strip_suffix('\n').unwrap_or(&source).to_string();
 
         if is_diagram_lang(&lang) {
-            match self.opts.diagram.render(&lang, &source, &self.theme) {
+            match self
+                .opts
+                .diagram
+                .render(&lang, &source, &self.theme, self.opts.diagram_ctx)
+            {
                 DiagramOutput::Lines(rendered) => self.lines.extend(rendered),
                 // A backend that rasterizes the diagram (e.g. mermaid → SVG):
                 // break the text flow and emit an image block, exactly like a
@@ -814,7 +818,13 @@ mod tests {
         assert_eq!(images.len(), 1, "the mermaid fence should be one image");
         match &images[0].source {
             ImageSource::Svg(svg) => {
-                assert!(svg.contains("<svg"), "expected SVG markup, got {svg:.80}")
+                assert!(svg.contains("<svg"), "expected SVG markup, got {svg:.80}");
+                // We request a transparent background so the diagram picks up
+                // the terminal color — carcimaid's default white box must be gone.
+                assert!(
+                    !svg.contains("background-color: white"),
+                    "diagram SVG should have a transparent background, not white"
+                );
             }
             other => panic!("expected an inline SVG source, got {other:?}"),
         }

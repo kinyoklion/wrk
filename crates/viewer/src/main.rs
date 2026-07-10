@@ -85,7 +85,7 @@ fn run_pager(path: &std::path::Path, opts: RenderOptions) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("creating terminal")?;
 
-    let res = pager_loop(&mut terminal, &title, path, &opts, source);
+    let res = pager_loop(&mut terminal, &title, path, opts, source);
 
     disable_raw_mode().ok();
     execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen).ok();
@@ -97,15 +97,20 @@ fn pager_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     title: &str,
     path: &std::path::Path,
-    opts: &RenderOptions,
+    mut opts: RenderOptions,
     mut source: String,
 ) -> Result<()> {
     let mut state = MarkdownViewState::new();
     // Detect the terminal's graphics protocol once, after the alternate screen
-    // is up (per ratatui-image, `from_query_stdio` must run here). `None` → no
-    // image protocol; image blocks then fall back to their placeholder line.
+    // is up (per ratatui-image, the query must run here). `None` → no image
+    // protocol; image blocks then fall back to their placeholder line. The same
+    // query reports the terminal background, which auto-themes diagrams.
     #[cfg(feature = "images")]
-    let picker = wrk_markdown::Picker::from_query_stdio().ok();
+    let picker = wrk_markdown::query_picker();
+    #[cfg(feature = "images")]
+    if let Some(p) = &picker {
+        opts.diagram_ctx.prefers_dark = wrk_markdown::terminal_prefers_dark(p).unwrap_or(false);
+    }
     let mut doc = RenderedDoc::default();
     // Re-render only when the content width changes (`0` forces the first render
     // and a re-render after reload).
@@ -114,7 +119,7 @@ fn pager_loop(
         // Content sits inside the 1-cell block border on each side.
         let inner_width = terminal.size()?.width.saturating_sub(2);
         if inner_width != rendered_width && inner_width > 0 {
-            doc = wrk_markdown::render_blocks(&source, inner_width as usize, opts);
+            doc = wrk_markdown::render_blocks(&source, inner_width as usize, &opts);
             // Rasterize images for the new width (once per re-render, not frame).
             #[cfg(feature = "images")]
             if let Some(picker) = &picker {
@@ -155,6 +160,13 @@ fn pager_loop(
                             source = fresh;
                             rendered_width = 0; // force re-render
                         }
+                    }
+                    // Toggle diagram background: transparent (blends with the
+                    // terminal) ↔ opaque high-contrast card for hard-to-read
+                    // diagrams. Force a re-render so it takes effect.
+                    KeyCode::Char('b') => {
+                        opts.diagram_ctx.opaque_background = !opts.diagram_ctx.opaque_background;
+                        rendered_width = 0;
                     }
                     _ => {}
                 }
