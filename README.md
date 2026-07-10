@@ -95,10 +95,9 @@ Diagrams are drawn on a transparent background and auto-themed to your terminal:
 on a dark terminal they use a dark palette (light lines and text) so they stay
 legible, on a light terminal the classic light palette. The terminal's
 background is detected once at startup (OSC 11); a diagram's own frontmatter
-`theme:` still wins. If a diagram is still hard to read (e.g. a `sequenceDiagram`,
-which carcimaid doesn't dark-theme yet), press `b` in the viewer to toggle an
-opaque white "card" behind it. (Flowcharts are dark-themed today; other diagram
-types follow as carcimaid gains them.)
+`theme:` still wins. If a diagram is still hard to read — auto-detection guessed
+wrong, or its colors don't suit your terminal — press `b` in the viewer to
+toggle an opaque white "card" behind it.
 
 Image links (`![](photo.png)`, `![](diagram.svg)`) render as real images in
 terminals with a graphics protocol (kitty, sixel, iterm2), falling back to
