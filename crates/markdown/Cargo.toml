@@ -11,8 +11,23 @@ default = ["highlight"]
 # Syntax-highlight fenced code blocks via syntect (pure-Rust fancy-regex engine,
 # no C/oniguruma). When off, code blocks render as plain dimmed text.
 highlight = ["dep:syntect"]
+# Render image links (`![](x.png|jpg|svg)`) as real terminal graphics
+# (kitty/sixel/iterm2, half-block fallback) via ratatui-image. SVG is
+# rasterized with resvg using a bundled Liberation Sans, so `<text>` renders
+# without relying on system fonts. Off by default (pulls resvg/tiny-skia and a
+# terminal-graphics stack, and raises the MSRV to 1.86); the `wrk` and `wrk-md`
+# binaries opt in.
+images = ["dep:ratatui-image", "dep:image", "dep:resvg"]
 
 [dependencies]
 ratatui = { workspace = true }
 pulldown-cmark = { version = "0.13", default-features = false }
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"], optional = true }
+# Terminal image protocols. default-features off to avoid `chafa-dyn` (which
+# dynamically links the C lib libchafa) — we keep the stack pure-Rust, matching
+# syntect's fancy-regex choice. `crossterm` selects the backend wrk/wrk-md use;
+# raster decoding comes from our own `image` dep below. resvg re-exports usvg +
+# tiny-skia + fontdb, so a single dep covers SVG parse → rasterize → font DB.
+ratatui-image = { version = "11", default-features = false, features = ["crossterm"], optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"], optional = true }
+resvg = { version = "0.45", optional = true }

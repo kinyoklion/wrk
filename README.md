@@ -70,7 +70,7 @@ cargo build --release
 ./target/release/wrk
 ```
 
-The Nix flake provides the toolchain. Without Nix, any Rust ≥ 1.85 (edition
+The Nix flake provides the toolchain. Without Nix, any Rust ≥ 1.86 (edition
 2024) works.
 
 `wrk` is a Cargo workspace. `cargo build --release` produces two binaries:
@@ -88,6 +88,18 @@ long cells within their columns (the widest column shrinks first, so short
 columns keep their natural width). Mermaid (and other diagram) fences are shown
 as a code block with a "preview not enabled" note for now; live diagram
 rendering is planned.
+
+Image links (`![](photo.png)`, `![](diagram.svg)`) render as real images in
+terminals with a graphics protocol (kitty, sixel, iterm2), falling back to
+unicode half-blocks elsewhere; where no image can be drawn they show as a `🖼`
+placeholder. SVG is rasterized with [resvg] against a bundled Liberation Sans,
+so `<text>` in diagrams renders the same regardless of the fonts installed on
+the host. This is the `images` feature (on by default; drop it with
+`--no-default-features` to shed the graphics/SVG stack, which also lowers the
+build's MSRV back below 1.86). Remote (`http(s)://`) and `data:` links stay
+placeholders.
+
+[resvg]: https://github.com/linebender/resvg
 
 ```sh
 wrk-md README.md            # scrollable pager (j/k, PgUp/PgDn, g/G, r reload, q quit)
@@ -176,8 +188,9 @@ by default; tmux needs `set -g allow-passthrough on`).
 | `Alt+>` | next tab |
 
 A markdown tab renders the file with the bundled `wrk-markdown` engine
-(headings, lists, tables, syntax-highlighted code; mermaid shows as a code block
-with a "preview not enabled" note for now). When focused, scroll with `j`/`k`,
+(headings, lists, tables, syntax-highlighted code, and inline images incl. SVG;
+mermaid shows as a code block with a "preview not enabled" note for now). When
+focused, scroll with `j`/`k`,
 `PgUp`/`PgDn`, `Space`, `g`/`G`, and reload from disk with `r`. Markdown tabs are
 ephemeral — they aren't recorded in `projects.toml` and are dropped on unload.
 
@@ -302,3 +315,8 @@ wrk-installed entries.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+`wrk-markdown` bundles the Liberation Sans fonts (used to rasterize SVG text
+with the `images` feature), which are licensed under the SIL Open Font License
+1.1 — see [crates/markdown/assets/fonts/LICENSE](crates/markdown/assets/fonts/LICENSE).
+The OFL covers only those font files; it does not affect wrk's MIT license.

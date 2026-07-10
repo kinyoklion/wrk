@@ -253,8 +253,8 @@ pub struct MarkdownTab {
     /// Raw markdown source. Re-rendered whenever the pane width changes so that
     /// tables lay out to the available width.
     pub source: String,
-    /// Rendered lines, valid for `render_width`.
-    pub rendered: ratatui::text::Text<'static>,
+    /// Rendered block sequence (text + image refs), valid for `render_width`.
+    pub rendered: wrk_markdown::RenderedDoc,
     /// Display width `rendered` was laid out at; `0` forces a (re-)render.
     pub render_width: u16,
     /// Color theme applied when rendering (resolved from settings at open).
@@ -264,18 +264,21 @@ pub struct MarkdownTab {
 }
 
 impl MarkdownTab {
-    /// Re-render the document if the display width changed. Cheap no-op when the
-    /// width is unchanged (the common per-frame case).
-    fn ensure_rendered(&mut self, width: u16) {
+    /// Re-render the document if the display width changed, returning `true`
+    /// when it re-rendered (so the caller can rebuild image protocols). Cheap
+    /// no-op when the width is unchanged (the common per-frame case).
+    fn ensure_rendered(&mut self, width: u16) -> bool {
         if width == 0 || width == self.render_width {
-            return;
+            return false;
         }
-        self.rendered = wrk_markdown::render_document(
-            &self.source,
-            width as usize,
-            &wrk_markdown::RenderOptions::default().with_theme(self.theme),
-        );
+        let mut opts = wrk_markdown::RenderOptions::default().with_theme(self.theme);
+        // Resolve relative image links against the document's own directory.
+        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            opts = opts.with_base_dir(parent);
+        }
+        self.rendered = wrk_markdown::render_blocks(&self.source, width as usize, &opts);
         self.render_width = width;
+        true
     }
 
     /// Re-read the file from disk; the next draw re-renders at the current width.
@@ -398,6 +401,10 @@ pub struct App {
     /// Path to this instance's IPC socket, exported to spawned PTYs as
     /// `WRK_SOCK`. `None` when the socket couldn't be created.
     pub socket_path: Option<PathBuf>,
+    /// Terminal graphics-protocol picker for markdown image tabs, detected once
+    /// at startup. `None` if detection failed — image blocks then render as
+    /// their placeholder line.
+    pub picker: Option<wrk_markdown::Picker>,
 }
 
 impl App {
@@ -436,6 +443,7 @@ impl App {
             select_mode: false,
             select_anchor_pane: None,
             socket_path: None,
+            picker: None,
         }
     }
 
@@ -939,7 +947,7 @@ fn build_markdown_tab(path: PathBuf, theme: wrk_markdown::MdTheme) -> Result<Tab
         name,
         path,
         source,
-        rendered: ratatui::text::Text::default(),
+        rendered: wrk_markdown::RenderedDoc::default(),
         render_width: 0,
         theme,
         state: wrk_markdown::MarkdownViewState::new(),
@@ -1039,6 +1047,10 @@ fn run_tui() -> Result<()> {
         EnableBracketedPaste,
     )
     .context("entering alternate screen")?;
+    // Detect the terminal's graphics protocol for markdown image tabs. Must run
+    // after entering the alternate screen (per ratatui-image) and before the
+    // event loop; failure leaves `picker` None so images show placeholders.
+    app.picker = wrk_markdown::Picker::from_query_stdio().ok();
     // Ask the host terminal for disambiguated key reporting (Kitty Keyboard
     // Protocol). On supporting terminals this is what lets us tell Shift+Enter
     // apart from plain Enter; on terminals that don't support it the request
@@ -2553,7 +2565,7 @@ mod tests {
             name: name.to_string(),
             path: PathBuf::from(name),
             source: "x".to_string(),
-            rendered: ratatui::text::Text::default(),
+            rendered: wrk_markdown::RenderedDoc::default(),
             render_width: 0,
             theme: wrk_markdown::MdTheme::default(),
             state: wrk_markdown::MarkdownViewState::new(),

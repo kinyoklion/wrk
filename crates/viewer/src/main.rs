@@ -22,7 +22,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders};
-use wrk_markdown::{MarkdownView, MarkdownViewState, RenderOptions};
+use wrk_markdown::{MarkdownView, MarkdownViewState, RenderOptions, RenderedDoc};
 
 const SCROLL_LINES: i32 = 3;
 
@@ -52,7 +52,11 @@ fn main() -> Result<()> {
     let source = std::fs::read_to_string(&cli.file)
         .with_context(|| format!("reading {}", cli.file.display()))?;
 
-    let opts = RenderOptions::new(!cli.no_highlight);
+    let mut opts = RenderOptions::new(!cli.no_highlight);
+    // Resolve relative image links against the file's own directory.
+    if let Some(parent) = cli.file.parent().filter(|p| !p.as_os_str().is_empty()) {
+        opts = opts.with_base_dir(parent);
+    }
 
     if cli.print {
         // Explicit `--width`, else the terminal width, else a default for pipes.
@@ -97,7 +101,12 @@ fn pager_loop(
     mut source: String,
 ) -> Result<()> {
     let mut state = MarkdownViewState::new();
-    let mut text = ratatui::text::Text::default();
+    // Detect the terminal's graphics protocol once, after the alternate screen
+    // is up (per ratatui-image, `from_query_stdio` must run here). `None` → no
+    // image protocol; image blocks then fall back to their placeholder line.
+    #[cfg(feature = "images")]
+    let picker = wrk_markdown::Picker::from_query_stdio().ok();
+    let mut doc = RenderedDoc::default();
     // Re-render only when the content width changes (`0` forces the first render
     // and a re-render after reload).
     let mut rendered_width: u16 = 0;
@@ -105,7 +114,12 @@ fn pager_loop(
         // Content sits inside the 1-cell block border on each side.
         let inner_width = terminal.size()?.width.saturating_sub(2);
         if inner_width != rendered_width && inner_width > 0 {
-            text = wrk_markdown::render_document(&source, inner_width as usize, opts);
+            doc = wrk_markdown::render_blocks(&source, inner_width as usize, opts);
+            // Rasterize images for the new width (once per re-render, not frame).
+            #[cfg(feature = "images")]
+            if let Some(picker) = &picker {
+                state.prepare_images(&doc, picker);
+            }
             rendered_width = inner_width;
         }
 
@@ -115,7 +129,7 @@ fn pager_loop(
                 .title(title)
                 .borders(Borders::ALL)
                 .border_style(Style::default().add_modifier(Modifier::DIM));
-            let view = MarkdownView::new(&text).block(block);
+            let view = MarkdownView::new(&doc).block(block);
             frame.render_stateful_widget(view, area, &mut state);
         })?;
 

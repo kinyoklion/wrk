@@ -11,8 +11,12 @@ name = "wrk-md"
 path = "src/main.rs"
 
 [features]
-default = ["highlight"]
+default = ["highlight", "images"]
 highlight = ["wrk-markdown/highlight"]
+# Render image links as terminal graphics (kitty/sixel/iterm2, half-block
+# fallback) incl. SVG. On by default — images are core to a viewer — but can be
+# dropped with `--no-default-features` to shed the resvg/graphics stack.
+images = ["wrk-markdown/images"]
 
 [dependencies]
 wrk-markdown = { workspace = true }

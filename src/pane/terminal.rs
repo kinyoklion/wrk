@@ -14,7 +14,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, TermMode, viewport_to_point};
 use anyhow::{Context, Result};
 use portable_pty::PtySize;
-use ratatui::buffer::Buffer;
+use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Widget;
@@ -491,10 +491,10 @@ impl<'a> Widget for PtyPaneWidget<'a> {
                 .flags
                 .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
             {
-                cell_buf.set_skip(true);
+                cell_buf.set_diff_option(CellDiffOption::Skip);
                 continue;
             }
-            cell_buf.set_skip(false);
+            cell_buf.set_diff_option(CellDiffOption::None);
 
             // Build the symbol: base char plus any zero-width combining marks
             // that alacritty stored on the cell. Replace control chars (which

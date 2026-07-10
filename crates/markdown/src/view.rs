@@ -1,10 +1,24 @@
-//! A scrollable, word-wrapping view widget over rendered markdown [`Text`].
+//! A scrollable, word-wrapping view widget over a rendered [`RenderedDoc`].
+//!
+//! Text-only documents take a fast path: one wrapped [`Paragraph`] with a scroll
+//! offset, exactly as a flat `Text` would render. When a document contains image
+//! blocks (and the `images` feature is on), the view switches to a block layout
+//! that stacks text and image blocks vertically and scrolls across them, drawing
+//! images with a terminal graphics protocol.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Text;
 use ratatui::widgets::{Block, Paragraph, StatefulWidget, Widget, Wrap};
+
+use crate::block::RenderedDoc;
+
+#[cfg(feature = "images")]
+use crate::block::MdBlock;
+#[cfg(feature = "images")]
+use ratatui::layout::Size;
+#[cfg(feature = "images")]
+use ratatui_image::{Resize, StatefulImage, picker::Picker, protocol::StatefulProtocol};
 
 /// A text selection in *viewport* coordinates: `(row, col)` cell positions
 /// within the last-rendered visible area. Anchor is where the drag began.
@@ -40,11 +54,20 @@ impl Selection {
     }
 }
 
+/// Per-block image protocols, index-aligned with a document's blocks (`None`
+/// for text blocks and images that failed to load). Rebuilt by
+/// [`MarkdownViewState::prepare_images`] when the document is (re-)rendered.
+#[cfg(feature = "images")]
+#[derive(Default)]
+struct ImageStore {
+    protocols: Vec<Option<StatefulProtocol>>,
+}
+
 /// Scroll position and transient selection for a [`MarkdownView`]. The widget
 /// refreshes the viewport/content geometry and a snapshot of the visible glyphs
 /// on each render, so the navigation and selection methods work off the last
 /// laid-out frame.
-#[derive(Debug, Default, Clone)]
+#[derive(Default)]
 pub struct MarkdownViewState {
     scroll: u16,
     viewport_h: u16,
@@ -55,6 +78,9 @@ pub struct MarkdownViewState {
     glyphs: Vec<String>,
     /// Width of the captured grid in cells.
     grid_w: u16,
+    /// Rasterized image protocols for the current document (images feature).
+    #[cfg(feature = "images")]
+    images: ImageStore,
 }
 
 impl MarkdownViewState {
@@ -105,6 +131,25 @@ impl MarkdownViewState {
         self.content_h = content_h;
         self.viewport_h = viewport_h;
         self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    /// (Re-)rasterize the document's image blocks into terminal protocols using
+    /// `picker`. Call once whenever the document is (re-)rendered — on open,
+    /// resize, or reload — not every frame; the protocols persist between draws.
+    /// Text blocks and images that fail to load get `None` (the view then shows
+    /// the placeholder line).
+    #[cfg(feature = "images")]
+    pub fn prepare_images(&mut self, doc: &RenderedDoc, picker: &Picker) {
+        self.images.protocols = doc
+            .blocks
+            .iter()
+            .map(|block| match block {
+                MdBlock::Image(img) => crate::image::load(&img.source)
+                    .ok()
+                    .map(|dyn_img| picker.new_resize_protocol(dyn_img)),
+                MdBlock::Text(_) => None,
+            })
+            .collect();
     }
 
     /// Begin a selection at viewport cell `(col, row)`.
@@ -182,20 +227,45 @@ impl MarkdownViewState {
     }
 }
 
-/// Widget that draws rendered markdown with vertical scrolling and word wrap.
+/// Word-wrap `text` and count how many display rows it occupies at `width`.
+#[cfg(feature = "images")]
+fn text_rows(text: &ratatui::text::Text<'static>, width: u16) -> u16 {
+    Paragraph::new(text.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(width) as u16
+}
+
+/// Widget that draws a rendered markdown document with vertical scrolling, word
+/// wrap, and (behind the `images` feature) inline images.
 pub struct MarkdownView<'a> {
-    text: &'a Text<'a>,
+    doc: &'a RenderedDoc,
     block: Option<Block<'a>>,
 }
 
 impl<'a> MarkdownView<'a> {
-    pub fn new(text: &'a Text<'a>) -> Self {
-        Self { text, block: None }
+    pub fn new(doc: &'a RenderedDoc) -> Self {
+        Self { doc, block: None }
     }
 
     pub fn block(mut self, block: Block<'a>) -> Self {
         self.block = Some(block);
         self
+    }
+
+    /// Fast path: flatten the whole document to one `Text` and render it as a
+    /// single scrolled paragraph. Used when there are no image blocks (or the
+    /// `images` feature is off), preserving the original text-only behavior.
+    fn render_flat(
+        doc: &RenderedDoc,
+        inner: Rect,
+        buf: &mut Buffer,
+        state: &mut MarkdownViewState,
+    ) {
+        let text = doc.clone().into_text();
+        let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+        let content_h = paragraph.line_count(inner.width) as u16;
+        state.sync(content_h, inner.height);
+        paragraph.scroll((state.scroll, 0)).render(inner, buf);
     }
 }
 
@@ -203,6 +273,7 @@ impl StatefulWidget for MarkdownView<'_> {
     type State = MarkdownViewState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
+        let doc = self.doc;
         let inner = match &self.block {
             Some(b) => b.inner(area),
             None => area,
@@ -214,50 +285,148 @@ impl StatefulWidget for MarkdownView<'_> {
             return;
         }
 
-        let paragraph = Paragraph::new(self.text.clone()).wrap(Wrap { trim: false });
-        let content_h = paragraph.line_count(inner.width) as u16;
+        #[cfg(feature = "images")]
+        if doc.has_images() {
+            Self::render_blocks(doc, inner, buf, state);
+            state.capture_and_highlight(inner, buf);
+            return;
+        }
+
+        Self::render_flat(doc, inner, buf, state);
+        state.capture_and_highlight(inner, buf);
+    }
+}
+
+#[cfg(feature = "images")]
+impl MarkdownView<'_> {
+    /// Height in rows an image block occupies at `width`, fit within `max_h` so
+    /// a single image never exceeds the viewport. Falls back to one row (the
+    /// placeholder line) when the image failed to load.
+    fn image_rows(state: &mut MarkdownViewState, idx: usize, width: u16, max_h: u16) -> u16 {
+        match state.images.protocols.get_mut(idx).and_then(|p| p.as_mut()) {
+            Some(proto) => {
+                let size = proto.size_for(Resize::Fit(None), Size::new(width, max_h));
+                size.height.clamp(1, max_h)
+            }
+            None => 1,
+        }
+    }
+
+    /// Block-layout path: stack blocks vertically, scroll across them, and draw
+    /// each block clipped to the visible window.
+    fn render_blocks(
+        doc: &RenderedDoc,
+        inner: Rect,
+        buf: &mut Buffer,
+        state: &mut MarkdownViewState,
+    ) {
+        // Measure every block first so scrolling can clamp to the full height.
+        let heights: Vec<u16> = doc
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, block)| match block {
+                MdBlock::Text(t) => text_rows(t, inner.width),
+                MdBlock::Image(_) => Self::image_rows(state, i, inner.width, inner.height),
+            })
+            .collect();
+        let content_h: u16 = heights.iter().copied().fold(0, u16::saturating_add);
         state.sync(content_h, inner.height);
 
-        paragraph.scroll((state.scroll, 0)).render(inner, buf);
-        state.capture_and_highlight(inner, buf);
+        let scroll = state.scroll;
+        let win_bot = scroll.saturating_add(inner.height);
+        let mut y_doc: u16 = 0;
+        for (i, block) in doc.blocks.iter().enumerate() {
+            let h = heights[i];
+            let top = y_doc;
+            let bot = y_doc.saturating_add(h);
+            y_doc = bot;
+            // Skip blocks entirely above or below the visible window.
+            if bot <= scroll || top >= win_bot {
+                continue;
+            }
+            let clip_top = scroll.saturating_sub(top); // rows hidden above the fold
+            let y_in_view = top.saturating_sub(scroll); // first visible row in viewport
+            let avail = inner.height.saturating_sub(y_in_view);
+            let vis_h = h.saturating_sub(clip_top).min(avail);
+            if vis_h == 0 {
+                continue;
+            }
+            let rect = Rect {
+                x: inner.x,
+                y: inner.y + y_in_view,
+                width: inner.width,
+                height: vis_h,
+            };
+            match block {
+                MdBlock::Text(t) => {
+                    Paragraph::new(t.clone())
+                        .wrap(Wrap { trim: false })
+                        .scroll((clip_top, 0))
+                        .render(rect, buf);
+                }
+                MdBlock::Image(img) => {
+                    match state.images.protocols.get_mut(i).and_then(|p| p.as_mut()) {
+                        // Fit the image into the visible rect. When the block is
+                        // partially scrolled the image scales to the slice — a
+                        // minor transient during scroll; at rest it renders at
+                        // its natural aspect.
+                        Some(proto) => {
+                            StatefulImage::default()
+                                .resize(Resize::Fit(None))
+                                .render(rect, buf, proto);
+                        }
+                        None => {
+                            Paragraph::new(img.placeholder.clone())
+                                .scroll((clip_top, 0))
+                                .render(rect, buf);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::text::Line;
+    use ratatui::text::{Line, Text};
 
-    fn long_text(n: usize) -> Text<'static> {
-        Text::from(
+    fn doc(text: Text<'static>) -> RenderedDoc {
+        RenderedDoc::from_text(text)
+    }
+
+    fn long_doc(n: usize) -> RenderedDoc {
+        doc(Text::from(
             (0..n)
                 .map(|i| Line::from(format!("line {i}")))
                 .collect::<Vec<_>>(),
-        )
+        ))
     }
 
-    fn render_into(text: &Text<'_>, w: u16, h: u16, state: &mut MarkdownViewState) {
+    fn render_into(doc: &RenderedDoc, w: u16, h: u16, state: &mut MarkdownViewState) {
         let area = Rect::new(0, 0, w, h);
         let mut buf = Buffer::empty(area);
-        MarkdownView::new(text).render(area, &mut buf, state);
+        MarkdownView::new(doc).render(area, &mut buf, state);
     }
 
     #[test]
     fn clamps_scroll_to_content() {
-        let text = long_text(50);
+        let d = long_doc(50);
         let mut state = MarkdownViewState::new();
-        render_into(&text, 20, 10, &mut state);
+        render_into(&d, 20, 10, &mut state);
         assert_eq!(state.max_scroll(), 40); // 50 lines - 10 visible
         state.scroll_by(1000);
-        render_into(&text, 20, 10, &mut state);
+        render_into(&d, 20, 10, &mut state);
         assert_eq!(state.scroll(), 40);
     }
 
     #[test]
     fn short_doc_does_not_scroll() {
-        let text = long_text(3);
+        let d = long_doc(3);
         let mut state = MarkdownViewState::new();
-        render_into(&text, 20, 10, &mut state);
+        render_into(&d, 20, 10, &mut state);
         assert_eq!(state.max_scroll(), 0);
         state.scroll_by(5);
         assert_eq!(state.scroll(), 0);
@@ -265,9 +434,9 @@ mod tests {
 
     #[test]
     fn page_and_bottom_navigation() {
-        let text = long_text(100);
+        let d = long_doc(100);
         let mut state = MarkdownViewState::new();
-        render_into(&text, 20, 10, &mut state);
+        render_into(&d, 20, 10, &mut state);
         state.page_down();
         assert_eq!(state.scroll(), 9);
         state.scroll_to_bottom();
@@ -280,9 +449,12 @@ mod tests {
 
     #[test]
     fn selection_extracts_single_and_multi_row_text() {
-        let text = Text::from(vec![Line::from("hello world"), Line::from("second line")]);
+        let d = doc(Text::from(vec![
+            Line::from("hello world"),
+            Line::from("second line"),
+        ]));
         let mut state = MarkdownViewState::new();
-        render_into(&text, 20, 5, &mut state);
+        render_into(&d, 20, 5, &mut state);
 
         // Single row: cols 0..=4 → "hello".
         state.selection_anchor(0, 0);
@@ -298,18 +470,62 @@ mod tests {
         assert_eq!(state.selection_text(), None);
     }
 
+    /// End-to-end image path: an SVG image block, rasterized through the real
+    /// `Picker`/`StatefulProtocol` and drawn with the halfblock protocol (which
+    /// needs no terminal), must paint colored cells into the buffer — proving
+    /// parse → rasterize → protocol → block-layout render all connect.
+    #[cfg(feature = "images")]
+    #[test]
+    fn svg_image_block_paints_colored_cells() {
+        use crate::block::{ImageRef, ImageSource, MdBlock};
+        use ratatui::style::Color;
+
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20">
+            <rect width="40" height="20" fill="#ff0000"/></svg>"##;
+        let d = RenderedDoc {
+            blocks: vec![
+                MdBlock::Text(Text::from("caption")),
+                MdBlock::Image(ImageRef {
+                    alt: "red".into(),
+                    source: ImageSource::Svg(svg.into()),
+                    placeholder: Line::from("[img]"),
+                }),
+            ],
+        };
+        assert!(d.has_images());
+
+        let picker = crate::Picker::halfblocks();
+        let mut state = MarkdownViewState::new();
+        state.prepare_images(&d, &picker);
+
+        let area = Rect::new(0, 0, 20, 12);
+        let mut buf = Buffer::empty(area);
+        MarkdownView::new(&d).render(area, &mut buf, &mut state);
+
+        // The caption is default-styled, so any RGB color must come from the
+        // rasterized image (halfblocks paint the fill as cell fg/bg).
+        let colored = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let c = &buf[(x, y)];
+                matches!(c.fg, Color::Rgb(..)) || matches!(c.bg, Color::Rgb(..))
+            })
+            .count();
+        assert!(colored > 0, "expected the SVG image to paint colored cells");
+    }
+
     #[test]
     fn selection_reverse_video_highlights_only_selected_cells() {
-        let text = Text::from("abcdef");
+        let d = doc(Text::from("abcdef"));
         let mut state = MarkdownViewState::new();
         let area = Rect::new(0, 0, 10, 3);
         let mut buf = Buffer::empty(area);
-        MarkdownView::new(&text).render(area, &mut buf, &mut state);
+        MarkdownView::new(&d).render(area, &mut buf, &mut state);
 
         state.selection_anchor(0, 0);
         state.selection_update(2, 0); // cols 0..=2
         // Re-render to apply the highlight over the captured frame.
-        MarkdownView::new(&text).render(area, &mut buf, &mut state);
+        MarkdownView::new(&d).render(area, &mut buf, &mut state);
 
         assert!(buf[(0, 0)].modifier.contains(Modifier::REVERSED));
         assert!(buf[(2, 0)].modifier.contains(Modifier::REVERSED));

@@ -12,6 +12,7 @@
 //! renders them as a code block plus a hint, leaving a seam for real diagram
 //! rendering later.
 
+mod block;
 mod diagram;
 mod parse;
 mod theme;
@@ -20,9 +21,21 @@ mod view;
 #[cfg(feature = "highlight")]
 mod highlight;
 
+#[cfg(feature = "images")]
+mod image;
+
+pub use block::{ImageRef, ImageSource, MdBlock, RenderedDoc};
 pub use diagram::{DiagramBackend, NullBackend};
 pub use theme::MdTheme;
 pub use view::{MarkdownView, MarkdownViewState};
+
+/// Terminal graphics-protocol picker, re-exported so consumers can build one
+/// (`Picker::from_query_stdio()`) without depending on `ratatui-image`
+/// directly. Pass it to [`MarkdownViewState::prepare_images`].
+#[cfg(feature = "images")]
+pub use ratatui_image::picker::Picker;
+
+use std::path::PathBuf;
 
 use ratatui::text::Text;
 
@@ -36,6 +49,10 @@ pub struct RenderOptions {
     /// Backend used to render diagram fences (mermaid, …). Defaults to
     /// [`NullBackend`].
     pub diagram: Box<dyn DiagramBackend>,
+    /// Directory relative image links resolve against (the document's own
+    /// directory). `None` leaves relative paths unresolved, so only absolute
+    /// links produce image blocks.
+    pub base_dir: Option<PathBuf>,
 }
 
 impl Default for RenderOptions {
@@ -44,6 +61,7 @@ impl Default for RenderOptions {
             theme: MdTheme::default(),
             highlight: cfg!(feature = "highlight"),
             diagram: Box::new(NullBackend),
+            base_dir: None,
         }
     }
 }
@@ -63,6 +81,13 @@ impl RenderOptions {
         self.theme = theme;
         self
     }
+
+    /// Set the base directory for resolving relative image links (builder
+    /// style).
+    pub fn with_base_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.base_dir = Some(dir.into());
+        self
+    }
 }
 
 /// Render markdown `source` into a ratatui [`Text`] of styled lines.
@@ -73,7 +98,15 @@ impl RenderOptions {
 /// at display time, so pass the same width you render the view at. For a quick
 /// plain-text dump, use [`to_plain_string`].
 pub fn render_document(source: &str, width: usize, opts: &RenderOptions) -> Text<'static> {
-    parse::render(source, width, opts)
+    parse::render_blocks(source, width, opts).into_text()
+}
+
+/// Render markdown `source` into a [`RenderedDoc`] — the block sequence (text +
+/// image references) backing the image-capable [`MarkdownView`]. Prefer this
+/// over [`render_document`] when images should render as graphics rather than
+/// placeholder text. `width` drives table layout as in [`render_document`].
+pub fn render_blocks(source: &str, width: usize, opts: &RenderOptions) -> RenderedDoc {
+    parse::render_blocks(source, width, opts)
 }
 
 /// Flatten a rendered [`Text`] into a plain (unstyled) string, one logical line
