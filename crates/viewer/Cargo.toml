@@ -11,12 +11,15 @@ name = "wrk-md"
 path = "src/main.rs"
 
 [features]
-default = ["highlight", "images"]
+default = ["highlight", "images", "mermaid"]
 highlight = ["wrk-markdown/highlight"]
 # Render image links as terminal graphics (kitty/sixel/iterm2, half-block
 # fallback) incl. SVG. On by default — images are core to a viewer — but can be
 # dropped with `--no-default-features` to shed the resvg/graphics stack.
 images = ["wrk-markdown/images"]
+# Render ```mermaid``` fences as diagrams (pure-Rust, via carcimaid). Implies
+# `images`. Off with `--no-default-features` to drop the carcimaid dependency.
+mermaid = ["wrk-markdown/mermaid"]
 
 [dependencies]
 wrk-markdown = { workspace = true }
