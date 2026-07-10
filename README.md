@@ -84,7 +84,31 @@ both `wrk` and `wrk-md`.
 For a single document that exercises every feature below — headings, tables,
 lists, code blocks, mermaid diagrams, and an inline image — see
 [`demo/showcase.md`](demo/showcase.md): `wrk-md demo/showcase.md` (or
-`wrk view demo/showcase.md` inside wrk).
+`wrk view demo/showcase.md` inside wrk). Rendered in a graphics-capable terminal
+(kitty here):
+
+<table>
+  <tr>
+    <td align="center">
+      <img src="docs/images/showcase-diagrams.png" width="420" alt="Mermaid flowchart and sequence diagrams, auto-themed to the terminal"><br>
+      <sub>Mermaid diagrams, auto-themed to the terminal</sub>
+    </td>
+    <td align="center">
+      <img src="docs/images/showcase-code.png" width="420" alt="Syntax-highlighted Rust and Python code blocks under a true-size heading"><br>
+      <sub>Syntax-highlighted code + a true-size heading</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="docs/images/showcase-table.png" width="420" alt="Column-aligned, zebra-striped table"><br>
+      <sub>Column-aligned, zebra-striped table</sub>
+    </td>
+    <td align="center">
+      <img src="docs/images/showcase-image.png" width="420" alt="Inline raster image of Ferris, the Rust crab"><br>
+      <sub>Inline raster images (Ferris, CC0)</sub>
+    </td>
+  </tr>
+</table>
 
 `wrk-md` renders a markdown file in the terminal — headings, emphasis, lists,
 block quotes, and syntax-highlighted code blocks — using the same engine that
