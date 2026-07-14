@@ -290,6 +290,10 @@ claude_command = ["steam-run", "claude"]
 # Optional. Defaults to $SHELL, then /bin/bash.
 # shell_command = ["zsh"]
 
+# Ask for confirmation before quitting the app. Defaults to true; set
+# false to quit immediately.
+# confirm_quit = true
+
 # Optional theme overrides. Each value accepts a hex color (#rrggbb or
 # #rgb) or one of the standard ratatui color names (case-insensitive:
 # black, red, green, yellow, blue, magenta, cyan, white, gray, darkgray,

@@ -230,6 +230,37 @@ impl ConfirmUnloadModal {
     }
 }
 
+/// Confirmation shown before the app quits (when `confirm_quit` is enabled).
+#[derive(Debug, Clone)]
+pub struct ConfirmQuitModal;
+
+impl ConfirmQuitModal {
+    pub fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
+        let popup = centered_rect(50, 20, area);
+        Clear.render(popup, buf);
+        let block = Block::default()
+            .title(" quit wrk ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.error));
+        let inner = block.inner(popup);
+        block.render(popup, buf);
+
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+
+        Paragraph::new("quit wrk?").render(layout[0], buf);
+        Paragraph::new("y: quit   n / Esc: cancel")
+            .style(Style::default().fg(theme.hint))
+            .render(layout[2], buf);
+    }
+}
+
 /// Modal for picking which Claude session to attach to a new tab.
 ///
 /// Index 0 is always the synthetic "New session" entry. Indices ≥ 1 are

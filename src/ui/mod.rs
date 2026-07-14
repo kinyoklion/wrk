@@ -152,6 +152,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ModalState::ConfirmUnload(m) => {
                 m.render(area, frame.buffer_mut(), &theme);
             }
+            ModalState::ConfirmQuit(m) => {
+                m.render(area, frame.buffer_mut(), &theme);
+            }
             ModalState::ClaudeTabPicker(m) => {
                 let cursor = m.render(area, frame.buffer_mut(), &theme);
                 if m.name_focused {
@@ -535,6 +538,7 @@ pub enum ModalState {
     OpenMarkdown(modal::OpenMarkdownModal),
     ConfirmDelete(modal::ConfirmDeleteModal),
     ConfirmUnload(modal::ConfirmUnloadModal),
+    ConfirmQuit(modal::ConfirmQuitModal),
     ClaudeTabPicker(modal::ClaudeTabPickerModal),
     UrlPicker(modal::UrlPickerModal),
 }

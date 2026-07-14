@@ -37,8 +37,8 @@ use crate::settings::{Settings, Theme};
 use crate::store::{LayoutMode, Project, ProjectStore, SessionRef};
 use crate::ui::ModalState;
 use crate::ui::modal::{
-    AddProjectModal, ClaudeTabPickerModal, ConfirmDeleteModal, ConfirmUnloadModal,
-    OpenMarkdownModal, UrlPickerModal,
+    AddProjectModal, ClaudeTabPickerModal, ConfirmDeleteModal, ConfirmQuitModal,
+    ConfirmUnloadModal, OpenMarkdownModal, UrlPickerModal,
 };
 
 #[derive(Parser)]
@@ -868,6 +868,19 @@ impl App {
     /// Killing the child processes and joining the reader threads happens via
     /// `PtyPane`'s `Drop` when the `ProjectSession` is removed from the map.
     /// Returns `false` if the project had no live session (nothing to unload).
+    /// Request application exit. Opens a confirmation modal when `confirm_quit`
+    /// is enabled (the default); otherwise quits immediately. A modal already
+    /// being open (e.g. the confirm dialog itself) is left untouched.
+    fn request_quit(&mut self) {
+        if self.settings.confirm_quit {
+            if self.modal.is_none() {
+                self.modal = Some(ModalState::ConfirmQuit(ConfirmQuitModal));
+            }
+        } else {
+            self.should_quit = true;
+        }
+    }
+
     fn unload_project(&mut self, name: &str) -> bool {
         let Some(session) = self.sessions.remove(name) else {
             return false;
@@ -1538,7 +1551,7 @@ fn handle_markdown_key(app: &mut App, key: KeyEvent) {
 fn dispatch_global_action(app: &mut App, action: GlobalAction, body: Rect) -> bool {
     match action {
         GlobalAction::Quit => {
-            app.should_quit = true;
+            app.request_quit();
         }
         GlobalAction::FocusProjects | GlobalAction::LeaderFocusProjects => {
             app.focus = Focus::Projects;
@@ -1809,7 +1822,7 @@ fn handle_projects_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
         return handle_filter_key(app, key, body);
     }
     match key.code {
-        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Char('q') => app.request_quit(),
         KeyCode::Char('j') | KeyCode::Down => app.sidebar.select_next(),
         KeyCode::Char('k') | KeyCode::Up => app.sidebar.select_prev(),
         KeyCode::Enter => {
@@ -1964,6 +1977,16 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                 if app.unload_project(&name) {
                     app.info = Some(format!("unloaded '{name}'"));
                 }
+                consumed_modal = Some(());
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                consumed_modal = Some(());
+            }
+            _ => {}
+        },
+        ModalState::ConfirmQuit(_) => match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                app.should_quit = true;
                 consumed_modal = Some(());
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -2629,10 +2652,37 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, ClaudeTab, Focus, MarkdownTab, Project, ProjectSession, ProjectStore, Settings, Tab,
-        expand_tilde, normalize_paste,
+        App, ClaudeTab, Focus, MarkdownTab, ModalState, Project, ProjectSession, ProjectStore,
+        Settings, Tab, expand_tilde, normalize_paste,
     };
     use std::path::PathBuf;
+
+    #[test]
+    fn request_quit_confirms_by_default() {
+        let mut app = empty_app();
+        assert!(app.settings.confirm_quit, "confirm_quit defaults on");
+        app.request_quit();
+        assert!(!app.should_quit, "must not quit before confirmation");
+        assert!(
+            matches!(app.modal, Some(ModalState::ConfirmQuit(_))),
+            "expected the quit-confirmation modal"
+        );
+        // A second request while the modal is up is a no-op (no stacking).
+        app.request_quit();
+        assert!(matches!(app.modal, Some(ModalState::ConfirmQuit(_))));
+    }
+
+    #[test]
+    fn request_quit_immediate_when_disabled() {
+        let mut app = empty_app();
+        app.settings.confirm_quit = false;
+        app.request_quit();
+        assert!(
+            app.should_quit,
+            "should quit immediately when confirm is off"
+        );
+        assert!(app.modal.is_none(), "no modal when confirm is off");
+    }
 
     fn empty_app() -> App {
         App::new(ProjectStore::default(), Settings::default())
