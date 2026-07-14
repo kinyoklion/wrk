@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.13](https://github.com/kinyoklion/wrk/compare/wrk-v0.1.12...wrk-v0.1.13) (2026-07-14)
+
+### Features
+
+* confirm before quitting the app (#73) ([#73](https://github.com/kinyoklion/wrk/issues/73)) ([#61](https://github.com/kinyoklion/wrk/issues/61))
+
+### Bug Fixes
+
+* expand `~` in project and markdown paths (#72) ([#72](https://github.com/kinyoklion/wrk/issues/72))
+* **markdown:** fixed-size images with slice-on-scroll (#70) ([#70](https://github.com/kinyoklion/wrk/issues/70)) ([#69](https://github.com/kinyoklion/wrk/issues/69))
+
 ## [0.1.12](https://github.com/kinyoklion/wrk/compare/wrk-v0.1.11...wrk-v0.1.12) (2026-07-10)
 
 ### Features
