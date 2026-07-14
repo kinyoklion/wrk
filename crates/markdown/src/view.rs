@@ -18,7 +18,11 @@ use crate::block::MdBlock;
 #[cfg(feature = "images")]
 use ratatui::layout::Size;
 #[cfg(feature = "images")]
-use ratatui_image::{Resize, StatefulImage, picker::Picker, protocol::StatefulProtocol};
+use ratatui_image::{
+    Resize,
+    picker::Picker,
+    sliced::{SignedPosition, SlicedImage, SlicedProtocol},
+};
 
 /// A text selection in *viewport* coordinates: `(row, col)` cell positions
 /// within the last-rendered visible area. Anchor is where the drag began.
@@ -57,10 +61,26 @@ impl Selection {
 /// Per-block image protocols, index-aligned with a document's blocks (`None`
 /// for text blocks and images that failed to load). Rebuilt by
 /// [`MarkdownViewState::prepare_images`] when the document is (re-)rendered.
+///
+/// Each protocol is a [`SlicedProtocol`] built once at a fixed cell size, so
+/// scrolling renders a cropped slice at a stable scale (via [`SlicedImage`])
+/// rather than re-fitting — and re-encoding — the whole image every frame.
 #[cfg(feature = "images")]
 #[derive(Default)]
 struct ImageStore {
-    protocols: Vec<Option<StatefulProtocol>>,
+    protocols: Vec<Option<SlicedProtocol>>,
+}
+
+/// Fixed display size for an image: its natural cell size, scaled down to fit
+/// `max_w` cells wide (never up). Height follows to preserve aspect. This is the
+/// stable size a [`SlicedProtocol`] is built at.
+#[cfg(feature = "images")]
+fn fit_to_width(natural: Size, max_w: u16) -> Size {
+    if max_w == 0 || natural.width == 0 || natural.width <= max_w {
+        return natural;
+    }
+    let height = ((u32::from(natural.height) * u32::from(max_w)) / u32::from(natural.width)).max(1);
+    Size::new(max_w, height as u16)
 }
 
 /// Scroll position and transient selection for a [`MarkdownView`]. The widget
@@ -134,19 +154,25 @@ impl MarkdownViewState {
     }
 
     /// (Re-)rasterize the document's image blocks into terminal protocols using
-    /// `picker`. Call once whenever the document is (re-)rendered — on open,
-    /// resize, or reload — not every frame; the protocols persist between draws.
-    /// Text blocks and images that fail to load get `None` (the view then shows
-    /// the placeholder line).
+    /// `picker`, sized to fit `width` cells. Call once whenever the document is
+    /// (re-)rendered — on open, resize, or reload — not every frame; the
+    /// protocols persist between draws and are sliced (not re-fit) while
+    /// scrolling. `width` must match the width the view renders at (its inner
+    /// width). Text blocks and images that fail to load get `None` (the view
+    /// then shows the placeholder line).
     #[cfg(feature = "images")]
-    pub fn prepare_images(&mut self, doc: &RenderedDoc, picker: &Picker) {
+    pub fn prepare_images(&mut self, doc: &RenderedDoc, picker: &Picker, width: u16) {
         self.images.protocols = doc
             .blocks
             .iter()
             .map(|block| match block {
-                MdBlock::Image(img) => crate::image::load(&img.source)
-                    .ok()
-                    .map(|dyn_img| picker.new_resize_protocol(dyn_img)),
+                MdBlock::Image(img) => crate::image::load(&img.source).ok().and_then(|dyn_img| {
+                    // Fix the size once (natural, capped to the pane width) so
+                    // the image has a stable height and scrolling only slices it.
+                    let size =
+                        fit_to_width(Resize::natural_size(&dyn_img, picker.font_size()), width);
+                    SlicedProtocol::new(picker, dyn_img, Some(size)).ok()
+                }),
                 MdBlock::Text(_) => None,
             })
             .collect();
@@ -299,17 +325,18 @@ impl StatefulWidget for MarkdownView<'_> {
 
 #[cfg(feature = "images")]
 impl MarkdownView<'_> {
-    /// Height in rows an image block occupies at `width`, fit within `max_h` so
-    /// a single image never exceeds the viewport. Falls back to one row (the
-    /// placeholder line) when the image failed to load.
-    fn image_rows(state: &mut MarkdownViewState, idx: usize, width: u16, max_h: u16) -> u16 {
-        match state.images.protocols.get_mut(idx).and_then(|p| p.as_mut()) {
-            Some(proto) => {
-                let size = proto.size_for(Resize::Fit(None), Size::new(width, max_h));
-                size.height.clamp(1, max_h)
-            }
-            None => 1,
-        }
+    /// Fixed height in rows an image block occupies — the height the
+    /// [`SlicedProtocol`] was built at, independent of scroll and viewport. A
+    /// taller-than-viewport image keeps its height and is scrolled through.
+    /// Falls back to one row (the placeholder line) when the image failed to
+    /// load.
+    fn image_rows(state: &MarkdownViewState, idx: usize) -> u16 {
+        state
+            .images
+            .protocols
+            .get(idx)
+            .and_then(|p| p.as_ref())
+            .map_or(1, |proto| proto.size().height.max(1))
     }
 
     /// Block-layout path: stack blocks vertically, scroll across them, and draw
@@ -327,7 +354,7 @@ impl MarkdownView<'_> {
             .enumerate()
             .map(|(i, block)| match block {
                 MdBlock::Text(t) => text_rows(t, inner.width),
-                MdBlock::Image(_) => Self::image_rows(state, i, inner.width, inner.height),
+                MdBlock::Image(_) => Self::image_rows(state, i),
             })
             .collect();
         let content_h: u16 = heights.iter().copied().fold(0, u16::saturating_add);
@@ -366,15 +393,16 @@ impl MarkdownView<'_> {
                         .render(rect, buf);
                 }
                 MdBlock::Image(img) => {
-                    match state.images.protocols.get_mut(i).and_then(|p| p.as_mut()) {
-                        // Fit the image into the visible rect. When the block is
-                        // partially scrolled the image scales to the slice — a
-                        // minor transient during scroll; at rest it renders at
-                        // its natural aspect.
+                    match state.images.protocols.get(i).and_then(|p| p.as_ref()) {
+                        // Draw the fixed-size image offset up by the scrolled-off
+                        // rows: `SlicedImage` crops to the visible slice at a
+                        // stable scale (no re-fit), reusing the encoded protocol.
                         Some(proto) => {
-                            StatefulImage::default()
-                                .resize(Resize::Fit(None))
-                                .render(rect, buf, proto);
+                            let pos = SignedPosition {
+                                x: 0,
+                                y: -(clip_top.min(i16::MAX as u16) as i16),
+                            };
+                            SlicedImage::new(proto, pos).render(rect, buf);
                         }
                         None => {
                             Paragraph::new(img.placeholder.clone())
@@ -496,7 +524,7 @@ mod tests {
 
         let picker = crate::Picker::halfblocks();
         let mut state = MarkdownViewState::new();
-        state.prepare_images(&d, &picker);
+        state.prepare_images(&d, &picker, 20);
 
         let area = Rect::new(0, 0, 20, 12);
         let mut buf = Buffer::empty(area);
@@ -512,6 +540,45 @@ mod tests {
             })
             .count();
         assert!(colored > 0, "expected the SVG image to paint colored cells");
+    }
+
+    #[cfg(feature = "images")]
+    #[test]
+    fn image_height_is_fixed_regardless_of_viewport() {
+        use crate::block::{ImageRef, ImageSource, MdBlock};
+
+        // A very tall image so it exceeds any small viewport we render into.
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="2000">
+            <rect width="20" height="2000" fill="#00ff00"/></svg>"##;
+        let d = RenderedDoc {
+            blocks: vec![MdBlock::Image(ImageRef {
+                alt: "tall".into(),
+                source: ImageSource::Svg(svg.into()),
+                placeholder: Line::from("[img]"),
+            })],
+        };
+        let picker = crate::Picker::halfblocks();
+        let mut state = MarkdownViewState::new();
+        state.prepare_images(&d, &picker, 40);
+
+        // Render into a viewport of height `h` and recover the content height.
+        // (`max_scroll == content_h - viewport_h` while content exceeds it.)
+        let content_h = |state: &mut MarkdownViewState, h: u16| {
+            let area = Rect::new(0, 0, 40, h);
+            let mut buf = Buffer::empty(area);
+            MarkdownView::new(&d).render(area, &mut buf, state);
+            state.max_scroll() + h
+        };
+        let a = content_h(&mut state, 4);
+        let b = content_h(&mut state, 8);
+        assert_eq!(
+            a, b,
+            "the image's height must be fixed, not fit to the viewport"
+        );
+        assert!(
+            a > 8,
+            "the tall image should be scrollable past a small viewport"
+        );
     }
 
     #[test]

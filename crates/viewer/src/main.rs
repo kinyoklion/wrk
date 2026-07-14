@@ -129,7 +129,7 @@ fn pager_loop(
             // Rasterize images for the new width (once per re-render, not frame).
             #[cfg(feature = "images")]
             if let Some(picker) = &picker {
-                state.prepare_images(&doc, picker);
+                state.prepare_images(&doc, picker, inner_width);
             }
             rendered_width = inner_width;
         }

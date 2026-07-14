@@ -251,7 +251,8 @@ fn draw_primary_pane(frame: &mut Frame, area: Rect, focused: bool, app: &mut App
                 // On a re-render, rebuild image protocols for the new width.
                 if md.ensure_rendered(content_area.width) {
                     if let Some(picker) = picker {
-                        md.state.prepare_images(&md.rendered, picker);
+                        md.state
+                            .prepare_images(&md.rendered, picker, content_area.width);
                     }
                 }
                 // Disjoint field borrows: `&md.rendered` and `&mut md.state`.
