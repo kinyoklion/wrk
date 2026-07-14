@@ -78,7 +78,7 @@ When the file changes externally and we reload, sessions whose project was remov
 
 ### Settings (`src/settings.rs`)
 
-Optional `~/.config/wrk/settings.toml`. Key fields: `claude_command` (defaults to `["claude", "--continue"]`) and `shell_command` (falls back to `$SHELL`, then `/bin/bash`). Used to support quirky setups like `["steam-run", "claude", "--continue"]` on NixOS.
+Optional `~/.config/wrk/settings.toml`. Key fields: `claude_command` (defaults to `["claude", "--continue"]`) and `shell_command` (falls back to `$SHELL`, then `/bin/bash`). Used to support quirky setups like `["steam-run", "claude", "--continue"]` on NixOS. `confirm_quit` (default true) gates app exit behind a confirmation modal — both quit paths (`GlobalAction::Quit` and `q` in the projects pane) route through `App::request_quit`, which opens `ModalState::ConfirmQuit` or sets `should_quit` directly.
 
 Color config: `[theme]` (chrome) resolves via `ThemeConfig::resolve()` → `Theme`, and `[markdown]` (markdown viewer palette) resolves via `MarkdownConfig::resolve()` → `wrk_markdown::MdTheme`, both reusing `parse_color`. `App` caches the resolved `theme` and `md_theme` at startup; markdown tabs copy `md_theme` at open and pass it to the renderer via `RenderOptions::with_theme` in `MarkdownTab::ensure_rendered`.
 

@@ -40,6 +40,15 @@ pub struct Settings {
     /// existing top-level table.
     #[serde(default)]
     pub keys: KeyConfig,
+
+    /// Ask for confirmation before quitting the app. Default `true`; set to
+    /// `false` to quit immediately.
+    #[serde(default = "default_true")]
+    pub confirm_quit: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -50,6 +59,7 @@ impl Default for Settings {
             theme: ThemeConfig::default(),
             markdown: MarkdownConfig::default(),
             keys: KeyConfig::default(),
+            confirm_quit: true,
         }
     }
 }
