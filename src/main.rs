@@ -92,6 +92,7 @@ fn main() -> Result<()> {
 /// originating project (`WRK_PROJECT`). Otherwise — or if that socket is stale —
 /// fall back to the standalone `wrk-md` pager.
 fn cmd_view(path: &Path) -> Result<()> {
+    let path = expand_tilde(&path.to_string_lossy());
     let abs = path
         .canonicalize()
         .with_context(|| format!("resolving {}", path.display()))?;
@@ -178,7 +179,25 @@ fn cmd_ls() -> Result<()> {
     Ok(())
 }
 
+/// Expand a leading `~` / `~/…` to the user's home directory. The shell does
+/// this for unquoted CLI args, but paths typed into wrk's modals — or quoted
+/// arguments — reach us with the `~` literal, so `canonicalize` would fail.
+/// Anything else (absolute or relative) is returned unchanged.
+fn expand_tilde(input: &str) -> PathBuf {
+    if input == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home);
+        }
+    } else if let Some(rest) = input.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(input)
+}
+
 fn cmd_add(path: &Path, name: Option<String>) -> Result<()> {
+    let path = expand_tilde(&path.to_string_lossy());
     let abs = path
         .canonicalize()
         .with_context(|| format!("resolving path {}", path.display()))?;
@@ -751,7 +770,7 @@ impl App {
         if trimmed.is_empty() {
             return Err(anyhow!("enter a file path"));
         }
-        let raw = PathBuf::from(trimmed);
+        let raw = expand_tilde(trimmed);
         let joined = if raw.is_absolute() {
             raw
         } else if let Some(base) = self.active_project().map(|p| p.path.clone()) {
@@ -1879,7 +1898,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                 m.current_input_mut().push(c);
             }
             KeyCode::Enter => {
-                let path = PathBuf::from(m.path_input.trim());
+                let path = expand_tilde(m.path_input.trim());
                 let name_input = m.name_input.trim().to_string();
                 let result = (|| -> Result<()> {
                     let abs = path.canonicalize()?;
@@ -2611,12 +2630,31 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 mod tests {
     use super::{
         App, ClaudeTab, Focus, MarkdownTab, Project, ProjectSession, ProjectStore, Settings, Tab,
-        normalize_paste,
+        expand_tilde, normalize_paste,
     };
     use std::path::PathBuf;
 
     fn empty_app() -> App {
         App::new(ProjectStore::default(), Settings::default())
+    }
+
+    #[test]
+    fn expand_tilde_resolves_home_prefix_only() {
+        let Ok(home) = std::env::var("HOME") else {
+            return; // no HOME in this environment; nothing to assert
+        };
+        let home = PathBuf::from(home);
+        // `~` and `~/…` expand to the home directory.
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("~/test.md"), home.join("test.md"));
+        assert_eq!(expand_tilde("~/a/b.md"), home.join("a/b.md"));
+        // Absolute and relative paths are untouched.
+        assert_eq!(expand_tilde("/abs/x.md"), PathBuf::from("/abs/x.md"));
+        assert_eq!(expand_tilde("rel/x.md"), PathBuf::from("rel/x.md"));
+        // A `~` that isn't the home prefix stays literal (no `~user` expansion,
+        // no mid-path expansion).
+        assert_eq!(expand_tilde("~bob/x"), PathBuf::from("~bob/x"));
+        assert_eq!(expand_tilde("/a/~/b"), PathBuf::from("/a/~/b"));
     }
 
     fn claude_tab(name: &str) -> Tab {
