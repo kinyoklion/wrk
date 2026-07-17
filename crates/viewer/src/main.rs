@@ -10,6 +10,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+#[cfg(feature = "images")]
+use crossterm::event::MouseButton;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseEventKind,
@@ -20,8 +22,12 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+#[cfg(feature = "images")]
+use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders};
+#[cfg(feature = "images")]
+use ratatui::widgets::{Clear, Paragraph};
 use wrk_markdown::{MarkdownView, MarkdownViewState, RenderOptions, RenderedDoc};
 
 const SCROLL_LINES: i32 = 3;
@@ -118,6 +124,9 @@ fn pager_loop(
         opts.cell_size = (f.width, f.height);
     }
     let mut doc = RenderedDoc::default();
+    // Active fullscreen image viewer (zoom/pan), opened from an inline image.
+    #[cfg(feature = "images")]
+    let mut viewer: Option<wrk_markdown::ImageViewer> = None;
     // Re-render only when the content width changes (`0` forces the first render
     // and a re-render after reload).
     let mut rendered_width: u16 = 0;
@@ -136,6 +145,25 @@ fn pager_loop(
 
         terminal.draw(|frame| {
             let area = frame.area();
+            // The fullscreen image viewer takes over the whole screen when open.
+            #[cfg(feature = "images")]
+            if let (Some(v), Some(p)) = (viewer.as_mut(), picker.as_ref()) {
+                let rows = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(0), Constraint::Length(1)])
+                    .split(area);
+                frame.render_widget(Clear, rows[0]);
+                v.render(rows[0], frame.buffer_mut(), p);
+                let hint = format!(
+                    " image · +/-/wheel zoom ({:.0}%) · hjkl/arrows pan · 0 reset · q/Esc close ",
+                    v.zoom() * 100.0
+                );
+                frame.render_widget(
+                    Paragraph::new(hint).style(Style::default().add_modifier(Modifier::DIM)),
+                    rows[1],
+                );
+                return;
+            }
             let block = Block::default()
                 .title(title)
                 .borders(Borders::ALL)
@@ -149,10 +177,30 @@ fn pager_loop(
         }
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                // The image viewer captures all keys while open.
+                #[cfg(feature = "images")]
+                if viewer_key(&mut viewer, &key) {
+                    // On close, force a re-render so the inline images rebuild
+                    // their protocols and re-transmit after the fullscreen
+                    // overlay clobbered their cells.
+                    if viewer.is_none() {
+                        rendered_width = 0;
+                    }
+                    continue;
+                }
                 if quit_requested(&key) {
                     return Ok(());
                 }
                 match key.code {
+                    // Open the top image in view in the fullscreen zoom/pan viewer.
+                    #[cfg(feature = "images")]
+                    KeyCode::Enter => {
+                        if let Some(idx) = state.top_visible_image()
+                            && let Some(wrk_markdown::MdBlock::Image(img)) = doc.blocks.get(idx)
+                        {
+                            viewer = wrk_markdown::ImageViewer::open(&img.source);
+                        }
+                    }
                     KeyCode::Char('j') | KeyCode::Down => state.scroll_by(1),
                     KeyCode::Char('k') | KeyCode::Up => state.scroll_by(-1),
                     KeyCode::Char('d') | KeyCode::PageDown | KeyCode::Char(' ') => {
@@ -177,14 +225,61 @@ fn pager_loop(
                     _ => {}
                 }
             }
-            Event::Mouse(m) => match m.kind {
-                MouseEventKind::ScrollUp => state.scroll_by(-SCROLL_LINES),
-                MouseEventKind::ScrollDown => state.scroll_by(SCROLL_LINES),
-                _ => {}
-            },
+            Event::Mouse(m) => {
+                // The image viewer captures the mouse (wheel zooms) while open.
+                #[cfg(feature = "images")]
+                if let Some(v) = viewer.as_mut() {
+                    match m.kind {
+                        MouseEventKind::ScrollUp => v.zoom_by(1.15),
+                        MouseEventKind::ScrollDown => v.zoom_by(1.0 / 1.15),
+                        _ => {}
+                    }
+                    continue;
+                }
+                match m.kind {
+                    MouseEventKind::ScrollUp => state.scroll_by(-SCROLL_LINES),
+                    MouseEventKind::ScrollDown => state.scroll_by(SCROLL_LINES),
+                    // Left-click an inline image to open it in the viewer.
+                    #[cfg(feature = "images")]
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(idx) = state.image_at(m.column, m.row)
+                            && let Some(wrk_markdown::MdBlock::Image(img)) = doc.blocks.get(idx)
+                        {
+                            viewer = wrk_markdown::ImageViewer::open(&img.source);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             _ => {}
         }
     }
+}
+
+/// Handle a key while the fullscreen image viewer is open. Returns `true` when
+/// the viewer is open (the key was consumed): zoom, pan, reset, or close.
+#[cfg(feature = "images")]
+fn viewer_key(viewer: &mut Option<wrk_markdown::ImageViewer>, key: &KeyEvent) -> bool {
+    if viewer.is_none() {
+        return false;
+    }
+    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+        *viewer = None;
+        return true;
+    }
+    if let Some(v) = viewer.as_mut() {
+        match key.code {
+            KeyCode::Char('+') | KeyCode::Char('=') => v.zoom_by(1.25),
+            KeyCode::Char('-') | KeyCode::Char('_') => v.zoom_by(0.8),
+            KeyCode::Char('0') => v.reset(),
+            KeyCode::Char('h') | KeyCode::Left => v.pan_view(-0.2, 0.0),
+            KeyCode::Char('l') | KeyCode::Right => v.pan_view(0.2, 0.0),
+            KeyCode::Char('k') | KeyCode::Up => v.pan_view(0.0, -0.2),
+            KeyCode::Char('j') | KeyCode::Down => v.pan_view(0.0, 0.2),
+            _ => {}
+        }
+    }
+    true
 }
 
 fn quit_requested(key: &KeyEvent) -> bool {

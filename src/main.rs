@@ -451,6 +451,9 @@ pub struct App {
     /// `[markdown] heading_images`, default true). Copied onto each markdown tab
     /// at open.
     pub heading_images: bool,
+    /// Active fullscreen image viewer (zoom/pan), opened from a markdown tab.
+    /// When `Some`, it takes over the screen and input until dismissed.
+    pub image_viewer: Option<wrk_markdown::ImageViewer>,
 }
 
 impl App {
@@ -493,6 +496,7 @@ impl App {
             picker: None,
             prefers_dark: false,
             heading_images,
+            image_viewer: None,
         }
     }
 
@@ -868,6 +872,19 @@ impl App {
     /// Killing the child processes and joining the reader threads happens via
     /// `PtyPane`'s `Drop` when the `ProjectSession` is removed from the map.
     /// Returns `false` if the project had no live session (nothing to unload).
+    /// Open the fullscreen zoom/pan viewer for `source`. No-op without a
+    /// graphics protocol (nothing could be drawn); sets an info hint if the
+    /// image can't be decoded.
+    fn open_image_viewer(&mut self, source: &wrk_markdown::ImageSource) {
+        if self.picker.is_none() {
+            return;
+        }
+        match wrk_markdown::ImageViewer::open(source) {
+            Some(v) => self.image_viewer = Some(v),
+            None => self.info = Some("could not open image".to_string()),
+        }
+    }
+
     /// Request application exit. Opens a confirmation modal when `confirm_quit`
     /// is enabled (the default); otherwise quits immediately. A modal already
     /// being open (e.g. the confirm dialog itself) is left untouched.
@@ -1460,6 +1477,12 @@ fn handle_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
     // user action so it doesn't shadow the hint indefinitely.
     app.info = None;
 
+    // The fullscreen image viewer captures all input while open.
+    if app.image_viewer.is_some() {
+        handle_image_viewer_key(app, key);
+        return Ok(());
+    }
+
     if app.modal.is_some() {
         return handle_modal_key(app, key, body);
     }
@@ -1526,22 +1549,107 @@ fn active_tab_is_markdown(app: &App) -> bool {
 
 /// Handle a key while a markdown tab is focused: scrolling, paging, and reload.
 fn handle_markdown_key(app: &mut App, key: KeyEvent) {
-    let Some(session) = app.active_session_mut() else {
+    // `Enter` opens the top-most image in view in the fullscreen viewer; the
+    // source is captured here and opened after the tab borrow ends.
+    let mut open_source: Option<wrk_markdown::ImageSource> = None;
+    {
+        let Some(session) = app.active_session_mut() else {
+            return;
+        };
+        let Some(Tab::Markdown(md)) = session.current_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => md.state.scroll_by(1),
+            KeyCode::Char('k') | KeyCode::Up => md.state.scroll_by(-1),
+            KeyCode::Char('d') | KeyCode::PageDown | KeyCode::Char(' ') => md.state.page_down(),
+            KeyCode::Char('u') | KeyCode::PageUp => md.state.page_up(),
+            KeyCode::Char('g') | KeyCode::Home => md.state.scroll_to_top(),
+            KeyCode::Char('G') | KeyCode::End => md.state.scroll_to_bottom(),
+            KeyCode::Char('r') => md.reload(),
+            KeyCode::Char('b') => md.toggle_diagram_background(),
+            KeyCode::Enter => {
+                open_source = image_source_for_block(md, md.state.top_visible_image())
+            }
+            _ => {}
+        }
+    }
+    if let Some(src) = open_source {
+        app.open_image_viewer(&src);
+    }
+}
+
+/// The [`ImageSource`](wrk_markdown::ImageSource) of the image at document block
+/// `idx` in `md`, if that block is an image.
+fn image_source_for_block(
+    md: &MarkdownTab,
+    idx: Option<usize>,
+) -> Option<wrk_markdown::ImageSource> {
+    let idx = idx?;
+    match md.rendered.blocks.get(idx)? {
+        wrk_markdown::MdBlock::Image(img) => Some(img.source.clone()),
+        wrk_markdown::MdBlock::Text(_) => None,
+    }
+}
+
+/// Handle a key while the fullscreen image viewer is open: zoom, pan, reset, or
+/// close.
+fn handle_image_viewer_key(app: &mut App, key: KeyEvent) {
+    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+        app.image_viewer = None;
+        // The fullscreen overlay clobbered the inline images' on-screen cells;
+        // force the markdown view to rebuild its image protocols so they
+        // re-transmit (a cached protocol would otherwise emit "skip").
+        if let Some(md) = app.active_markdown_mut() {
+            md.render_width = 0;
+        }
         return;
-    };
-    let Some(Tab::Markdown(md)) = session.current_mut() else {
+    }
+    let Some(v) = app.image_viewer.as_mut() else {
         return;
     };
     match key.code {
-        KeyCode::Char('j') | KeyCode::Down => md.state.scroll_by(1),
-        KeyCode::Char('k') | KeyCode::Up => md.state.scroll_by(-1),
-        KeyCode::Char('d') | KeyCode::PageDown | KeyCode::Char(' ') => md.state.page_down(),
-        KeyCode::Char('u') | KeyCode::PageUp => md.state.page_up(),
-        KeyCode::Char('g') | KeyCode::Home => md.state.scroll_to_top(),
-        KeyCode::Char('G') | KeyCode::End => md.state.scroll_to_bottom(),
-        KeyCode::Char('r') => md.reload(),
-        KeyCode::Char('b') => md.toggle_diagram_background(),
+        KeyCode::Char('+') | KeyCode::Char('=') => v.zoom_by(1.25),
+        KeyCode::Char('-') | KeyCode::Char('_') => v.zoom_by(0.8),
+        KeyCode::Char('0') => v.reset(),
+        KeyCode::Char('h') | KeyCode::Left => v.pan_view(-IMG_PAN_STEP, 0.0),
+        KeyCode::Char('l') | KeyCode::Right => v.pan_view(IMG_PAN_STEP, 0.0),
+        KeyCode::Char('k') | KeyCode::Up => v.pan_view(0.0, -IMG_PAN_STEP),
+        KeyCode::Char('j') | KeyCode::Down => v.pan_view(0.0, IMG_PAN_STEP),
         _ => {}
+    }
+}
+
+/// Keyboard pan step, as a fraction of the visible view.
+const IMG_PAN_STEP: f32 = 0.2;
+
+/// Handle a mouse event while the fullscreen image viewer is open: the wheel
+/// zooms. (Pan is on the keyboard for now.)
+fn handle_image_viewer_mouse(app: &mut App, m: MouseEvent) {
+    if let Some(v) = app.image_viewer.as_mut() {
+        match m.kind {
+            MouseEventKind::ScrollUp => v.zoom_by(1.15),
+            MouseEventKind::ScrollDown => v.zoom_by(1.0 / 1.15),
+            _ => {}
+        }
+    }
+}
+
+/// If buffer cell `(x, y)` is over an inline image in the active markdown tab,
+/// open it in the fullscreen viewer and return `true`.
+fn try_open_image_at(app: &mut App, x: u16, y: u16) -> bool {
+    if !active_tab_is_markdown(app) {
+        return false;
+    }
+    let source = app
+        .active_markdown_mut()
+        .and_then(|md| image_source_for_block(md, md.state.image_at(x, y)));
+    match source {
+        Some(src) => {
+            app.open_image_viewer(&src);
+            true
+        }
+        None => false,
     }
 }
 
@@ -2094,6 +2202,12 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
     // fresh "copied N chars") or leaves it cleared.
     app.info = None;
 
+    // The fullscreen image viewer captures the mouse (wheel zooms) while open.
+    if app.image_viewer.is_some() {
+        handle_image_viewer_mouse(app, m);
+        return;
+    }
+
     if app.modal.is_some() {
         return;
     }
@@ -2156,6 +2270,14 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
         && (m.modifiers.contains(KeyModifiers::CONTROL)
             || m.modifiers.contains(KeyModifiers::SHIFT))
         && try_open_url(app, &layout, pos_x, pos_y)
+    {
+        return;
+    }
+
+    // A left-click on an inline markdown image opens it in the fullscreen
+    // viewer (before PTY forwarding — a markdown tab has no PTY anyway).
+    if let MouseEventKind::Down(MouseButton::Left) = m.kind
+        && try_open_image_at(app, pos_x, pos_y)
     {
         return;
     }

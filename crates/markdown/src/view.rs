@@ -101,6 +101,20 @@ pub struct MarkdownViewState {
     /// Rasterized image protocols for the current document (images feature).
     #[cfg(feature = "images")]
     images: ImageStore,
+    /// Visible image blocks and the buffer rect each occupied, captured each
+    /// render (top-to-bottom). Backs click-to-open and "open the top image in
+    /// view" for the fullscreen viewer.
+    #[cfg(feature = "images")]
+    image_hits: Vec<ImageHit>,
+}
+
+/// A visible image block and where it was drawn, for hit-testing clicks.
+#[cfg(feature = "images")]
+#[derive(Clone, Copy)]
+struct ImageHit {
+    /// Index into the document's `blocks`.
+    block: usize,
+    rect: Rect,
 }
 
 impl MarkdownViewState {
@@ -176,6 +190,29 @@ impl MarkdownViewState {
                 MdBlock::Text(_) => None,
             })
             .collect();
+    }
+
+    /// Document block index of the image drawn under buffer cell `(x, y)`, if
+    /// any — for click-to-open. Coordinates are absolute buffer positions, as
+    /// captured during the last render.
+    #[cfg(feature = "images")]
+    pub fn image_at(&self, x: u16, y: u16) -> Option<usize> {
+        self.image_hits
+            .iter()
+            .find(|h| {
+                x >= h.rect.x
+                    && x < h.rect.x + h.rect.width
+                    && y >= h.rect.y
+                    && y < h.rect.y + h.rect.height
+            })
+            .map(|h| h.block)
+    }
+
+    /// Document block index of the top-most image currently in view, if any —
+    /// for a keyboard "open the image I'm looking at".
+    #[cfg(feature = "images")]
+    pub fn top_visible_image(&self) -> Option<usize> {
+        self.image_hits.first().map(|h| h.block)
     }
 
     /// Begin a selection at viewport cell `(col, row)`.
@@ -359,6 +396,7 @@ impl MarkdownView<'_> {
             .collect();
         let content_h: u16 = heights.iter().copied().fold(0, u16::saturating_add);
         state.sync(content_h, inner.height);
+        state.image_hits.clear();
 
         let scroll = state.scroll;
         let win_bot = scroll.saturating_add(inner.height);
@@ -393,7 +431,7 @@ impl MarkdownView<'_> {
                         .render(rect, buf);
                 }
                 MdBlock::Image(img) => {
-                    match state.images.protocols.get(i).and_then(|p| p.as_ref()) {
+                    let hit_w = match state.images.protocols.get(i).and_then(|p| p.as_ref()) {
                         // Draw the fixed-size image offset up by the scrolled-off
                         // rows: `SlicedImage` crops to the visible slice at a
                         // stable scale (no re-fit), reusing the encoded protocol.
@@ -402,14 +440,26 @@ impl MarkdownView<'_> {
                                 x: 0,
                                 y: -(clip_top.min(i16::MAX as u16) as i16),
                             };
+                            let w = proto.size().width.min(rect.width);
                             SlicedImage::new(proto, pos).render(rect, buf);
+                            w
                         }
                         None => {
                             Paragraph::new(img.placeholder.clone())
                                 .scroll((clip_top, 0))
                                 .render(rect, buf);
+                            rect.width
                         }
-                    }
+                    };
+                    // Record where this image drew so a click (or the "top image
+                    // in view" key) can open it in the fullscreen viewer.
+                    state.image_hits.push(ImageHit {
+                        block: i,
+                        rect: Rect {
+                            width: hit_w,
+                            ..rect
+                        },
+                    });
                 }
             }
         }
