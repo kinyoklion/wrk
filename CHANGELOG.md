@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.14](https://github.com/kinyoklion/wrk/compare/wrk-v0.1.13...wrk-v0.1.14) (2026-07-17)
+
+### Features
+
+* **markdown:** fullscreen zoom/pan image viewer (#74) ([#74](https://github.com/kinyoklion/wrk/issues/74))
+
 ## [0.1.13](https://github.com/kinyoklion/wrk/compare/wrk-v0.1.12...wrk-v0.1.13) (2026-07-14)
 
 ### Features
