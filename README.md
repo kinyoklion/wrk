@@ -138,6 +138,11 @@ the host. This is the `images` feature (on by default; drop it with
 build's MSRV back below 1.86). Remote (`http(s)://`) and `data:` links stay
 placeholders.
 
+Any inline image (or diagram) can be opened in a fullscreen zoom/pan viewer:
+**click it**, or press `Enter` with an image at the top of the view. Inside,
+`+`/`-` or the mouse wheel zoom, `h`/`j`/`k`/`l` or the arrows pan, `0` resets to
+fit, and `q`/`Esc` returns to the document.
+
 On a graphics terminal, `H1`–`H3` headings render at a true, larger font size
 (the same SVG pipeline, in the bundled sans font and the heading color, with the
 `#` stripped); a heading wider than the pane scales down to fit. `H4`–`H6` stay
@@ -149,7 +154,7 @@ text automatically.
 [carcimaid]: https://github.com/kinyoklion/carcimaid
 
 ```sh
-wrk-md README.md            # scrollable pager (j/k, PgUp/PgDn, g/G, r reload, b diagram bg, q quit)
+wrk-md README.md            # pager (j/k, PgUp/PgDn, g/G, r reload, b diagram bg, Enter/click zoom image, q quit)
 wrk-md --no-highlight FILE  # disable code syntax highlighting
 wrk-md --print FILE         # plain-text render to stdout (for piping)
 wrk-md --print --width 80 F # force a wrap width for --print (else terminal width)
@@ -237,9 +242,10 @@ by default; tmux needs `set -g allow-passthrough on`).
 A markdown tab renders the file with the bundled `wrk-markdown` engine
 (headings, lists, tables, syntax-highlighted code, inline images incl. SVG, and
 mermaid diagrams auto-themed to the terminal). When focused, scroll with `j`/`k`,
-`PgUp`/`PgDn`, `Space`, `g`/`G`, reload from disk with `r`, and toggle a diagram's
-opaque background with `b`. Markdown tabs are ephemeral — they aren't recorded in
-`projects.toml` and are dropped on unload.
+`PgUp`/`PgDn`, `Space`, `g`/`G`, reload from disk with `r`, toggle a diagram's
+opaque background with `b`, and open an image in the fullscreen zoom/pan viewer
+by clicking it or pressing `Enter`. Markdown tabs are ephemeral — they aren't
+recorded in `projects.toml` and are dropped on unload.
 
 Anywhere else the pane has focus, all keys (including `Tab`) pass through to
 the embedded PTY child.

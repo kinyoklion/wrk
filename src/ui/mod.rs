@@ -5,7 +5,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -70,6 +70,13 @@ fn project_status_for(sessions: &HashMap<String, ProjectSession>, name: &str) ->
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+
+    // The fullscreen image viewer takes over the whole screen when open.
+    if app.image_viewer.is_some() {
+        draw_image_viewer(frame, app, area);
+        return;
+    }
+
     let theme = app.theme;
 
     let outer = Layout::default()
@@ -198,6 +205,34 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
         _ => {}
     }
+}
+
+/// Render the fullscreen zoom/pan image viewer over the whole screen: the image
+/// fills all but the bottom row, which shows the controls + current zoom.
+fn draw_image_viewer(frame: &mut Frame, app: &mut App, area: Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(area);
+    let (img_area, hint_area) = (rows[0], rows[1]);
+
+    frame.render_widget(Clear, img_area);
+    let mut zoom = 1.0;
+    {
+        let buf = frame.buffer_mut();
+        if let (Some(viewer), Some(picker)) = (app.image_viewer.as_mut(), app.picker.as_ref()) {
+            viewer.render(img_area, buf, picker);
+            zoom = viewer.zoom();
+        }
+    }
+    let hint = format!(
+        " image · +/-/wheel zoom ({:.0}%) · hjkl/arrows pan · 0 reset · q/Esc close ",
+        zoom * 100.0
+    );
+    frame.render_widget(
+        Paragraph::new(hint).style(Style::default().fg(app.theme.hint)),
+        hint_area,
+    );
 }
 
 /// Renders the primary pane: border + tab strip + the active tab's content

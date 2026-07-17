@@ -27,6 +27,9 @@ mod image;
 #[cfg(feature = "images")]
 mod heading;
 
+#[cfg(feature = "images")]
+mod image_view;
+
 pub use block::{ImageRef, ImageSource, MdBlock, RenderedDoc};
 pub use diagram::{DiagramBackend, DiagramCtx, DiagramOutput, NullBackend};
 
@@ -40,6 +43,9 @@ pub use view::{MarkdownView, MarkdownViewState};
 /// directly. Pass it to [`MarkdownViewState::prepare_images`].
 #[cfg(feature = "images")]
 pub use ratatui_image::picker::Picker;
+
+#[cfg(feature = "images")]
+pub use image_view::ImageViewer;
 
 #[cfg(feature = "images")]
 pub use detect::{query_picker, terminal_prefers_dark};
