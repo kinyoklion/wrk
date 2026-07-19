@@ -24,6 +24,7 @@ directories = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
 wrk-markdown = { workspace = true, features = ["highlight", "images", "mermaid"] }
 
 [dev-dependencies]

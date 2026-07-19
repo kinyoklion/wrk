@@ -71,20 +71,6 @@ pub fn discover_sessions_named(
     sessions
 }
 
-/// Returns the session ID of the newest session file that was modified
-/// strictly after `since`, or `None` if no such file exists yet.
-///
-/// Used after spawning `claude` (no args) to capture the newly-created
-/// session ID from the filesystem.
-pub fn find_session_created_after(project_path: &Path, since: SystemTime) -> Option<String> {
-    let sessions = discover_sessions(project_path);
-    // sessions is sorted newest-first; find the first one modified after `since`
-    sessions
-        .into_iter()
-        .find(|s| s.modified > since)
-        .map(|s| s.session_id)
-}
-
 fn sessions_dir(project_path: &Path) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     let key = path_to_claude_key(project_path);
