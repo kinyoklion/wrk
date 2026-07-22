@@ -22,8 +22,8 @@ pub enum LayoutMode {
 pub struct SessionRef {
     pub name: String,
     /// Claude session UUID. When present, wrk launches `claude --resume <id>`.
-    /// When absent, wrk spawns a fresh new Claude session for this tab and
-    /// fills in the ID a few seconds later (via session-file discovery).
+    /// When absent, wrk mints a fresh UUID for this tab at spawn time and
+    /// launches `claude --session-id <uuid>`, then persists the UUID here.
     /// Once persisted with an ID, subsequent project opens resume the same
     /// session deterministically — `claude --continue` is not used.
     #[serde(skip_serializing_if = "Option::is_none")]

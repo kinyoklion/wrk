@@ -3532,6 +3532,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "toml",
+ "uuid",
  "vte",
  "wrk-markdown",
 ]

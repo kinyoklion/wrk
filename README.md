@@ -28,11 +28,13 @@ project. Linux-only, native rendering (via your terminal), built on
   tab with `Alt+w`. Resumption is **deterministic**: every tab is tied to a
   specific Claude session ID, persisted to `projects.toml`, and restored via
   `claude --resume <id>`. A tab with no recorded ID yet (brand-new project, or
-  a hand-written entry) spawns a fresh new session; wrk captures its ID a few
-  seconds later and writes it back to `projects.toml`. wrk does **not** use
-  `claude --continue`, which would non-deterministically attach to whatever
-  session was newest in the directory — wrong when multiple projects share a
-  path.
+  a hand-written entry) gets a fresh UUID generated up front and is launched
+  with `claude --session-id <uuid> --name <project>` — the new session is bound
+  to that ID from its very first launch (and named after its project), then
+  written straight back to `projects.toml`. wrk does **not** use `claude
+  --continue`, nor does it guess the ID from the filesystem after the fact —
+  both would non-deterministically attach to whatever session was newest in the
+  directory, which is wrong when multiple projects share a path.
 - **Multiple projects per directory**: project names are unique; paths need
   not be, so you can have `wrk-feature` and `wrk-bugfix` both pointing at the
   same directory with separate Claude sessions each. Each project resumes its
@@ -261,8 +263,8 @@ path = "/home/rlamb/projects/wrk"
 layout = "tabbed"   # optional, defaults to split
 claude_sessions = [
   { name = "main",      session_id = "5d1f9f10-56bc-43f2-9dd5-ca711af4f3f9" },
-  { name = "refactor" },   # no session_id → spawns a fresh new session; wrk
-                           # fills in the ID on first run and persists it
+  { name = "refactor" },   # no session_id → wrk mints a UUID on first run
+                           # (claude --session-id …) and persists it
 ]
 
 [[project]]

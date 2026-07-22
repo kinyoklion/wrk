@@ -237,19 +237,15 @@ fn cmd_rm(name: &str) -> Result<()> {
 /// A single running (or dead) Claude tab within a project.
 pub struct ClaudeTab {
     pub name: String,
-    /// Claude session UUID — used to resume the same conversation.
+    /// Claude session UUID — used to resume the same conversation. `None` until
+    /// the tab is first spawned; at that point wrk generates a fresh UUID,
+    /// launches `claude --session-id <uuid>`, and records it here so every
+    /// later open resumes deterministically via `--resume <uuid>`.
     pub session_id: Option<String>,
     /// Unique ID for this tab's `WRK_STATUS_FILE` (stable for the lifetime of
     /// the tab, independent of the Claude session ID).
     pub status_id: String,
     pub pane: Option<PtyPane>,
-    /// True when this tab was spawned as a brand-new session (`claude` with no
-    /// args). We scan the filesystem after a short delay to capture the session
-    /// ID so we can persist it for future restarts.
-    pub detect_session_id: bool,
-    /// Wall-clock time at which the pane was spawned, used to find the right
-    /// session file when detecting the ID post-spawn.
-    pub spawn_time: Option<std::time::SystemTime>,
 }
 
 static TAB_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -567,43 +563,47 @@ impl App {
         let session = self.sessions.entry(project.name.clone()).or_default();
 
         // Build the initial set of tabs from the project's configured sessions.
-        // If the list is empty, spawn one fresh new session — its ID will be
-        // captured by `detect_new_session_ids` (~3 s post-spawn) and persisted
-        // back to `projects.toml`, so subsequent opens resume deterministically
-        // via `--resume <id>`. Entries that already have a `session_id` resume
-        // it directly; entries with no ID (hand-written, or new since last
-        // run) also spawn fresh and capture the ID on first run.
+        // If the list is empty, create one new session named after the project.
+        // A tab with no `session_id` (empty project, or a hand-written entry)
+        // gets a fresh UUID assigned at spawn time and is persisted, so every
+        // later open resumes deterministically via `--resume <id>`.
         if session.tabs.is_empty() {
             if project.claude_sessions.is_empty() {
                 session.tabs.push(Tab::Claude(ClaudeTab {
-                    name: "claude".to_string(),
+                    name: project.name.clone(),
                     session_id: None,
                     status_id: new_status_id(),
                     pane: None,
-                    detect_session_id: true,
-                    spawn_time: None,
                 }));
             } else {
                 for sr in &project.claude_sessions {
-                    let needs_detect = sr.session_id.is_none();
                     session.tabs.push(Tab::Claude(ClaudeTab {
                         name: sr.name.clone(),
                         session_id: sr.session_id.clone(),
                         status_id: new_status_id(),
                         pane: None,
-                        detect_session_id: needs_detect,
-                        spawn_time: None,
                     }));
                 }
             }
         }
 
-        // Spawn any missing or dead claude panes.
+        // Spawn any missing or dead claude panes. Tabs without a session_id are
+        // assigned a fresh UUID here (`--session-id`) and persisted afterward.
         let claude_content = claude_pane_split(claude_inner, session.tabs.len()).1;
+        let mut assigned_new = false;
         for tab in session.claude_tabs_mut() {
             let dead = tab.pane.as_mut().is_some_and(|p| p.child_finished());
             if tab.pane.is_none() || dead {
-                let cmd = claude_command(&self.settings, tab.session_id.as_deref());
+                let cmd = match tab.session_id.clone() {
+                    Some(id) => claude_resume_command(&self.settings, &id),
+                    None => {
+                        let id = new_session_id();
+                        let cmd = claude_new_command(&self.settings, &id, &tab.name);
+                        tab.session_id = Some(id);
+                        assigned_new = true;
+                        cmd
+                    }
+                };
                 let status_path = status::status_file_for_tab(&tab.status_id);
                 let mut env = base_env.clone();
                 env.push((
@@ -618,12 +618,7 @@ impl App {
                     &env,
                 );
                 match spawned {
-                    Ok(p) => {
-                        if tab.detect_session_id {
-                            tab.spawn_time = Some(std::time::SystemTime::now());
-                        }
-                        tab.pane = Some(p);
-                    }
+                    Ok(p) => tab.pane = Some(p),
                     Err(e) => push_error(&mut self.error, format!("claude spawn failed: {e}")),
                 }
             }
@@ -656,6 +651,11 @@ impl App {
         }
         if let Some(p) = session.shell.as_mut() {
             let _ = p.resize(shell_inner.height, shell_inner.width);
+        }
+
+        // Persist any freshly-assigned session IDs so the next open resumes them.
+        if assigned_new {
+            self.persist_claude_sessions(&project.name);
         }
 
         self.focus = Focus::Claude;
@@ -694,7 +694,8 @@ impl App {
     }
 
     /// Add a new Claude tab to the active project.
-    /// `session_id = None` → fresh `claude` session (ID detected post-spawn).
+    /// `session_id = None` → new session: a fresh UUID is generated up front
+    /// (`claude --session-id <uuid> --name <name>`) and recorded immediately.
     /// `session_id = Some(id)` → `claude --resume <id>`.
     fn add_claude_tab(&mut self, name: String, session_id: Option<String>, body: Rect) {
         let Some(project_name) = self.active_project_name.clone() else {
@@ -715,8 +716,16 @@ impl App {
             return;
         };
 
-        let new_session = session_id.is_none();
-        let cmd = claude_command(&self.settings, session_id.as_deref());
+        // Resume an existing session, or mint a new one with a fresh UUID so it
+        // is tracked deterministically from the very first spawn.
+        let (cmd, session_id) = match session_id {
+            Some(id) => (claude_resume_command(&self.settings, &id), Some(id)),
+            None => {
+                let id = new_session_id();
+                let cmd = claude_new_command(&self.settings, &id, &name);
+                (cmd, Some(id))
+            }
+        };
         let status_id = new_status_id();
         let status_path = status::status_file_for_tab(&status_id);
         let mut env = self.base_pty_env(&project_name);
@@ -725,19 +734,13 @@ impl App {
             status_path.to_string_lossy().into_owned(),
         ));
 
-        let spawn_result = PtyPane::spawn(
+        let pane = match PtyPane::spawn(
             &cmd,
             &project_path,
             claude_content.height,
             claude_content.width,
             &env,
-        );
-        let spawn_time = if new_session && spawn_result.is_ok() {
-            Some(std::time::SystemTime::now())
-        } else {
-            None
-        };
-        let pane = match spawn_result {
+        ) {
             Ok(p) => Some(p),
             Err(e) => {
                 push_error(&mut self.error, format!("claude spawn failed: {e}"));
@@ -748,11 +751,9 @@ impl App {
         let session = self.sessions.entry(project_name.clone()).or_default();
         session.tabs.push(Tab::Claude(ClaudeTab {
             name,
-            session_id: session_id.clone(),
+            session_id,
             status_id,
             pane,
-            detect_session_id: new_session,
-            spawn_time,
         }));
         let new_idx = session.tabs.len() - 1;
         session.active_tab = new_idx;
@@ -958,10 +959,9 @@ impl App {
             .iter_mut()
             .find(|p| p.name == project_name)
         {
-            // Persist the live tab list faithfully. A tab without a session_id
-            // (newly spawned, ID not yet discovered) is intentionally kept —
-            // detect_new_session_ids will re-persist with the real ID once
-            // claude has written its session file (~3 s post-spawn).
+            // Persist the live tab list faithfully. A tab keeps `session_id =
+            // None` only if it hasn't been spawned yet; once spawned it always
+            // has a UUID (assigned at spawn time), so restarts resume it.
             p.claude_sessions = tabs;
         }
         if let Err(e) = store::save(&self.store) {
@@ -1012,21 +1012,39 @@ impl App {
     }
 }
 
-/// Build the claude launch command for a tab.
-///  - `session_id = Some(id)` → `claude --resume <id>` (deterministic resume)
-///  - `session_id = None`     → bare `claude` (fresh new session — its ID is
-///    captured shortly after spawn by `detect_new_session_ids` and persisted)
+/// A fresh Claude session UUID (v4) for a brand-new tab.
+fn new_session_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Build the command to **resume** an existing Claude session: `claude --resume
+/// <id>`.
 ///
 /// `claude --continue` is intentionally not used. It resumes "the most recent
 /// session in this directory", which is non-deterministic when multiple wrk
 /// projects share a path: project A could end up attached to a session that
 /// actually belongs to project B simply because B was used more recently.
-fn claude_command(settings: &Settings, session_id: Option<&str>) -> Vec<String> {
+fn claude_resume_command(settings: &Settings, session_id: &str) -> Vec<String> {
     let mut cmd = settings.claude_base();
-    if let Some(id) = session_id {
-        cmd.push("--resume".to_string());
-        cmd.push(id.to_string());
-    }
+    cmd.push("--resume".to_string());
+    cmd.push(session_id.to_string());
+    cmd
+}
+
+/// Build the command to **create** a new Claude session with a caller-chosen
+/// UUID and display name: `claude --session-id <id> --name <name>`.
+///
+/// Assigning the ID up front (rather than guessing it from the filesystem after
+/// the fact) is what makes resumption deterministic — the tab is bound to its
+/// own session from the very first launch, so it can never latch onto another
+/// project's conversation. The `--name` labels the session after its project
+/// (shown in Claude's `/resume` picker and terminal title).
+fn claude_new_command(settings: &Settings, session_id: &str, name: &str) -> Vec<String> {
+    let mut cmd = settings.claude_base();
+    cmd.push("--session-id".to_string());
+    cmd.push(session_id.to_string());
+    cmd.push("--name".to_string());
+    cmd.push(name.to_string());
     cmd
 }
 
@@ -1062,50 +1080,6 @@ fn build_markdown_tab(
         cell_size,
         state: wrk_markdown::MarkdownViewState::new(),
     }))
-}
-
-/// For tabs spawned as new sessions, try to find the session ID that Claude
-/// created on disk. We wait at least 3 s after spawn to give Claude time to
-/// write its session file, then scan the project's session directory.
-fn detect_new_session_ids(app: &mut App) {
-    let Some(project_name) = app.active_project_name.clone() else {
-        return;
-    };
-    let Some(project_path) = app.active_project().map(|p| p.path.clone()) else {
-        return;
-    };
-    let Some(session) = app.sessions.get_mut(&project_name) else {
-        return;
-    };
-
-    let mut any_detected = false;
-    for tab in session.claude_tabs_mut() {
-        if !tab.detect_session_id || tab.session_id.is_some() {
-            continue;
-        }
-        let Some(spawn_time) = tab.spawn_time else {
-            continue;
-        };
-        let elapsed = spawn_time.elapsed().unwrap_or_default();
-        if elapsed < Duration::from_secs(3) {
-            continue;
-        }
-        if let Some(id) = session::find_session_created_after(&project_path, spawn_time) {
-            tab.session_id = Some(id);
-            tab.detect_session_id = false;
-            tab.spawn_time = None;
-            any_detected = true;
-        } else if elapsed > Duration::from_secs(30) {
-            // Give up waiting after 30 s.
-            tab.detect_session_id = false;
-            tab.spawn_time = None;
-        }
-    }
-
-    if any_detected {
-        let project_name = project_name.clone();
-        app.persist_claude_sessions(&project_name);
-    }
 }
 
 fn push_error(slot: &mut Option<String>, msg: String) {
@@ -1306,9 +1280,6 @@ fn event_loop(
                 _ => {}
             }
         }
-
-        // Try to detect the session ID for newly-spawned "new session" tabs.
-        detect_new_session_ids(app);
 
         // Reap dead children on the active session so the placeholder shows.
         if let Some(session) = app.active_session_mut() {
@@ -2775,7 +2746,8 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 mod tests {
     use super::{
         App, ClaudeTab, Focus, MarkdownTab, ModalState, Project, ProjectSession, ProjectStore,
-        Settings, Tab, expand_tilde, normalize_paste,
+        Settings, Tab, claude_new_command, claude_resume_command, expand_tilde, new_session_id,
+        normalize_paste,
     };
     use std::path::PathBuf;
 
@@ -2829,14 +2801,70 @@ mod tests {
         assert_eq!(expand_tilde("/a/~/b"), PathBuf::from("/a/~/b"));
     }
 
+    #[test]
+    fn resume_command_uses_resume_flag() {
+        let s = Settings::default();
+        assert_eq!(
+            claude_resume_command(&s, "abc-123"),
+            vec!["claude", "--resume", "abc-123"]
+        );
+    }
+
+    #[test]
+    fn new_command_pins_session_id_and_name() {
+        let s = Settings::default();
+        assert_eq!(
+            claude_new_command(&s, "abc-123", "my project"),
+            vec!["claude", "--session-id", "abc-123", "--name", "my project"]
+        );
+    }
+
+    #[test]
+    fn command_builders_honor_the_claude_base_wrapper() {
+        // A wrapper command (e.g. NixOS `steam-run`) with a trailing --continue
+        // that claude_base strips: both builders prepend the wrapper and append
+        // their own session flags.
+        let s = Settings {
+            claude_command: vec![
+                "steam-run".to_string(),
+                "claude".to_string(),
+                "--continue".to_string(),
+            ],
+            ..Settings::default()
+        };
+        assert_eq!(
+            claude_resume_command(&s, "id1"),
+            vec!["steam-run", "claude", "--resume", "id1"]
+        );
+        assert_eq!(
+            claude_new_command(&s, "id1", "proj"),
+            vec![
+                "steam-run",
+                "claude",
+                "--session-id",
+                "id1",
+                "--name",
+                "proj"
+            ]
+        );
+    }
+
+    #[test]
+    fn new_session_id_is_a_unique_uuid() {
+        let a = new_session_id();
+        let b = new_session_id();
+        assert_ne!(a, b);
+        // Canonical UUID: 36 chars, hyphens in the 8-4-4-4-12 positions.
+        assert_eq!(a.len(), 36);
+        assert!(uuid::Uuid::parse_str(&a).is_ok());
+    }
+
     fn claude_tab(name: &str) -> Tab {
         Tab::Claude(ClaudeTab {
             name: name.to_string(),
             session_id: None,
             status_id: String::new(),
             pane: None,
-            detect_session_id: false,
-            spawn_time: None,
         })
     }
 
