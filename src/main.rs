@@ -72,6 +72,11 @@ enum Command {
     InstallHooks,
     /// Remove the wrk-installed hooks and the `wrk-view` skill.
     UninstallHooks,
+    /// Push a status update to the running wrk instance. Invoked by the Claude
+    /// Code hooks installed by `install-hooks`; reads `WRK_SOCK`/`WRK_TAB` from
+    /// the environment and is a silent no-op outside a wrk session.
+    #[command(hide = true)]
+    Hook { kind: String },
 }
 
 fn main() -> Result<()> {
@@ -83,6 +88,7 @@ fn main() -> Result<()> {
         Some(Command::View { path }) => cmd_view(&path),
         Some(Command::InstallHooks) => cmd_install_hooks(),
         Some(Command::UninstallHooks) => cmd_uninstall_hooks(),
+        Some(Command::Hook { kind }) => cmd_hook(&kind),
         None => run_tui(),
     }
 }
@@ -98,11 +104,11 @@ fn cmd_view(path: &Path) -> Result<()> {
         .with_context(|| format!("resolving {}", path.display()))?;
 
     if let Ok(sock) = std::env::var("WRK_SOCK") {
-        let req = ipc::OpenRequest {
+        let req = ipc::Request::Open(ipc::OpenRequest {
             path: abs.to_string_lossy().into_owned(),
             project: std::env::var("WRK_PROJECT").ok(),
-        };
-        if ipc::send_open(Path::new(&sock), &req).is_ok() {
+        });
+        if ipc::send(Path::new(&sock), &req).is_ok() {
             println!("opened {} in wrk", abs.display());
             return Ok(());
         }
@@ -134,14 +140,30 @@ fn viewer_binary() -> PathBuf {
 
 fn cmd_install_hooks() -> Result<()> {
     let path = status::install_hooks()?;
-    let dir = status::ensure_status_dir()?;
     println!("installed hooks in {}", path.display());
-    println!("status files will live under {}", dir.display());
+    println!("hooks push status to the running wrk over its socket ($WRK_SOCK)");
     println!("(no-op for any Claude session not launched by wrk)");
     match status::install_skill() {
         Ok(skill) => println!("installed wrk-view skill in {}", skill.display()),
         Err(e) => eprintln!("warning: could not install wrk-view skill: {e}"),
     }
+    Ok(())
+}
+
+/// Push a status update to the running wrk instance. Invoked by Claude Code
+/// hooks as `wrk hook <kind>`; reads `WRK_SOCK` (the instance socket) and
+/// `WRK_TAB` (the originating tab id) from the environment. Best-effort and
+/// always exits 0 — a missing socket, stale instance, or unknown kind is a
+/// silent no-op so hooks never surface errors to Claude.
+fn cmd_hook(kind: &str) -> Result<()> {
+    let (Ok(sock), Ok(tab)) = (std::env::var("WRK_SOCK"), std::env::var("WRK_TAB")) else {
+        return Ok(());
+    };
+    let Some(kind) = status::StatusKind::from_arg(kind) else {
+        return Ok(());
+    };
+    let req = ipc::Request::Status(ipc::StatusUpdate { tab, kind });
+    let _ = ipc::send(Path::new(&sock), &req);
     Ok(())
 }
 
@@ -242,9 +264,13 @@ pub struct ClaudeTab {
     /// launches `claude --session-id <uuid>`, and records it here so every
     /// later open resumes deterministically via `--resume <uuid>`.
     pub session_id: Option<String>,
-    /// Unique ID for this tab's `WRK_STATUS_FILE` (stable for the lifetime of
-    /// the tab, independent of the Claude session ID).
+    /// Opaque per-tab id exported to the PTY as `WRK_TAB`, so hook-driven status
+    /// pushes (`wrk hook`) can be routed back to this tab. Stable for the tab's
+    /// lifetime, independent of the Claude session ID.
     pub status_id: String,
+    /// Latest hook-driven status (state + sub-agent count). Defaults to "no
+    /// event yet", at which point the UI falls back to the idle-time heuristic.
+    pub status: status::TabStatus,
     pub pane: Option<PtyPane>,
 }
 
@@ -535,7 +561,7 @@ impl App {
 
     /// Environment common to every PTY wrk spawns for a project: `WRK_PROJECT`
     /// (so `wrk view` can name its originating project) and `WRK_SOCK` (this
-    /// instance's IPC socket). Claude tabs additionally get `WRK_STATUS_FILE`.
+    /// instance's IPC socket). Claude tabs additionally get `WRK_TAB`.
     fn base_pty_env(&self, project_name: &str) -> Vec<(String, String)> {
         let mut env = vec![("WRK_PROJECT".to_string(), project_name.to_string())];
         if let Some(sock) = &self.socket_path {
@@ -573,6 +599,7 @@ impl App {
                     name: project.name.clone(),
                     session_id: None,
                     status_id: new_status_id(),
+                    status: status::TabStatus::default(),
                     pane: None,
                 }));
             } else {
@@ -581,6 +608,7 @@ impl App {
                         name: sr.name.clone(),
                         session_id: sr.session_id.clone(),
                         status_id: new_status_id(),
+                        status: status::TabStatus::default(),
                         pane: None,
                     }));
                 }
@@ -604,12 +632,8 @@ impl App {
                         cmd
                     }
                 };
-                let status_path = status::status_file_for_tab(&tab.status_id);
                 let mut env = base_env.clone();
-                env.push((
-                    "WRK_STATUS_FILE".to_string(),
-                    status_path.to_string_lossy().into_owned(),
-                ));
+                env.push(("WRK_TAB".to_string(), tab.status_id.clone()));
                 let spawned = PtyPane::spawn(
                     &cmd,
                     &project.path,
@@ -727,12 +751,8 @@ impl App {
             }
         };
         let status_id = new_status_id();
-        let status_path = status::status_file_for_tab(&status_id);
         let mut env = self.base_pty_env(&project_name);
-        env.push((
-            "WRK_STATUS_FILE".to_string(),
-            status_path.to_string_lossy().into_owned(),
-        ));
+        env.push(("WRK_TAB".to_string(), status_id.clone()));
 
         let pane = match PtyPane::spawn(
             &cmd,
@@ -753,6 +773,7 @@ impl App {
             name,
             session_id,
             status_id,
+            status: status::TabStatus::default(),
             pane,
         }));
         let new_idx = session.tabs.len() - 1;
@@ -839,6 +860,29 @@ impl App {
         }
     }
 
+    /// Route an [`ipc::Request`] drained from the socket to its handler.
+    fn handle_request(&mut self, req: ipc::Request) {
+        match req {
+            ipc::Request::Open(open) => self.handle_open_request(open),
+            ipc::Request::Status(update) => self.handle_status_update(update),
+        }
+    }
+
+    /// Apply a hook-pushed [`ipc::StatusUpdate`]: find the Claude tab whose
+    /// `status_id` matches `update.tab` (across all loaded sessions) and fold the
+    /// transition into its status. Unknown tab ids are ignored — a stale push
+    /// from a tab that was closed simply has no target.
+    fn handle_status_update(&mut self, update: ipc::StatusUpdate) {
+        for session in self.sessions.values_mut() {
+            for tab in session.claude_tabs_mut() {
+                if tab.status_id == update.tab {
+                    tab.status.apply(update.kind);
+                    return;
+                }
+            }
+        }
+    }
+
     /// Close the currently active tab. Markdown tabs are closed freely; a Claude
     /// tab is only closed when another Claude tab remains, so a project always
     /// keeps at least one Claude session. Persists only when a Claude tab was
@@ -903,13 +947,9 @@ impl App {
         let Some(session) = self.sessions.remove(name) else {
             return false;
         };
-        // Best-effort: remove the per-tab status files so a stale status dot
-        // doesn't linger for a project that's no longer loaded.
-        for tab in session.claude_tabs() {
-            status::remove_tab_status(&tab.status_id);
-        }
         // Dropping `session` here kills its child processes and joins their
-        // reader threads (see `PtyPane`'s Drop impl).
+        // reader threads (see `PtyPane`'s Drop impl). In-memory status goes with
+        // it — there are no on-disk status files to clean up.
         drop(session);
 
         // If we just unloaded the active project, return to the empty state so
@@ -1109,10 +1149,11 @@ fn run_tui() -> Result<()> {
         eprintln!("warning: failed to load settings.toml: {e}; using defaults");
         Settings::default()
     });
-    let _ = status::ensure_status_dir();
     let mut app = App::new(store, settings);
 
-    // IPC socket for `wrk view` run inside a pane. Non-fatal if it can't bind.
+    // IPC socket for `wrk view` and `wrk hook` run inside a pane. Non-fatal if
+    // it can't bind — `wrk view` falls back to the pager and hook status pushes
+    // are simply dropped.
     let (socket_path, ipc_rx) = match ipc::serve() {
         Ok((p, rx)) => (Some(p), Some(rx)),
         Err(e) => {
@@ -1229,7 +1270,7 @@ fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
     watch_rx: Receiver<()>,
-    ipc_rx: Option<Receiver<ipc::OpenRequest>>,
+    ipc_rx: Option<Receiver<ipc::Request>>,
 ) -> Result<()> {
     while !app.should_quit {
         terminal.draw(|frame| ui::draw(frame, app))?;
@@ -1262,10 +1303,11 @@ fn event_loop(
             let _ = app.reload_store();
         }
 
-        // Drain IPC open-file requests from `wrk view`.
+        // Drain IPC requests: `wrk view` open-file requests and `wrk hook`
+        // status pushes.
         if let Some(rx) = &ipc_rx {
             while let Ok(req) = rx.try_recv() {
-                app.handle_open_request(req);
+                app.handle_request(req);
             }
         }
 
@@ -2864,6 +2906,7 @@ mod tests {
             name: name.to_string(),
             session_id: None,
             status_id: String::new(),
+            status: crate::status::TabStatus::default(),
             pane: None,
         })
     }
@@ -2926,6 +2969,45 @@ mod tests {
         let s = app.active_session().unwrap();
         assert_eq!(s.tabs.len(), 1);
         assert!(matches!(s.tabs[0], Tab::Claude(_)));
+    }
+
+    #[test]
+    fn status_update_routes_to_matching_tab_by_id() {
+        use crate::ipc::StatusUpdate;
+        use crate::status::{HookEvent, StatusKind};
+
+        let mut app = app_with_tabs(vec![claude_tab("a"), md_tab("m"), claude_tab("b")]);
+        // Give the two Claude tabs distinct ids (the markdown tab is skipped).
+        {
+            let s = app.sessions.get_mut("p").unwrap();
+            for (tab, id) in s.tabs.iter_mut().zip(["ta", "", "tb"]) {
+                if let Tab::Claude(c) = tab {
+                    c.status_id = id.to_string();
+                }
+            }
+        }
+
+        app.handle_status_update(StatusUpdate {
+            tab: "tb".into(),
+            kind: StatusKind::Waiting,
+        });
+        app.handle_status_update(StatusUpdate {
+            tab: "ta".into(),
+            kind: StatusKind::SubagentStart,
+        });
+        // An unknown id must be a harmless no-op.
+        app.handle_status_update(StatusUpdate {
+            tab: "ghost".into(),
+            kind: StatusKind::Busy,
+        });
+
+        let s = app.active_session().unwrap();
+        let a = s.tabs[0].as_claude().unwrap();
+        let b = s.tabs[2].as_claude().unwrap();
+        assert_eq!(a.status.event, None);
+        assert_eq!(a.status.subagents, 1);
+        assert_eq!(b.status.event, Some(HookEvent::Waiting));
+        assert_eq!(b.status.subagents, 0);
     }
 
     #[test]

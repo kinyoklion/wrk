@@ -1,12 +1,14 @@
-//! Per-instance IPC so `wrk view <file>` run inside a wrk pane can tell the
-//! running TUI to open a markdown tab.
+//! Per-instance IPC so external `wrk` invocations can talk to the running TUI.
 //!
 //! Each running TUI binds a Unix domain socket at
 //! `<runtime>/wrk/sock/wrk-<pid>.sock` and exports its path to every spawned
-//! PTY as `WRK_SOCK` (with `WRK_PROJECT` naming the owning project). A `wrk
-//! view` invoked inside such a pane connects, writes one line of JSON, and
-//! disconnects; the server accepts one request per connection and forwards it
-//! to the event loop over a channel.
+//! PTY as `WRK_SOCK` (with `WRK_PROJECT` naming the owning project and, for
+//! Claude tabs, `WRK_TAB` identifying the tab). Two callers connect, write one
+//! line of JSON, and disconnect: `wrk view <file>` sends a [`Request::Open`]
+//! that becomes a markdown tab, and `wrk hook <kind>` (from Claude Code hooks)
+//! sends a [`Request::Status`] that updates the originating tab's sidebar
+//! status. The server accepts one request per connection and forwards it to the
+//! event loop over a channel.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -15,6 +17,19 @@ use std::sync::mpsc::{Receiver, channel};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::status::StatusKind;
+
+/// One line-JSON message from an external `wrk` invocation to the running TUI.
+/// Internally tagged by `cmd` so a single socket carries both request kinds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "cmd", rename_all = "lowercase")]
+pub enum Request {
+    /// Open a file as a markdown tab (`wrk view`).
+    Open(OpenRequest),
+    /// Update a Claude tab's status (`wrk hook`).
+    Status(StatusUpdate),
+}
 
 /// A request to open a file in a running wrk instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,12 +42,18 @@ pub struct OpenRequest {
     pub project: Option<String>,
 }
 
-/// Directory holding per-instance sockets (sibling of the status dir).
+/// A status push from a Claude Code hook, tagging the originating tab.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusUpdate {
+    /// The tab's opaque id (from `WRK_TAB`).
+    pub tab: String,
+    /// The state transition.
+    pub kind: StatusKind,
+}
+
+/// Directory holding per-instance sockets.
 pub fn socket_dir() -> PathBuf {
-    crate::status::status_dir()
-        .parent()
-        .map(|p| p.join("sock"))
-        .unwrap_or_else(|| PathBuf::from("/tmp/wrk/sock"))
+    crate::status::runtime_dir().join("sock")
 }
 
 /// Socket path for the given process id.
@@ -41,10 +62,10 @@ pub fn socket_path(pid: u32) -> PathBuf {
 }
 
 /// Bind this process's socket and spawn an accept thread that forwards each
-/// parsed [`OpenRequest`] over the returned channel. Returns the socket path
-/// (for the env export and cleanup on exit) and the receiver (drained by the
-/// event loop).
-pub fn serve() -> Result<(PathBuf, Receiver<OpenRequest>)> {
+/// parsed [`Request`] over the returned channel. Returns the socket path (for
+/// the env export and cleanup on exit) and the receiver (drained by the event
+/// loop).
+pub fn serve() -> Result<(PathBuf, Receiver<Request>)> {
     let dir = socket_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = socket_path(std::process::id());
@@ -54,7 +75,7 @@ pub fn serve() -> Result<(PathBuf, Receiver<OpenRequest>)> {
     let listener =
         UnixListener::bind(&path).with_context(|| format!("binding {}", path.display()))?;
 
-    let (tx, rx) = channel::<OpenRequest>();
+    let (tx, rx) = channel::<Request>();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else {
@@ -70,17 +91,17 @@ pub fn serve() -> Result<(PathBuf, Receiver<OpenRequest>)> {
     Ok((path, rx))
 }
 
-fn read_request(stream: UnixStream) -> Option<OpenRequest> {
+fn read_request(stream: UnixStream) -> Option<Request> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line).ok()?;
     serde_json::from_str(line.trim()).ok()
 }
 
-/// Client side: connect to `sock` and send one open request. Fails fast when
-/// the socket is gone (e.g. a stale `WRK_SOCK` from an instance that exited),
-/// so the caller can fall back to the standalone viewer.
-pub fn send_open(sock: &Path, req: &OpenRequest) -> Result<()> {
+/// Client side: connect to `sock` and send one request. Fails fast when the
+/// socket is gone (e.g. a stale `WRK_SOCK` from an instance that exited), so the
+/// caller can fall back (e.g. to the standalone viewer) or silently ignore it.
+pub fn send(sock: &Path, req: &Request) -> Result<()> {
     let mut stream =
         UnixStream::connect(sock).with_context(|| format!("connecting to {}", sock.display()))?;
     let mut payload = serde_json::to_string(req)?;
@@ -96,20 +117,38 @@ mod tests {
 
     #[test]
     fn open_request_json_round_trip() {
-        let req = OpenRequest {
+        let req = Request::Open(OpenRequest {
             path: "/tmp/doc.md".to_string(),
             project: Some("web".to_string()),
-        };
+        });
         let json = serde_json::to_string(&req).unwrap();
-        let back: OpenRequest = serde_json::from_str(&json).unwrap();
+        assert!(json.contains(r#""cmd":"open""#));
+        let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
     }
 
     #[test]
-    fn project_defaults_to_none_when_absent() {
-        let req: OpenRequest = serde_json::from_str(r#"{"path":"/a/b.md"}"#).unwrap();
-        assert_eq!(req.path, "/a/b.md");
-        assert_eq!(req.project, None);
+    fn status_request_json_round_trip() {
+        let req = Request::Status(StatusUpdate {
+            tab: "tab3".to_string(),
+            kind: StatusKind::Waiting,
+        });
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"cmd":"status","tab":"tab3","kind":"waiting"}"#);
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn open_project_defaults_to_none_when_absent() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"open","path":"/a/b.md"}"#).unwrap();
+        assert_eq!(
+            req,
+            Request::Open(OpenRequest {
+                path: "/a/b.md".to_string(),
+                project: None,
+            })
+        );
     }
 
     #[test]

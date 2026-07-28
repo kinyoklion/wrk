@@ -1,95 +1,159 @@
-//! Per-project status files written by Claude Code hooks.
+//! Claude Code status signalling.
 //!
-//! When wrk spawns a Claude session, it sets `WRK_STATUS_FILE` to a
-//! per-project path under `$XDG_RUNTIME_DIR/wrk/status/` (or a `/tmp`
-//! fallback). Hooks installed in `~/.claude/settings.json` write the
-//! event name into that file each time Claude transitions state.
+//! When wrk spawns a Claude session it sets `WRK_SOCK` (this instance's IPC
+//! socket) and `WRK_TAB` (an opaque per-tab id). Claude Code hooks installed in
+//! `~/.claude/settings.json` invoke `wrk hook <kind>`, which connects to
+//! `WRK_SOCK` and pushes a one-line status update tagged with `WRK_TAB`. The
+//! running TUI drains those updates and reflects them in the sidebar — no files,
+//! no polling. Sessions not launched by wrk have no `WRK_SOCK`, so the guarded
+//! hook command is a no-op for them.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// Hook events we care about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HookEvent {
-    UserPromptSubmit,
-    Stop,
-    Notification,
+/// A status transition pushed by a Claude Code hook (`wrk hook <kind>`). This is
+/// the wire vocabulary carried by `ipc::StatusUpdate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StatusKind {
+    /// The user submitted a prompt — Claude is actively working.
+    Busy,
+    /// Claude finished its turn and is idle.
+    Stopped,
+    /// Claude is blocked waiting for the user (permission / input).
+    Waiting,
+    /// A sub-agent (Task tool) started.
+    SubagentStart,
+    /// A sub-agent finished.
+    SubagentStop,
 }
 
-const EVENTS: &[(&str, &str)] = &[
-    ("UserPromptSubmit", "UserPromptSubmit"),
-    ("Stop", "Stop"),
-    ("Notification", "Notification"),
-];
+impl StatusKind {
+    /// Parse the positional argument of `wrk hook <kind>`.
+    pub fn from_arg(s: &str) -> Option<Self> {
+        Some(match s {
+            "busy" => Self::Busy,
+            "stopped" => Self::Stopped,
+            "waiting" => Self::Waiting,
+            "subagent-start" => Self::SubagentStart,
+            "subagent-stop" => Self::SubagentStop,
+            _ => return None,
+        })
+    }
+}
 
-/// Substring marker that identifies an entry as one of ours when scanning
-/// existing settings.json (e.g. for uninstall or de-dup).
-const HOOK_MARKER: &str = "WRK_STATUS_FILE";
+/// The last state-changing event seen for a tab (sub-agent start/stop only move
+/// the counter, they don't change this).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookEvent {
+    /// Actively working.
+    Busy,
+    /// Finished its turn, idle.
+    Stopped,
+    /// Waiting for the user (permission / input).
+    Waiting,
+}
 
-pub fn status_dir() -> PathBuf {
+/// Live status for a single Claude tab, updated from hook pushes. `event` is
+/// `None` until the first hook fires, at which point the UI switches from the
+/// idle-time heuristic to precise hook state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TabStatus {
+    pub event: Option<HookEvent>,
+    /// Number of sub-agents currently running (for future UI enrichment).
+    pub subagents: u32,
+}
+
+impl TabStatus {
+    /// Fold a hook update into this status.
+    pub fn apply(&mut self, kind: StatusKind) {
+        match kind {
+            StatusKind::Busy => self.event = Some(HookEvent::Busy),
+            StatusKind::Stopped => self.event = Some(HookEvent::Stopped),
+            StatusKind::Waiting => self.event = Some(HookEvent::Waiting),
+            StatusKind::SubagentStart => self.subagents = self.subagents.saturating_add(1),
+            StatusKind::SubagentStop => self.subagents = self.subagents.saturating_sub(1),
+        }
+    }
+}
+
+/// Base runtime directory for this user's wrk instance (holds the `sock/`
+/// subdir). Prefers `$XDG_RUNTIME_DIR/wrk`, falling back to `/tmp/wrk-<user>`.
+pub fn runtime_dir() -> PathBuf {
     if let Some(dirs) = directories::ProjectDirs::from("", "", "wrk")
         && let Some(runtime) = dirs.runtime_dir()
     {
-        return runtime.join("status");
+        return runtime.to_path_buf();
     }
     let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
-    PathBuf::from(format!("/tmp/wrk-{user}/status"))
+    PathBuf::from(format!("/tmp/wrk-{user}"))
 }
 
-pub fn ensure_status_dir() -> Result<PathBuf> {
-    let dir = status_dir();
-    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    Ok(dir)
+/// One installed hook: the Claude Code event, its tool matcher (empty = all),
+/// and the `wrk hook` kind argument it fires.
+struct HookSpec {
+    event: &'static str,
+    matcher: &'static str,
+    kind: &'static str,
 }
 
-/// Status file path for an individual Claude tab, keyed by a runtime-assigned
-/// `tab_status_id` (an opaque string unique per spawned tab).
-pub fn status_file_for_tab(tab_status_id: &str) -> PathBuf {
-    status_dir().join(format!("{}.status", sanitize(tab_status_id)))
+const HOOKS: &[HookSpec] = &[
+    HookSpec {
+        event: "UserPromptSubmit",
+        matcher: "",
+        kind: "busy",
+    },
+    HookSpec {
+        event: "Stop",
+        matcher: "",
+        kind: "stopped",
+    },
+    HookSpec {
+        event: "Notification",
+        matcher: "",
+        kind: "waiting",
+    },
+    HookSpec {
+        event: "PreToolUse",
+        matcher: "Task",
+        kind: "subagent-start",
+    },
+    HookSpec {
+        event: "SubagentStop",
+        matcher: "",
+        kind: "subagent-stop",
+    },
+];
+
+/// Substrings that identify a hook entry as one wrk wrote. `WRK_SOCK` marks the
+/// current socket-push commands; `WRK_STATUS_FILE` marks the legacy file-polling
+/// commands so re-running `install-hooks` upgrades (and `uninstall-hooks`
+/// removes) older installs.
+const HOOK_MARKERS: &[&str] = &["WRK_SOCK", "WRK_STATUS_FILE"];
+
+fn command_is_ours(cmd: &str) -> bool {
+    HOOK_MARKERS.iter().any(|m| cmd.contains(m))
 }
 
-/// Remove a tab's status file (best-effort). Called when a project's session
-/// is unloaded so a stale status dot doesn't linger in the sidebar.
-pub fn remove_tab_status(tab_status_id: &str) {
-    let _ = fs::remove_file(status_file_for_tab(tab_status_id));
+/// Absolute path to the running `wrk` binary, for embedding in hook commands.
+/// Falls back to a bare `wrk` (resolved via `PATH`) if it can't be determined.
+fn wrk_binary() -> String {
+    std::env::current_exe()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "wrk".to_string())
 }
 
-pub fn read_tab_status(tab_status_id: &str) -> Option<HookEvent> {
-    let path = status_file_for_tab(tab_status_id);
-    let content = fs::read_to_string(&path).ok()?;
-    parse_event(content.trim())
-}
-
-fn parse_event(s: &str) -> Option<HookEvent> {
-    match s {
-        "UserPromptSubmit" => Some(HookEvent::UserPromptSubmit),
-        "Stop" => Some(HookEvent::Stop),
-        "Notification" => Some(HookEvent::Notification),
-        _ => None,
-    }
-}
-
-fn sanitize(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-fn hook_command(event: &str) -> String {
-    // The trailing `; true` ensures we exit 0 even when WRK_STATUS_FILE is
-    // unset (i.e. the session wasn't launched by wrk) — otherwise the failed
-    // `[ -n "" ]` test would propagate as exit 1 and Claude Code would log a
-    // hook error.
-    format!(r#"[ -n "$WRK_STATUS_FILE" ] && printf '{event}' > "$WRK_STATUS_FILE"; true"#)
+fn hook_command(wrk: &str, kind: &str) -> String {
+    // Guard on WRK_SOCK so a Claude session not launched by wrk is a no-op; the
+    // trailing `; true` keeps the hook's exit status 0 either way (a failed
+    // `[ -n "" ]` test would otherwise be logged as a hook error). `wrk hook`
+    // itself never fails, but we still swallow its output for tidiness.
+    format!(r#"[ -n "$WRK_SOCK" ] && "{wrk}" hook {kind} >/dev/null 2>&1; true"#)
 }
 
 fn settings_path() -> Result<PathBuf> {
@@ -192,9 +256,16 @@ fn write_settings(path: &Path, value: &Value) -> Result<()> {
 
 pub fn install_hooks() -> Result<PathBuf> {
     let path = settings_path()?;
-    let mut settings = read_settings(&path)?;
+    install_hooks_at(&path, &wrk_binary())?;
+    Ok(path)
+}
 
-    // Ensure top-level is an object.
+/// Merge wrk's hook entries into the settings.json at `path`, embedding `wrk` as
+/// the binary path in each command. Split out from [`install_hooks`] so tests
+/// can drive it against a temp file with a deterministic binary path.
+fn install_hooks_at(path: &Path, wrk: &str) -> Result<()> {
+    let mut settings = read_settings(path)?;
+
     if !settings.is_object() {
         return Err(anyhow!("{} top-level is not a JSON object", path.display()));
     }
@@ -205,18 +276,22 @@ pub fn install_hooks() -> Result<PathBuf> {
     }
     let hooks_obj = hooks_entry.as_object_mut().unwrap();
 
-    for (event, payload) in EVENTS {
+    for spec in HOOKS {
         let arr_entry = hooks_obj
-            .entry((*event).to_string())
+            .entry(spec.event.to_string())
             .or_insert_with(|| json!([]));
         if !arr_entry.is_array() {
-            return Err(anyhow!("settings.json: hooks.{event} is not an array"));
+            return Err(anyhow!(
+                "settings.json: hooks.{} is not an array",
+                spec.event
+            ));
         }
         let arr = arr_entry.as_array_mut().unwrap();
-        let new_cmd = hook_command(payload);
+        let new_cmd = hook_command(wrk, spec.kind);
 
         // If a wrk-marked entry exists, refresh its command (so re-running
-        // install-hooks picks up bug fixes). Otherwise append a new entry.
+        // install-hooks upgrades legacy file-polling commands and picks up bug
+        // fixes). Otherwise append a new entry.
         let mut found = false;
         for entry in arr.iter_mut() {
             if !entry_has_marker(entry) {
@@ -228,7 +303,7 @@ pub fn install_hooks() -> Result<PathBuf> {
                     let is_ours = h
                         .get("command")
                         .and_then(|c| c.as_str())
-                        .is_some_and(|c| c.contains(HOOK_MARKER));
+                        .is_some_and(command_is_ours);
                     if is_ours {
                         h["command"] = json!(new_cmd.clone());
                     }
@@ -237,7 +312,7 @@ pub fn install_hooks() -> Result<PathBuf> {
         }
         if !found {
             arr.push(json!({
-                "matcher": "",
+                "matcher": spec.matcher,
                 "hooks": [{
                     "type": "command",
                     "command": new_cmd,
@@ -246,28 +321,34 @@ pub fn install_hooks() -> Result<PathBuf> {
         }
     }
 
-    write_settings(&path, &settings)?;
-    Ok(path)
+    write_settings(path, &settings)
 }
 
 pub fn uninstall_hooks() -> Result<(PathBuf, usize)> {
     let path = settings_path()?;
+    let removed = uninstall_hooks_at(&path)?;
+    Ok((path, removed))
+}
+
+fn uninstall_hooks_at(path: &Path) -> Result<usize> {
     if !path.exists() {
-        return Ok((path, 0));
+        return Ok(0);
     }
-    let mut settings = read_settings(&path)?;
+    let mut settings = read_settings(path)?;
     let Some(root) = settings.as_object_mut() else {
-        return Ok((path, 0));
+        return Ok(0);
     };
     let Some(hooks_entry) = root.get_mut("hooks") else {
-        return Ok((path, 0));
+        return Ok(0);
     };
     let Some(hooks_obj) = hooks_entry.as_object_mut() else {
-        return Ok((path, 0));
+        return Ok(0);
     };
 
     let mut removed = 0usize;
-    let event_keys: Vec<String> = EVENTS.iter().map(|(e, _)| (*e).to_string()).collect();
+    // Scan every hook event, not just the ones we install today — a legacy
+    // install may have entries under events we no longer use.
+    let event_keys: Vec<String> = hooks_obj.keys().cloned().collect();
     for event in &event_keys {
         if let Some(arr_entry) = hooks_obj.get_mut(event)
             && let Some(arr) = arr_entry.as_array_mut()
@@ -277,7 +358,7 @@ pub fn uninstall_hooks() -> Result<(PathBuf, usize)> {
             removed += before - arr.len();
         }
     }
-    // Drop empty event arrays we created.
+    // Drop event arrays we emptied.
     for event in &event_keys {
         let drop = hooks_obj
             .get(event)
@@ -287,13 +368,12 @@ pub fn uninstall_hooks() -> Result<(PathBuf, usize)> {
             hooks_obj.remove(event);
         }
     }
-    let drop_hooks = hooks_obj.is_empty();
-    if drop_hooks {
+    if hooks_obj.is_empty() {
         root.remove("hooks");
     }
 
-    write_settings(&path, &settings)?;
-    Ok((path, removed))
+    write_settings(path, &settings)?;
+    Ok(removed)
 }
 
 fn entry_has_marker(entry: &Value) -> bool {
@@ -303,7 +383,7 @@ fn entry_has_marker(entry: &Value) -> bool {
     hooks.iter().any(|h| {
         h.get("command")
             .and_then(|c| c.as_str())
-            .is_some_and(|c| c.contains(HOOK_MARKER))
+            .is_some_and(command_is_ours)
     })
 }
 
@@ -312,12 +392,148 @@ mod tests {
     use super::*;
 
     #[test]
+    fn status_kind_round_trips_from_arg() {
+        for (arg, kind) in [
+            ("busy", StatusKind::Busy),
+            ("stopped", StatusKind::Stopped),
+            ("waiting", StatusKind::Waiting),
+            ("subagent-start", StatusKind::SubagentStart),
+            ("subagent-stop", StatusKind::SubagentStop),
+        ] {
+            assert_eq!(StatusKind::from_arg(arg), Some(kind));
+        }
+        assert_eq!(StatusKind::from_arg("nope"), None);
+    }
+
+    #[test]
+    fn status_kind_serde_is_kebab_case() {
+        assert_eq!(
+            serde_json::to_string(&StatusKind::SubagentStart).unwrap(),
+            "\"subagent-start\""
+        );
+        let back: StatusKind = serde_json::from_str("\"waiting\"").unwrap();
+        assert_eq!(back, StatusKind::Waiting);
+    }
+
+    #[test]
+    fn tab_status_apply_tracks_event_and_subagents() {
+        let mut s = TabStatus::default();
+        assert_eq!(s.event, None);
+        s.apply(StatusKind::Busy);
+        assert_eq!(s.event, Some(HookEvent::Busy));
+        s.apply(StatusKind::SubagentStart);
+        s.apply(StatusKind::SubagentStart);
+        assert_eq!(s.subagents, 2);
+        assert_eq!(s.event, Some(HookEvent::Busy)); // sub-agents don't change event
+        s.apply(StatusKind::SubagentStop);
+        assert_eq!(s.subagents, 1);
+        s.apply(StatusKind::Stopped);
+        assert_eq!(s.event, Some(HookEvent::Stopped));
+        // Underflow is clamped, never panics.
+        s.apply(StatusKind::SubagentStop);
+        s.apply(StatusKind::SubagentStop);
+        assert_eq!(s.subagents, 0);
+    }
+
+    #[test]
+    fn hook_command_guards_on_socket_and_invokes_wrk() {
+        let cmd = hook_command("/usr/bin/wrk", "busy");
+        assert!(cmd.contains(r#"[ -n "$WRK_SOCK" ]"#));
+        assert!(cmd.contains(r#""/usr/bin/wrk" hook busy"#));
+        assert!(cmd.trim_end().ends_with("; true"));
+        assert!(command_is_ours(&cmd));
+    }
+
+    #[test]
+    fn command_is_ours_matches_current_and_legacy() {
+        assert!(command_is_ours(
+            r#"[ -n "$WRK_SOCK" ] && wrk hook stopped; true"#
+        ));
+        assert!(command_is_ours(
+            r#"printf 'Stop' > "$WRK_STATUS_FILE"; true"#
+        ));
+        assert!(!command_is_ours("notify-send done"));
+    }
+
+    #[test]
+    fn install_writes_all_events_with_matchers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        install_hooks_at(&path, "/opt/wrk").unwrap();
+
+        let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let hooks = v["hooks"].as_object().unwrap();
+        for spec in HOOKS {
+            let arr = hooks[spec.event].as_array().unwrap();
+            assert_eq!(arr.len(), 1, "event {}", spec.event);
+            assert_eq!(arr[0]["matcher"], spec.matcher);
+            let cmd = arr[0]["hooks"][0]["command"].as_str().unwrap();
+            assert!(
+                cmd.contains(&format!("hook {}", spec.kind)),
+                "event {}",
+                spec.event
+            );
+        }
+    }
+
+    #[test]
+    fn install_upgrades_legacy_entries_without_duplicating() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // A legacy file-polling install.
+        let legacy = json!({
+            "hooks": {
+                "Stop": [{
+                    "matcher": "",
+                    "hooks": [{ "type": "command", "command": "printf 'Stop' > \"$WRK_STATUS_FILE\"; true" }]
+                }]
+            }
+        });
+        fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        install_hooks_at(&path, "/opt/wrk").unwrap();
+        let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let stop = v["hooks"]["Stop"].as_array().unwrap();
+        // Refreshed in place — not duplicated.
+        assert_eq!(stop.len(), 1);
+        let cmd = stop[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains(r#""/opt/wrk" hook stopped"#));
+        assert!(!cmd.contains("WRK_STATUS_FILE"));
+    }
+
+    #[test]
+    fn uninstall_removes_current_and_legacy_and_preserves_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let settings = json!({
+            "hooks": {
+                "Stop": [
+                    { "matcher": "", "hooks": [{ "type": "command", "command": "printf 'Stop' > \"$WRK_STATUS_FILE\"; true" }] },
+                    { "matcher": "", "hooks": [{ "type": "command", "command": "my-own-hook" }] }
+                ],
+                "PreToolUse": [
+                    { "matcher": "Task", "hooks": [{ "type": "command", "command": "[ -n \"$WRK_SOCK\" ] && wrk hook subagent-start; true" }] }
+                ]
+            }
+        });
+        fs::write(&path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+
+        let removed = uninstall_hooks_at(&path).unwrap();
+        assert_eq!(removed, 2);
+        let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        // The user's own Stop hook survives; the emptied PreToolUse array is gone.
+        let stop = v["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1);
+        assert_eq!(stop[0]["hooks"][0]["command"], "my-own-hook");
+        assert!(v["hooks"].get("PreToolUse").is_none());
+    }
+
+    #[test]
     fn skill_markdown_has_name_and_marker() {
         let md = skill_markdown();
         assert!(md.contains("name: wrk-view"));
         assert!(md.contains("allowed-tools: Bash(wrk view *)"));
         assert!(md.contains(SKILL_INSTALL_MARKER));
-        // description + triggers keep the frontmatter well under the 1536-char cap.
         assert!(md.len() < 1536);
     }
 
@@ -334,7 +550,6 @@ mod tests {
         assert_eq!(removed, Some(claude.join("skills/wrk-view")));
         assert!(!path.exists());
 
-        // Second uninstall is a no-op.
         assert_eq!(uninstall_skill_in(&claude).unwrap(), None);
     }
 
@@ -344,41 +559,9 @@ mod tests {
         let claude = home.path().join(".claude");
         let dir = claude.join("skills/wrk-view");
         fs::create_dir_all(&dir).unwrap();
-        // A user's own skill that happens to share the name (no wrk marker).
         fs::write(dir.join("SKILL.md"), "---\nname: wrk-view\n---\nmine\n").unwrap();
 
         assert_eq!(uninstall_skill_in(&claude).unwrap(), None);
         assert!(dir.join("SKILL.md").exists());
-    }
-
-    #[test]
-    fn sanitize_strips_unsafe_chars() {
-        assert_eq!(sanitize("foo bar/baz"), "foo_bar_baz");
-        assert_eq!(sanitize("ok.name-1_2"), "ok.name-1_2");
-    }
-
-    #[test]
-    fn parse_event_round_trip() {
-        assert_eq!(parse_event("Stop"), Some(HookEvent::Stop));
-        assert_eq!(
-            parse_event("UserPromptSubmit"),
-            Some(HookEvent::UserPromptSubmit)
-        );
-        assert_eq!(parse_event("Notification"), Some(HookEvent::Notification));
-        assert_eq!(parse_event("nope"), None);
-    }
-
-    #[test]
-    fn entry_marker_detection() {
-        let ours = json!({
-            "matcher": "",
-            "hooks": [{ "type": "command", "command": "echo X > $WRK_STATUS_FILE" }]
-        });
-        let other = json!({
-            "matcher": "",
-            "hooks": [{ "type": "command", "command": "notify-send done" }]
-        });
-        assert!(entry_has_marker(&ours));
-        assert!(!entry_has_marker(&other));
     }
 }
