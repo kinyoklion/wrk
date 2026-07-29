@@ -277,8 +277,8 @@ checksum = "8f1fe948ff07f4bd06c30984e69f5b4899c516a3ef74f34df92a2df2ab535495"
 
 [[package]]
 name = "carcimaid"
-version = "0.1.4"
-source = "git+https://github.com/kinyoklion/carcimaid.git?tag=carcimaid-v0.1.4#e34fff9554a0162486ac548f936dc82700748fa1"
+version = "0.1.5"
+source = "git+https://github.com/kinyoklion/carcimaid.git?tag=carcimaid-v0.1.5#1b3fe3f1831219ac33bd3f92ca37dea91e691a30"
 dependencies = [
  "dagre",
  "roughr",
@@ -2127,8 +2127,8 @@ dependencies = [
 
 [[package]]
 name = "roughr"
-version = "0.1.4"
-source = "git+https://github.com/kinyoklion/carcimaid.git?tag=carcimaid-v0.1.4#e34fff9554a0162486ac548f936dc82700748fa1"
+version = "0.1.5"
+source = "git+https://github.com/kinyoklion/carcimaid.git?tag=carcimaid-v0.1.5#1b3fe3f1831219ac33bd3f92ca37dea91e691a30"
 
 [[package]]
 name = "roxmltree"
