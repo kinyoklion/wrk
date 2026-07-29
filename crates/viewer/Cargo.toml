@@ -1,7 +1,7 @@
 [package]
 name = "wrk-md"
 description = "Standalone terminal markdown viewer (pager) built on the wrk-markdown renderer."
-version = "0.1.14" # x-release-please-version
+version = "0.1.15" # x-release-please-version
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

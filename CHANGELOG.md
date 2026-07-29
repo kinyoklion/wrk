@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.15](https://github.com/kinyoklion/wrk/compare/wrk-v0.1.14...wrk-v0.1.15) (2026-07-29)
+
+### Features
+
+* **status:** push hook status over the socket instead of polling files (#30) (#78) ([#30](https://github.com/kinyoklion/wrk/issues/30)) ([#78](https://github.com/kinyoklion/wrk/issues/78))
+
+### Bug Fixes
+
+* deterministic session IDs, named after the project (#62) (#76) ([#62](https://github.com/kinyoklion/wrk/issues/62)) ([#76](https://github.com/kinyoklion/wrk/issues/76)) ([#62](https://github.com/kinyoklion/wrk/issues/62)) ([#62](https://github.com/kinyoklion/wrk/issues/62))
+
 ## [0.1.14](https://github.com/kinyoklion/wrk/compare/wrk-v0.1.13...wrk-v0.1.14) (2026-07-17)
 
 ### Features
