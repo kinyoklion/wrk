@@ -42,9 +42,10 @@ project. Linux-only, native rendering (via your terminal), built on
 - **Two layouts per project, persisted**: split (claude | shell side-by-side,
   resizable) or tabbed (one content area, claude/shell as tabs). Stored in
   `projects.toml` as `layout = "split" | "tabbed"`.
-- **Status indicators** in the sidebar — green ● when claude is waiting for
-  input, yellow · while busy, red ● on a Notification (permission prompt).
-  Driven by Claude Code hooks when installed (precise), with a
+- **Status indicators** in the sidebar — green ● when claude has stopped
+  (finished its turn), yellow · while busy, red ● when it is waiting on you
+  (a permission prompt or other Notification). Driven by Claude Code hooks when
+  installed (precise — the hooks push state over a socket, no polling), with a
   time-since-output heuristic as fallback. A trailing `*` marks a project with
   a live session — bright on the active project, dim on ones loaded in the
   background. Press `u` on the projects pane to unload one.
@@ -365,12 +366,15 @@ dump_grid                = "Alt+x"   # diagnostic: dump the focused PTY grid
 
 ### Status hooks (`wrk install-hooks`)
 
-Adds three entries to `~/.claude/settings.json` (`UserPromptSubmit`, `Stop`,
-`Notification`) that write event names to a per-session status file. The hook
-commands are gated on `[ -n "$WRK_STATUS_FILE" ]` and only fire for Claude
-sessions launched by wrk — other sessions are unaffected. Re-run
-`install-hooks` to pick up updates; `uninstall-hooks` removes only the
-wrk-installed entries.
+Adds hook entries to `~/.claude/settings.json` — `UserPromptSubmit` (busy),
+`Stop` (stopped), `Notification` (waiting on you), plus `PreToolUse`/`Task` and
+`SubagentStop` to track sub-agents — that run `wrk hook <kind>`. That command
+pushes the state to the running wrk over its Unix socket (`WRK_SOCK`), tagged
+with the tab id (`WRK_TAB`); there are no status files and no polling. The hook
+commands are gated on `[ -n "$WRK_SOCK" ]` and only fire for Claude sessions
+launched by wrk — other sessions are unaffected. Re-run `install-hooks` to pick
+up updates (it also upgrades older file-based installs in place);
+`uninstall-hooks` removes only the wrk-installed entries.
 
 ## License
 

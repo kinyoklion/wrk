@@ -13,7 +13,7 @@ use std::time::Duration;
 use crate::pane::Focus;
 use crate::pane::terminal::PtyPaneWidget;
 use crate::settings::Theme;
-use crate::status::{self, HookEvent};
+use crate::status::HookEvent;
 use crate::store::LayoutMode;
 use crate::ui::projects::ProjectStatus;
 use crate::{App, ClaudeTab, ProjectSession, Tab, claude_pane_split, compute_layout};
@@ -25,13 +25,15 @@ fn tab_status(tab: &ClaudeTab) -> ProjectStatus {
     if tab.pane.is_none() {
         return ProjectStatus::None;
     }
-    if let Some(event) = status::read_tab_status(&tab.status_id) {
+    // Precise hook state, once any hook has fired for this tab.
+    if let Some(event) = tab.status.event {
         return match event {
-            HookEvent::Notification => ProjectStatus::Attention,
-            HookEvent::Stop => ProjectStatus::Waiting,
-            HookEvent::UserPromptSubmit => ProjectStatus::Busy,
+            HookEvent::Waiting => ProjectStatus::Attention,
+            HookEvent::Stopped => ProjectStatus::Waiting,
+            HookEvent::Busy => ProjectStatus::Busy,
         };
     }
+    // Fallback: idle-time heuristic until the first hook arrives.
     if let Some(p) = &tab.pane {
         if p.idle_for() >= WAITING_THRESHOLD {
             return ProjectStatus::Waiting;
