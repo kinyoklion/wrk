@@ -454,39 +454,131 @@ fn inner_area(area: Rect) -> Rect {
     Block::default().borders(Borders::ALL).inner(area)
 }
 
+/// The trailing message on the status line. The hint carries several tiers
+/// (longest first) so it can collapse to fit a narrow window; errors and info
+/// are single strings that truncate with an ellipsis instead of collapsing.
+enum StatusMsg {
+    Error(String),
+    Info(String),
+    Hint(Vec<String>),
+}
+
+/// Everything the status line renders, independent of `App` so the fitting
+/// logic ([`compose_status`]) is unit-testable.
+struct StatusView<'a> {
+    project: &'a str,
+    focus_label: &'a str,
+    session_count: usize,
+    layout_label: &'a str,
+    passthrough: bool,
+    select: bool,
+    msg: StatusMsg,
+}
+
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
-    let theme = &app.theme;
     let project = app.active_project().map(|p| p.name.as_str()).unwrap_or("—");
-    let focus = match app.focus {
+    let focus_label = match app.focus {
         Focus::Projects => "projects",
         Focus::Claude => "claude",
         Focus::Shell => "shell",
     };
-    let session_count = app.sessions.len();
-    let layout = match app.layout_mode {
+    let layout_label = match app.layout_mode {
         LayoutMode::Split => "split",
         LayoutMode::Tabbed => "tabs",
     };
-    let mut spans = vec![
+    let msg = if let Some(err) = &app.error {
+        StatusMsg::Error(format!("error: {err}"))
+    } else if let Some(info) = &app.info {
+        // Transient feedback like "copied N chars" — no prefix, hint-colored
+        // so it reads as status rather than an alert. Cleared on the next
+        // key or mouse event.
+        StatusMsg::Info(info.clone())
+    } else {
+        StatusMsg::Hint(hint_tiers(app))
+    };
+    let view = StatusView {
+        project,
+        focus_label,
+        session_count: app.sessions.len(),
+        layout_label,
+        passthrough: app.shell_passthrough,
+        select: app.select_mode,
+        msg,
+    };
+    let spans = compose_status(&app.theme, &view, area.width as usize);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Fit the status line to `width`, dropping the lowest-priority pieces first so
+/// the essentials always stay visible. Priority, high to low: the project chip
+/// and any active `[passthru]`/`[select]` warning chips (never dropped); then a
+/// message (the hint collapses through its tiers, an error/info truncates with
+/// `…`); then the `[focus]` and `(N live · layout)` context chips, which are
+/// dropped first when space runs low.
+fn compose_status(theme: &Theme, v: &StatusView, width: usize) -> Vec<Span<'static>> {
+    let project_chip = format!(" {} ", v.project);
+    let focus_chip = format!("[{}] ", v.focus_label);
+    let live_chip = format!("({} live · {}) ", v.session_count, v.layout_label);
+    const GAP: &str = " "; // separator after the colored project chip
+
+    let (tiers, msg_style): (Vec<String>, Style) = match &v.msg {
+        StatusMsg::Error(e) => (vec![e.clone()], Style::default().fg(theme.error)),
+        StatusMsg::Info(i) => (vec![i.clone()], Style::default().fg(theme.info)),
+        StatusMsg::Hint(t) => (t.clone(), Style::default().fg(theme.hint)),
+    };
+    // Reserve room for at least the shortest message tier when deciding whether
+    // the optional context chips fit.
+    let min_msg_w = tiers.last().map(|t| cell_width(t)).unwrap_or(0);
+
+    // Mandatory: project chip + gap + any active warning chips.
+    let mut mandatory = cell_width(&project_chip) + cell_width(GAP);
+    if v.passthrough {
+        mandatory += cell_width("[passthru] ");
+    }
+    if v.select {
+        mandatory += cell_width("[select] ");
+    }
+
+    // Optional context, added only if the shortest message still fits after.
+    let mut opt_budget = width.saturating_sub(mandatory).saturating_sub(min_msg_w);
+    let show_focus = cell_width(&focus_chip) <= opt_budget;
+    if show_focus {
+        opt_budget -= cell_width(&focus_chip);
+    }
+    let show_live = cell_width(&live_chip) <= opt_budget;
+
+    // Whatever remains after the mandatory + shown context goes to the message.
+    let mut consumed = mandatory;
+    if show_focus {
+        consumed += cell_width(&focus_chip);
+    }
+    if show_live {
+        consumed += cell_width(&live_chip);
+    }
+    let message = choose_message(&tiers, width.saturating_sub(consumed));
+
+    // Assemble in visual order.
+    let mut spans: Vec<Span<'static>> = vec![
         Span::styled(
-            format!(" {project} "),
+            project_chip,
             Style::default().fg(theme.accent_fg).bg(theme.accent),
         ),
-        Span::raw(" "),
-        Span::styled(
-            format!("[{focus}] "),
-            Style::default().fg(theme.focus_indicator),
-        ),
-        Span::styled(
-            format!("({session_count} live · {layout}) "),
-            Style::default().fg(theme.hint),
-        ),
+        Span::raw(GAP),
     ];
-    if app.shell_passthrough {
-        // Reverse-video the passthrough chip so it stands out — a reminder
-        // that wrk's normal Alt+… shortcuts won't fire while focus is on the
-        // shell pane. Reuses theme slots so users who recolor `error` get a
-        // matching chip background.
+    if show_focus {
+        spans.push(Span::styled(
+            focus_chip,
+            Style::default().fg(theme.focus_indicator),
+        ));
+    }
+    if show_live {
+        spans.push(Span::styled(live_chip, Style::default().fg(theme.hint)));
+    }
+    if v.passthrough {
+        // Reverse-video the passthrough chip so it stands out — a reminder that
+        // wrk's normal Alt+… shortcuts won't fire while focus is on the shell
+        // pane. Reuses theme slots so users who recolor `error` get a matching
+        // chip background.
         spans.push(Span::styled(
             "[passthru] ",
             Style::default()
@@ -495,7 +587,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    if app.select_mode {
+    if v.select {
         spans.push(Span::styled(
             "[select] ",
             Style::default()
@@ -504,68 +596,117 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    if let Some(err) = &app.error {
-        spans.push(Span::styled(
-            format!("error: {err}"),
-            Style::default().fg(theme.error),
-        ));
-    } else if let Some(info) = &app.info {
-        // Transient feedback like "copied N chars" — no prefix, hint-colored
-        // so it reads as status rather than an alert. Cleared on the next
-        // key or mouse event.
-        spans.push(Span::styled(info.clone(), Style::default().fg(theme.info)));
-    } else {
-        let hint = build_hint(app);
-        spans.push(Span::styled(hint, Style::default().fg(theme.hint)));
+    if !message.is_empty() {
+        spans.push(Span::styled(message, msg_style));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    spans
 }
 
-/// Compose the focus-specific hint string from the live keymap so it stays in
-/// sync with any user overrides. Hard-coded keys (the projects-pane single
-/// chars `+`, `d`, `r`, `/`, `↑`/`↓`, `Enter`) are not configurable yet so
-/// they're spliced in literally.
-fn build_hint(app: &App) -> String {
+/// Pick the widest message tier that fits in `budget`; if even the shortest
+/// overflows, truncate it with an ellipsis.
+fn choose_message(tiers: &[String], budget: usize) -> String {
+    for t in tiers {
+        if cell_width(t) <= budget {
+            return t.clone();
+        }
+    }
+    match tiers.last() {
+        Some(t) => truncate_to_width(t, budget),
+        None => String::new(),
+    }
+}
+
+/// Display width of `s` in terminal cells (accounts for wide/zero-width chars).
+fn cell_width(s: &str) -> usize {
+    Span::raw(s).width()
+}
+
+/// Truncate `s` to at most `max` cells, appending `…` when it had to cut.
+fn truncate_to_width(s: &str, max: usize) -> String {
+    if cell_width(s) <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let budget = max - 1; // leave a cell for the ellipsis
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let mut buf = [0u8; 4];
+        let cw = cell_width(ch.encode_utf8(&mut buf));
+        if used + cw > budget {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out.push('…');
+    out
+}
+
+/// Focus-specific hint tiers from the live keymap (longest first), so the
+/// status line can shed detail as the window narrows while staying in sync with
+/// any user key overrides. Hard-coded projects-pane keys (`+`, `d`, `u`, `r`,
+/// `/`, `↑`/`↓`, `Enter`) aren't configurable yet, so they're spliced literally.
+fn hint_tiers(app: &App) -> Vec<String> {
     let km = &app.keymap;
-    if app.select_mode {
-        return format!(
-            "select: drag to highlight, release to copy, {esc}/{toggle} cancel",
-            esc = "Esc",
-            toggle = km.display(crate::keymap::GlobalAction::EnterSelectMode),
-        );
-    }
-    let passthrough_active = app.shell_passthrough && app.focus == Focus::Shell;
-    if passthrough_active {
-        return format!(
-            "{toggle} exit passthrough  (all other keys → shell)",
-            toggle = km.display(crate::keymap::GlobalAction::ToggleShellPassthrough),
-        );
-    }
     use crate::keymap::GlobalAction as A;
-    let toggle_sidebar = km.display(A::ToggleSidebar);
-    let toggle_layout = km.display(A::ToggleLayout);
-    let shrink = km.display(A::ShrinkClaude);
-    let grow = km.display(A::GrowClaude);
+    if app.select_mode {
+        return vec![
+            format!(
+                "select: drag to highlight, release to copy, Esc/{toggle} cancel",
+                toggle = km.display(A::EnterSelectMode),
+            ),
+            "select: Esc cancel".to_string(),
+        ];
+    }
+    if app.shell_passthrough && app.focus == Focus::Shell {
+        let toggle = km.display(A::ToggleShellPassthrough);
+        return vec![
+            format!("{toggle} exit passthrough  (all other keys → shell)"),
+            format!("{toggle} exit passthrough"),
+        ];
+    }
     let quit = km.display(A::Quit);
+    let layout = km.display(A::ToggleLayout);
     match app.focus {
-        Focus::Projects => format!(
-            "↑/↓ Enter/dbl-click  +/d/u/r  /  {toggle_sidebar} sidebar  \
-             {toggle_layout} layout  {shrink}/{grow} resize  {quit} quit",
-        ),
-        _ => format!(
-            "{focus_p}/{focus_c}/{focus_s} panes  {new} new-claude  {md} markdown  \
-             {close} close  {prev}/{next} tabs  {toggle_layout} layout  \
-             {passthru} passthru  {quit} quit",
-            focus_p = km.display(A::FocusProjects),
-            focus_c = km.display(A::FocusClaude),
-            focus_s = km.display(A::FocusShell),
-            new = km.display(A::NewClaudeTab),
-            md = km.display(A::OpenMarkdown),
-            close = km.display(A::CloseClaudeTab),
-            prev = km.display(A::PrevClaudeTab),
-            next = km.display(A::NextClaudeTab),
-            passthru = km.display(A::ToggleShellPassthrough),
-        ),
+        Focus::Projects => {
+            let sidebar = km.display(A::ToggleSidebar);
+            let shrink = km.display(A::ShrinkClaude);
+            let grow = km.display(A::GrowClaude);
+            vec![
+                format!(
+                    "↑/↓ Enter/dbl-click  +/d/u/r  /  {sidebar} sidebar  \
+                     {layout} layout  {shrink}/{grow} resize  {quit} quit"
+                ),
+                format!("↑/↓ Enter  +/d/u/r  {sidebar} sidebar  {layout} layout  {quit} quit"),
+                format!("↑/↓ Enter  {quit} quit"),
+                format!("{quit} quit"),
+            ]
+        }
+        _ => {
+            let fp = km.display(A::FocusProjects);
+            let fc = km.display(A::FocusClaude);
+            let fs = km.display(A::FocusShell);
+            let new = km.display(A::NewClaudeTab);
+            let md = km.display(A::OpenMarkdown);
+            let close = km.display(A::CloseClaudeTab);
+            let prev = km.display(A::PrevClaudeTab);
+            let next = km.display(A::NextClaudeTab);
+            let passthru = km.display(A::ToggleShellPassthrough);
+            vec![
+                format!(
+                    "{fp}/{fc}/{fs} panes  {new} new-claude  {md} markdown  {close} close  \
+                     {prev}/{next} tabs  {layout} layout  {passthru} passthru  {quit} quit"
+                ),
+                format!(
+                    "{fp}/{fc}/{fs} panes  {new} new  {prev}/{next} tabs  {layout} layout  {quit} quit"
+                ),
+                format!("{fp}/{fc}/{fs} panes  {quit} quit"),
+                format!("{quit} quit"),
+            ]
+        }
     }
 }
 
@@ -578,4 +719,161 @@ pub enum ModalState {
     ConfirmQuit(modal::ConfirmQuitModal),
     ClaudeTabPicker(modal::ClaudeTabPickerModal),
     UrlPicker(modal::UrlPickerModal),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::Theme;
+
+    fn hint(tiers: &[&str]) -> StatusMsg {
+        StatusMsg::Hint(tiers.iter().map(|s| s.to_string()).collect())
+    }
+
+    fn text_of(spans: &[Span<'static>]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn wide_status_shows_all_context_and_the_full_hint() {
+        let theme = Theme::default();
+        let v = StatusView {
+            project: "proj",
+            focus_label: "claude",
+            session_count: 3,
+            layout_label: "split",
+            passthrough: false,
+            select: false,
+            msg: hint(&["FULL panes tabs layout quit", "MED tabs quit", "quit"]),
+        };
+        let spans = compose_status(&theme, &v, 200);
+        assert!(Line::from(spans.clone()).width() <= 200);
+        let text = text_of(&spans);
+        assert!(text.contains(" proj "));
+        assert!(text.contains("[claude]"));
+        assert!(text.contains("(3 live · split)"));
+        assert!(text.contains("FULL panes tabs layout quit"));
+    }
+
+    #[test]
+    fn narrow_status_drops_context_first_but_keeps_project_and_a_hint() {
+        let theme = Theme::default();
+        let v = StatusView {
+            project: "proj",
+            focus_label: "claude",
+            session_count: 3,
+            layout_label: "split",
+            passthrough: false,
+            select: false,
+            msg: hint(&[
+                "FULL hint that is definitely too wide",
+                "panes quit",
+                "quit",
+            ]),
+        };
+        let width = 24;
+        let spans = compose_status(&theme, &v, width);
+        assert!(Line::from(spans.clone()).width() <= width);
+        let text = text_of(&spans);
+        assert!(text.contains("proj"), "project chip must survive");
+        assert!(!text.contains("live"), "context chip should drop first");
+        // A shorter hint tier still shows rather than nothing.
+        assert!(text.contains("quit"));
+    }
+
+    #[test]
+    fn warning_chips_survive_when_the_hint_collapses() {
+        let theme = Theme::default();
+        let v = StatusView {
+            project: "proj",
+            focus_label: "shell",
+            session_count: 2,
+            layout_label: "tabs",
+            passthrough: true,
+            select: true,
+            msg: hint(&["a long hint that will not fit here", "quit"]),
+        };
+        let width = 40;
+        let spans = compose_status(&theme, &v, width);
+        assert!(Line::from(spans.clone()).width() <= width);
+        let text = text_of(&spans);
+        assert!(text.contains("[passthru]"));
+        assert!(text.contains("[select]"));
+    }
+
+    #[test]
+    fn very_narrow_truncates_an_error_with_an_ellipsis() {
+        let theme = Theme::default();
+        let v = StatusView {
+            project: "p",
+            focus_label: "claude",
+            session_count: 1,
+            layout_label: "split",
+            passthrough: false,
+            select: false,
+            msg: StatusMsg::Error("error: something went badly wrong here".into()),
+        };
+        let width = 20;
+        let spans = compose_status(&theme, &v, width);
+        assert!(Line::from(spans.clone()).width() <= width);
+        assert!(text_of(&spans).contains('…'));
+    }
+
+    #[test]
+    fn truncate_to_width_respects_the_cell_budget() {
+        assert_eq!(truncate_to_width("hello", 10), "hello");
+        let t = truncate_to_width("hello world", 5);
+        assert!(cell_width(&t) <= 5);
+        assert!(t.ends_with('…'));
+        assert_eq!(truncate_to_width("x", 0), "");
+    }
+}
+
+#[cfg(test)]
+mod render_check {
+    use super::*;
+    use crate::settings::Theme;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::{Paragraph, Widget};
+
+    /// Drive the real `Paragraph` widget path across a range of widths. Once the
+    /// window is wide enough to hold the mandatory project chip the composed line
+    /// fits exactly (nothing silently clipped); below that the chip alone can't
+    /// fit, so we only require that rendering never panics.
+    #[test]
+    fn renders_within_bounds_at_every_width() {
+        let theme = Theme::default();
+        let tiers = vec![
+            "Alt+1/2/3 panes  Alt+n new-claude  Alt+m markdown  Alt+w close  \
+             Alt+</Alt+> tabs  Alt+t layout  F12 passthru  Alt+q quit"
+                .to_string(),
+            "Alt+1/2/3 panes  Alt+n new  Alt+</Alt+> tabs  Alt+t layout  Alt+q quit".to_string(),
+            "Alt+1/2/3 panes  Alt+q quit".to_string(),
+            "Alt+q quit".to_string(),
+        ];
+        for width in [200u16, 120, 80, 60, 40, 30, 20, 12, 6, 1] {
+            let v = StatusView {
+                project: "wrk",
+                focus_label: "claude",
+                session_count: 3,
+                layout_label: "split",
+                passthrough: false,
+                select: false,
+                msg: StatusMsg::Hint(tiers.clone()),
+            };
+            let line = Line::from(compose_status(&theme, &v, width as usize));
+            // " wrk " + separator = 6 cells; at or above that the line must fit.
+            if width >= 6 {
+                assert!(
+                    line.width() <= width as usize,
+                    "w={width} line={}",
+                    line.width()
+                );
+            }
+            let area = Rect::new(0, 0, width, 1);
+            let mut buf = Buffer::empty(area);
+            Paragraph::new(line).render(area, &mut buf);
+        }
+    }
 }
