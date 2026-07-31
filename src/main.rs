@@ -2,6 +2,7 @@ mod ipc;
 mod keymap;
 mod pane;
 mod proc;
+mod review;
 mod session;
 mod settings;
 mod status;
