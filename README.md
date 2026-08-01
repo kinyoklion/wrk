@@ -49,6 +49,10 @@ project. Linux-only, native rendering (via your terminal), built on
   time-since-output heuristic as fallback. A trailing `*` marks a project with
   a live session — bright on the active project, dim on ones loaded in the
   background. Press `u` on the projects pane to unload one.
+- **In-TUI code review** — a GitHub-style side-by-side diff review, driven from
+  Claude. `/start-local-review` opens a full-screen review (file list + side-by-side
+  diff, unchanged sections collapsed); comment on any before/after line, then
+  `/end-local-review` hands your comments back to Claude to act on. See below.
 - **Mouse**: click panes / tabs / projects to focus, double-click a project to
   open it, scroll wheel paginates the alacritty scrollback (10k lines).
   **Ctrl+click** (or **Shift+click**, if your outer terminal swallows Ctrl) on
@@ -375,6 +379,31 @@ commands are gated on `[ -n "$WRK_SOCK" ]` and only fire for Claude sessions
 launched by wrk — other sessions are unaffected. Re-run `install-hooks` to pick
 up updates (it also upgrades older file-based installs in place);
 `uninstall-hooks` removes only the wrk-installed entries.
+
+`install-hooks` also installs three **skills** into `~/.claude/skills/`:
+`wrk-view` (open a file), and `start-local-review` / `end-local-review` (the code
+review below).
+
+### Code review
+
+A GitHub-style diff review, right in wrk. Ask Claude to review your changes (or
+type `/start-local-review`): it inspects the repo, picks what to compare
+(uncommitted vs `HEAD`, or your branch's commits vs its base, or a target you
+name), and opens a **full-screen review**:
+
+- a **file list** of everything changed (add / modify / delete / rename), and
+- a **side-by-side diff** of the selected file, with unchanged regions collapsed
+  to `⋯ N unchanged lines ⋯` (press `Enter` to reveal one, `e` / `o` to
+  expand / collapse all).
+
+Navigate with `Tab` / arrows / `j`/`k`; press `c` on any line to **comment** on
+the before or after side (`h`/`l` picks the side), `D` to delete a comment, `q`
+to close. When you're done, run `/end-local-review` — your comments are handed
+back to the Claude session that opened the review (file, line, side, and the
+quoted line) for it to act on.
+
+Manually, the same is available as `wrk review start [<rev>|<a>..<b>]` and
+`wrk review end` (run from inside a wrk pane). Diffing shells out to `git`.
 
 ## License
 
