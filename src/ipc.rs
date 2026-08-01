@@ -29,6 +29,8 @@ pub enum Request {
     Open(OpenRequest),
     /// Update a Claude tab's status (`wrk hook`).
     Status(StatusUpdate),
+    /// Start or end an in-TUI code review (`wrk review`).
+    Review(ReviewRequest),
 }
 
 /// A request to open a file in a running wrk instance.
@@ -49,6 +51,33 @@ pub struct StatusUpdate {
     pub tab: String,
     /// The state transition.
     pub kind: StatusKind,
+}
+
+/// A `wrk review` request from a Claude session: start a review of its project's
+/// diff, or end the active one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewRequest {
+    /// Originating Claude tab (`WRK_TAB`), so comments can be reported back to it.
+    #[serde(default)]
+    pub tab: Option<String>,
+    /// Project (`WRK_PROJECT`) whose working tree is reviewed; `None` → active.
+    #[serde(default)]
+    pub project: Option<String>,
+    pub kind: ReviewKind,
+}
+
+/// Start (with an optional git target) or end a review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "lowercase")]
+pub enum ReviewKind {
+    /// Open the review overlay. `target` is the raw `wrk review start [target]`
+    /// argument (empty → uncommitted vs HEAD).
+    Start {
+        #[serde(default)]
+        target: Option<String>,
+    },
+    /// Close the active review overlay.
+    End,
 }
 
 /// Directory holding per-instance sockets.
@@ -137,6 +166,33 @@ mod tests {
         assert_eq!(json, r#"{"cmd":"status","tab":"tab3","kind":"waiting"}"#);
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
+    }
+
+    #[test]
+    fn review_request_json_round_trip() {
+        let start = Request::Review(ReviewRequest {
+            tab: Some("tab7".into()),
+            project: Some("web".into()),
+            kind: ReviewKind::Start {
+                target: Some("main..HEAD".into()),
+            },
+        });
+        let json = serde_json::to_string(&start).unwrap();
+        assert!(json.contains(r#""cmd":"review""#));
+        assert!(json.contains(r#""action":"start""#));
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), start);
+
+        // End needs no fields beyond the action tag; absent tab/project default.
+        let end: Request =
+            serde_json::from_str(r#"{"cmd":"review","kind":{"action":"end"}}"#).unwrap();
+        assert_eq!(
+            end,
+            Request::Review(ReviewRequest {
+                tab: None,
+                project: None,
+                kind: ReviewKind::End,
+            })
+        );
     }
 
     #[test]

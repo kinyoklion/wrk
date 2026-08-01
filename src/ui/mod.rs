@@ -1,5 +1,6 @@
 pub mod modal;
 pub mod projects;
+pub mod review;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -76,6 +77,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // The fullscreen image viewer takes over the whole screen when open.
     if app.image_viewer.is_some() {
         draw_image_viewer(frame, app, area);
+        return;
+    }
+
+    // The fullscreen code-review overlay likewise takes over the screen.
+    if app.review.is_some() {
+        review::draw_review(frame, app, area);
         return;
     }
 
@@ -617,12 +624,12 @@ fn choose_message(tiers: &[String], budget: usize) -> String {
 }
 
 /// Display width of `s` in terminal cells (accounts for wide/zero-width chars).
-fn cell_width(s: &str) -> usize {
+pub(crate) fn cell_width(s: &str) -> usize {
     Span::raw(s).width()
 }
 
 /// Truncate `s` to at most `max` cells, appending `…` when it had to cut.
-fn truncate_to_width(s: &str, max: usize) -> String {
+pub(crate) fn truncate_to_width(s: &str, max: usize) -> String {
     if cell_width(s) <= max {
         return s.to_string();
     }

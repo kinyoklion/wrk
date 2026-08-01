@@ -78,6 +78,13 @@ enum Command {
     /// the environment and is a silent no-op outside a wrk session.
     #[command(hide = true)]
     Hook { kind: String },
+    /// Start or end an in-TUI code review in the running wrk instance:
+    /// `wrk review start [target]` / `wrk review end`. `target` is a git rev or
+    /// `a..b` range; empty compares the working tree to HEAD.
+    Review {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -90,6 +97,7 @@ fn main() -> Result<()> {
         Some(Command::InstallHooks) => cmd_install_hooks(),
         Some(Command::UninstallHooks) => cmd_uninstall_hooks(),
         Some(Command::Hook { kind }) => cmd_hook(&kind),
+        Some(Command::Review { args }) => cmd_review(&args),
         None => run_tui(),
     }
 }
@@ -166,6 +174,56 @@ fn cmd_hook(kind: &str) -> Result<()> {
     let req = ipc::Request::Status(ipc::StatusUpdate { tab, kind });
     let _ = ipc::send(Path::new(&sock), &req);
     Ok(())
+}
+
+/// Start or end an in-TUI code review in the running wrk instance:
+/// `wrk review start [target]` opens the review overlay; `wrk review end`
+/// closes it. Both require being inside a wrk-managed pane (`WRK_SOCK` set).
+fn cmd_review(args: &[String]) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    let rest = args.get(1..).unwrap_or(&[]).join(" ");
+    let sock = std::env::var("WRK_SOCK").ok().filter(|s| !s.is_empty());
+    match sub {
+        "start" => {
+            let sock = sock.ok_or_else(|| {
+                anyhow!("`wrk review` must be run inside a wrk-managed pane (no WRK_SOCK)")
+            })?;
+            let target = review::diff::DiffTarget::parse(&rest);
+            let req = ipc::Request::Review(ipc::ReviewRequest {
+                tab: std::env::var("WRK_TAB").ok(),
+                project: std::env::var("WRK_PROJECT").ok(),
+                kind: ipc::ReviewKind::Start {
+                    target: if rest.trim().is_empty() {
+                        None
+                    } else {
+                        Some(rest.trim().to_string())
+                    },
+                },
+            });
+            ipc::send(Path::new(&sock), &req).context("sending review request to wrk")?;
+            println!(
+                "Opened a code review ({}) in the wrk review pane. \
+                 Review it there, then run /end-local-review to collect comments.",
+                target.label()
+            );
+            Ok(())
+        }
+        "end" => {
+            if let Some(sock) = sock {
+                let req = ipc::Request::Review(ipc::ReviewRequest {
+                    tab: std::env::var("WRK_TAB").ok(),
+                    project: std::env::var("WRK_PROJECT").ok(),
+                    kind: ipc::ReviewKind::End,
+                });
+                let _ = ipc::send(Path::new(&sock), &req);
+            }
+            println!("Ended the code review.");
+            Ok(())
+        }
+        other => Err(anyhow!(
+            "unknown `wrk review` subcommand '{other}'; use `start [target]` or `end`"
+        )),
+    }
 }
 
 fn cmd_uninstall_hooks() -> Result<()> {
@@ -477,6 +535,9 @@ pub struct App {
     /// Active fullscreen image viewer (zoom/pan), opened from a markdown tab.
     /// When `Some`, it takes over the screen and input until dismissed.
     pub image_viewer: Option<wrk_markdown::ImageViewer>,
+    /// Active code-review overlay (started by `wrk review`). When `Some`, it
+    /// takes over the screen and input until dismissed.
+    pub review: Option<review::ReviewSession>,
 }
 
 impl App {
@@ -520,6 +581,7 @@ impl App {
             prefers_dark: false,
             heading_images,
             image_viewer: None,
+            review: None,
         }
     }
 
@@ -866,6 +928,38 @@ impl App {
         match req {
             ipc::Request::Open(open) => self.handle_open_request(open),
             ipc::Request::Status(update) => self.handle_status_update(update),
+            ipc::Request::Review(review) => self.handle_review_request(review),
+        }
+    }
+
+    /// Handle a `wrk review` request: `Start` computes the diff for the named
+    /// project and opens the full-screen review overlay; `End` closes it. Errors
+    /// surface in the status bar rather than interrupting the session.
+    fn handle_review_request(&mut self, req: ipc::ReviewRequest) {
+        match req.kind {
+            ipc::ReviewKind::Start { target } => {
+                let project = req.project.or_else(|| self.active_project_name.clone());
+                let Some(project) = project else {
+                    push_error(&mut self.error, "wrk review: no active project".into());
+                    return;
+                };
+                let Some(path) = self.store.find(&project).map(|p| p.path.clone()) else {
+                    push_error(
+                        &mut self.error,
+                        format!("wrk review: unknown project '{project}'"),
+                    );
+                    return;
+                };
+                let target = review::diff::DiffTarget::parse(target.as_deref().unwrap_or(""));
+                match review::diff::build_review(&path, &target) {
+                    Ok(files) => {
+                        self.review =
+                            Some(review::ReviewSession::new(project, req.tab, target, files));
+                    }
+                    Err(e) => push_error(&mut self.error, format!("wrk review: {e}")),
+                }
+            }
+            ipc::ReviewKind::End => self.review = None,
         }
     }
 
@@ -1497,6 +1591,12 @@ fn handle_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
         return Ok(());
     }
 
+    // The fullscreen review overlay captures all input while open.
+    if app.review.is_some() {
+        handle_review_key(app, key);
+        return Ok(());
+    }
+
     if app.modal.is_some() {
         return handle_modal_key(app, key, body);
     }
@@ -1636,6 +1736,46 @@ fn handle_image_viewer_key(app: &mut App, key: KeyEvent) {
 
 /// Keyboard pan step, as a fraction of the visible view.
 const IMG_PAN_STEP: f32 = 0.2;
+
+/// Handle a key while the full-screen code-review overlay is open. Navigation is
+/// vim-ish; `q`/`Esc` closes (the review session is dropped, but comments — once
+/// PR 3 adds them — are already mirrored to disk for `wrk review end`).
+fn handle_review_key(app: &mut App, key: KeyEvent) {
+    use review::ReviewFocus;
+    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+        app.review = None;
+        return;
+    }
+    let Some(review) = app.review.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Tab | KeyCode::BackTab => review.toggle_focus(),
+        KeyCode::Left | KeyCode::Char('h') => review.focus = ReviewFocus::Files,
+        KeyCode::Right | KeyCode::Char('l') => review.focus = ReviewFocus::Diff,
+        KeyCode::Down | KeyCode::Char('j') => match review.focus {
+            ReviewFocus::Files => review.select_file(1),
+            ReviewFocus::Diff => review.move_cursor(1),
+        },
+        KeyCode::Up | KeyCode::Char('k') => match review.focus {
+            ReviewFocus::Files => review.select_file(-1),
+            ReviewFocus::Diff => review.move_cursor(-1),
+        },
+        KeyCode::PageDown | KeyCode::Char('d') => review.move_cursor(10),
+        KeyCode::PageUp | KeyCode::Char('u') => review.move_cursor(-10),
+        KeyCode::Char('g') => review.cursor_to_edge(true),
+        KeyCode::Char('G') => review.cursor_to_edge(false),
+        // Reveal the collapsed gap under the cursor; if focused on the file list,
+        // Enter jumps into the diff.
+        KeyCode::Enter | KeyCode::Char(' ') => match review.focus {
+            ReviewFocus::Files => review.focus = ReviewFocus::Diff,
+            ReviewFocus::Diff => review.reveal_at_cursor(),
+        },
+        KeyCode::Char('e') => review.set_all_revealed(true),
+        KeyCode::Char('o') => review.set_all_revealed(false),
+        _ => {}
+    }
+}
 
 /// Handle a mouse event while the fullscreen image viewer is open: the wheel
 /// zooms. (Pan is on the keyboard for now.)
@@ -2219,6 +2359,16 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
     // The fullscreen image viewer captures the mouse (wheel zooms) while open.
     if app.image_viewer.is_some() {
         handle_image_viewer_mouse(app, m);
+        return;
+    }
+
+    // The fullscreen review overlay captures the mouse (wheel scrolls the diff).
+    if let Some(review) = app.review.as_mut() {
+        match m.kind {
+            MouseEventKind::ScrollDown => review.move_cursor(3),
+            MouseEventKind::ScrollUp => review.move_cursor(-3),
+            _ => {}
+        }
         return;
     }
 
