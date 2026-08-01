@@ -25,6 +25,8 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
+# Pure-Rust line/word diffing for the in-TUI code review (no C deps).
+similar = "2"
 wrk-markdown = { workspace = true, features = ["highlight", "images", "mermaid"] }
 
 [dev-dependencies]
