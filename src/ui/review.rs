@@ -78,8 +78,9 @@ fn draw_comment_editor(frame: &mut Frame, area: Rect, review: &ReviewSession, th
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(label, Style::default().bg(theme.accent).fg(theme.accent_fg)),
-            Span::raw(format!("{} ", d.buffer)),
-            Span::styled("▎", Style::default().fg(theme.accent)),
+            // The block cursor sits immediately after the typed text — no gap.
+            Span::raw(d.buffer.clone()),
+            Span::styled("▏", Style::default().fg(theme.accent)),
         ])),
         area,
     );

@@ -169,14 +169,18 @@ fn claude_dir() -> Result<PathBuf> {
 /// skill wrk itself wrote (never a user's own skill of the same name).
 const SKILL_INSTALL_MARKER: &str = "installed by `wrk install-hooks`";
 
-/// The skills wrk installs into `~/.claude/skills/<name>/SKILL.md`. The skill's
-/// invoke name is its directory name, so `start-local-review` → the
-/// `/start-local-review` command the user asked for.
-fn skill_specs() -> Vec<(&'static str, String)> {
+/// Directory (= `/command`) names of the skills wrk installs.
+const SKILL_NAMES: &[&str] = &["wrk-view", "start-local-review", "end-local-review"];
+
+/// The skills wrk installs into `~/.claude/skills/<name>/SKILL.md`, with `wrk`
+/// (the absolute binary path, resolved at install time) baked into every command
+/// — the skill `!`…`` preprocessor and hook shells don't load the user's PATH, so
+/// a bare `wrk` isn't reliably found.
+fn skill_specs(wrk: &str) -> Vec<(&'static str, String)> {
     vec![
-        ("wrk-view", view_skill_markdown()),
-        ("start-local-review", review_start_skill_markdown()),
-        ("end-local-review", review_end_skill_markdown()),
+        ("wrk-view", view_skill_markdown(wrk)),
+        ("start-local-review", review_start_skill_markdown(wrk)),
+        ("end-local-review", review_end_skill_markdown(wrk)),
     ]
 }
 
@@ -185,19 +189,19 @@ fn marker_comment() -> String {
 }
 
 /// The `wrk-view` skill: teaches Claude to open files with `wrk view`.
-fn view_skill_markdown() -> String {
+fn view_skill_markdown(wrk: &str) -> String {
     format!(
         "---\n\
 name: wrk-view\n\
 description: Open a markdown file, README, or diagram in the wrk viewer. Use when the user asks to view, open, preview, show, or visualize a markdown/text file or diagram in the terminal.\n\
-allowed-tools: Bash(wrk view *)\n\
+allowed-tools: Bash({wrk} view *)\n\
 ---\n\
 {marker}\n\
 \n\
 # View a file in the wrk viewer\n\
 \n\
-Run `wrk view <absolute-path>` to open a file in wrk's markdown viewer. Inside a\n\
-wrk session it opens as a new tab beside the conversation; in a plain shell it\n\
+Run `{wrk} view <absolute-path>` to open a file in wrk's markdown viewer. Inside\n\
+a wrk session it opens as a new tab beside the conversation; in a plain shell it\n\
 opens a scrollable pager. It is read-only and never modifies the file.\n\
 \n\
 When the user asks to view, open, preview, show, or visualize a markdown file or\n\
@@ -205,7 +209,7 @@ diagram:\n\
 \n\
 1. Resolve it to an absolute path (search with grep/find if they described the\n\
    file rather than naming it).\n\
-2. Run `wrk view <absolute-path>`.\n\
+2. Run `{wrk} view <absolute-path>`.\n\
 3. Briefly confirm it is open.\n",
         marker = marker_comment()
     )
@@ -213,12 +217,12 @@ diagram:\n\
 
 /// The `/start-local-review` skill: model-invocable, so Claude inspects the repo
 /// and picks the comparison itself before opening the review overlay.
-fn review_start_skill_markdown() -> String {
+fn review_start_skill_markdown(wrk: &str) -> String {
     format!(
         "---\n\
 name: start-local-review\n\
 description: Start an in-editor code review in wrk. Use when the user asks to review changes, review a diff, do a local/code review, or look over their work side-by-side.\n\
-allowed-tools: Bash(wrk review:*), Bash(git status:*), Bash(git log:*), Bash(git diff:*), Bash(git branch:*), Bash(git rev-parse:*)\n\
+allowed-tools: Bash({wrk} review:*), Bash(git status:*), Bash(git log:*), Bash(git diff:*), Bash(git branch:*), Bash(git rev-parse:*)\n\
 ---\n\
 {marker}\n\
 \n\
@@ -233,9 +237,9 @@ work out WHAT to review, then start it — don't invent feedback yourself.\n\
    - `git log --oneline <base>..HEAD` — are there local commits not on the base?\n\
 2. Choose the target:\n\
    - If the user named one, use it.\n\
-   - Else if there are uncommitted changes, review those: `wrk review start` (no argument = working tree vs HEAD).\n\
-   - Else if the branch has commits ahead of the base, review those: `wrk review start <base>..HEAD`.\n\
-3. Run `wrk review start <target>`. Then tell the user to comment in the wrk\n\
+   - Else if there are uncommitted changes, review those: `{wrk} review start` (no argument = working tree vs HEAD).\n\
+   - Else if the branch has commits ahead of the base, review those: `{wrk} review start <base>..HEAD`.\n\
+3. Run `{wrk} review start <target>`. Then tell the user to comment in the wrk\n\
    review pane and run `/end-local-review` when done. Wait for their comments —\n\
    do not guess at review feedback.\n",
         marker = marker_comment()
@@ -243,19 +247,20 @@ work out WHAT to review, then start it — don't invent feedback yourself.\n\
 }
 
 /// The `/end-local-review` skill: pulls the user's comments via `wrk review end`
-/// and hands them to Claude to act on.
-fn review_end_skill_markdown() -> String {
+/// and hands them to Claude to act on. Uses the absolute `wrk` path because the
+/// `!`…`` preprocessor shell doesn't load the user's PATH.
+fn review_end_skill_markdown(wrk: &str) -> String {
     format!(
         "---\n\
 name: end-local-review\n\
 description: End the in-editor code review in wrk and collect the user's comments. Use when the user says they are done reviewing, finished commenting, or asks to end the local review.\n\
-allowed-tools: Bash(wrk review:*)\n\
+allowed-tools: Bash({wrk} review:*)\n\
 ---\n\
 {marker}\n\
 \n\
 # Collect local review comments\n\
 \n\
-!`wrk review end`\n\
+!`{wrk} review end`\n\
 \n\
 The output above lists the comments the user left in the wrk review pane (file,\n\
 line, side, the comment, and the quoted line). Address each one:\n\
@@ -272,7 +277,7 @@ changed.\n",
 /// Write every wrk skill to `~/.claude/skills/<name>/SKILL.md`, overwriting any
 /// prior copy (so content fixes propagate). Returns the written paths.
 pub fn install_skills() -> Result<Vec<PathBuf>> {
-    install_skills_in(&claude_dir()?)
+    install_skills_in(&claude_dir()?, &wrk_binary())
 }
 
 /// Remove the wrk-installed skills. Returns the removed directories (only those
@@ -281,9 +286,9 @@ pub fn uninstall_skills() -> Result<Vec<PathBuf>> {
     uninstall_skills_in(&claude_dir()?)
 }
 
-fn install_skills_in(claude_dir: &Path) -> Result<Vec<PathBuf>> {
+fn install_skills_in(claude_dir: &Path, wrk: &str) -> Result<Vec<PathBuf>> {
     let mut written = Vec::new();
-    for (name, markdown) in skill_specs() {
+    for (name, markdown) in skill_specs(wrk) {
         let dir = claude_dir.join("skills").join(name);
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = dir.join("SKILL.md");
@@ -295,7 +300,7 @@ fn install_skills_in(claude_dir: &Path) -> Result<Vec<PathBuf>> {
 
 fn uninstall_skills_in(claude_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut removed = Vec::new();
-    for (name, _) in skill_specs() {
+    for name in SKILL_NAMES {
         let dir = claude_dir.join("skills").join(name);
         let path = dir.join("SKILL.md");
         if !path.exists() {
@@ -609,18 +614,21 @@ mod tests {
     }
 
     #[test]
-    fn skills_have_names_markers_and_expected_commands() {
-        // Every skill carries the marker; the review-start skill is
-        // model-invocable (no disable-model-invocation) and drives the agent to
-        // pick a target; the end skill pulls comments via `wrk review end`.
-        for (name, md) in skill_specs() {
+    fn skills_have_names_markers_and_absolute_wrk_paths() {
+        // Every skill carries the marker and bakes in the absolute wrk path (so
+        // the `!`…`` preprocessor / hook shells, which lack the user's PATH, can
+        // find it); the review-start skill stays model-invocable; the end skill
+        // pulls comments via `wrk review end`.
+        let wrk = "/opt/bin/wrk";
+        for (name, md) in skill_specs(wrk) {
             assert!(md.contains(&format!("name: {name}")), "{name} name");
             assert!(md.contains(SKILL_INSTALL_MARKER), "{name} marker");
+            assert!(md.contains(wrk), "{name} embeds the wrk path");
         }
-        let end = review_end_skill_markdown();
-        assert!(end.contains("!`wrk review end`"));
-        let start = review_start_skill_markdown();
-        assert!(start.contains("wrk review start"));
+        let end = review_end_skill_markdown(wrk);
+        assert!(end.contains("!`/opt/bin/wrk review end`"));
+        let start = review_start_skill_markdown(wrk);
+        assert!(start.contains("/opt/bin/wrk review start"));
         assert!(!start.contains("disable-model-invocation"));
     }
 
@@ -629,14 +637,14 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let claude = home.path().join(".claude");
 
-        let paths = install_skills_in(&claude).unwrap();
-        assert_eq!(paths.len(), skill_specs().len());
+        let paths = install_skills_in(&claude, "/opt/bin/wrk").unwrap();
+        assert_eq!(paths.len(), SKILL_NAMES.len());
         assert!(claude.join("skills/wrk-view/SKILL.md").exists());
         assert!(claude.join("skills/start-local-review/SKILL.md").exists());
         assert!(claude.join("skills/end-local-review/SKILL.md").exists());
 
         let removed = uninstall_skills_in(&claude).unwrap();
-        assert_eq!(removed.len(), skill_specs().len());
+        assert_eq!(removed.len(), SKILL_NAMES.len());
         assert!(!claude.join("skills/wrk-view/SKILL.md").exists());
 
         // Second uninstall removes nothing.
