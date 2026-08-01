@@ -82,14 +82,30 @@ pub struct FileState {
     pub cursor: usize,
     /// Top visible display line (updated by the renderer to follow the cursor).
     pub scroll: usize,
+    /// Horizontal scroll offset (columns) for long lines that don't fit.
+    pub hscroll: usize,
+    /// Width in cells of the widest line on either side, for clamping `hscroll`.
+    pub content_width: usize,
 }
 
 impl FileState {
     fn new(file: ReviewFile) -> Self {
+        let content_width = file
+            .rows
+            .iter()
+            .map(|r| {
+                let w =
+                    |c: &Option<diff::DiffCell>| c.as_ref().map_or(0, |c| c.text.chars().count());
+                w(&r.left).max(w(&r.right))
+            })
+            .max()
+            .unwrap_or(0);
         Self {
             file,
             cursor: 0,
             scroll: 0,
+            hscroll: 0,
+            content_width,
         }
     }
 
@@ -229,6 +245,15 @@ impl ReviewSession {
             } else {
                 fs.line_count().saturating_sub(1)
             };
+        }
+    }
+
+    /// Scroll the diff horizontally by `delta` columns (for lines wider than the
+    /// pane), clamped to `[0, content_width]`.
+    pub fn scroll_h(&mut self, delta: isize) {
+        if let Some(fs) = self.files.get_mut(self.selected) {
+            let max = fs.content_width as isize;
+            fs.hscroll = (fs.hscroll as isize + delta).clamp(0, max) as usize;
         }
     }
 

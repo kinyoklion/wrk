@@ -25,12 +25,18 @@ pub fn draw_review(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
 
-    // A one-row comment editor sits above the hint while typing.
+    // The comment editor sits above the hint while typing, growing (up to a cap)
+    // to keep the wrapped text and caret visible.
     let editing = review.editing.is_some();
+    let editor_h = review.editing.as_ref().map_or(0, |d| {
+        let wrapped = wrap_text(&d.buffer, (area.width as usize).max(1)).len();
+        // 1 label row + text rows, capped so the diff keeps most of the screen.
+        (1 + wrapped.clamp(1, 4)) as u16
+    });
     let constraints = if editing {
         vec![
             Constraint::Min(0),
-            Constraint::Length(1),
+            Constraint::Length(editor_h),
             Constraint::Length(1),
         ]
     } else {
@@ -59,8 +65,9 @@ pub fn draw_review(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Paragraph::new(hint_line(review, &theme)), hint_area);
 }
 
-/// The one-row comment input shown while typing (`c`). Shows the anchor and the
-/// buffer with a block cursor.
+/// The comment input shown while typing (`c`): a labeled anchor row, then the
+/// buffer wrapped across the remaining rows with a block cursor at the end. When
+/// the text outgrows the box it scrolls so the caret (last line) stays visible.
 fn draw_comment_editor(frame: &mut Frame, area: Rect, review: &ReviewSession, theme: &Theme) {
     let Some(d) = review.editing.as_ref() else {
         return;
@@ -74,16 +81,42 @@ fn draw_comment_editor(frame: &mut Frame, area: Rect, review: &ReviewSession, th
         Side::Before => "before",
         Side::After => "after",
     };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+    let (label_area, text_area) = (rows[0], rows[1]);
+
     let label = format!(" comment {path}:{} ({side}) › ", d.line);
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(label, Style::default().bg(theme.accent).fg(theme.accent_fg)),
-            // The block cursor sits immediately after the typed text — no gap.
-            Span::raw(d.buffer.clone()),
-            Span::styled("▏", Style::default().fg(theme.accent)),
-        ])),
-        area,
+        Paragraph::new(Line::from(Span::styled(
+            fit(&label, label_area.width as usize),
+            Style::default().bg(theme.accent).fg(theme.accent_fg),
+        ))),
+        label_area,
     );
+
+    let w = (text_area.width as usize).max(1);
+    let mut wrapped = wrap_text(&d.buffer, w);
+    // Keep the caret (the last wrapped line) in view when the text overflows.
+    let h = text_area.height as usize;
+    let start = wrapped.len().saturating_sub(h.max(1));
+    let last = wrapped.len() - 1;
+    let lines: Vec<Line> = wrapped
+        .drain(start..)
+        .enumerate()
+        .map(|(i, chunk)| {
+            if start + i == last {
+                Line::from(vec![
+                    Span::raw(chunk),
+                    Span::styled("▏", Style::default().fg(theme.accent)),
+                ])
+            } else {
+                Line::from(Span::raw(chunk))
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), text_area);
 }
 
 fn border(focused: bool, theme: &Theme) -> Style {
@@ -289,12 +322,12 @@ fn build_diff_lines(
             if let Some(c) = row.left.as_ref()
                 && let Some(body) = review.comment_for(review.selected, Side::Before, c.line)
             {
-                lines.push(comment_line(Side::Before, body, width, theme));
+                lines.extend(comment_lines(Side::Before, body, width, theme));
             }
             if let Some(c) = row.right.as_ref()
                 && let Some(body) = review.comment_for(review.selected, Side::After, c.line)
             {
-                lines.push(comment_line(Side::After, body, width, theme));
+                lines.extend(comment_lines(Side::After, body, width, theme));
             }
         }
     }
@@ -332,10 +365,12 @@ fn render_line(
         VisualLine::Row(r) => {
             let row = &fs.file.rows[*r];
             let (lc, rc) = side_colors(row.kind, theme);
+            let hscroll = fs.hscroll;
             let mut spans = vec![marker];
             spans.extend(cell_spans(
                 row.left.as_ref(),
                 text_w,
+                hscroll,
                 lc,
                 active_side == Some(Side::Before),
                 theme,
@@ -347,6 +382,7 @@ fn render_line(
             spans.extend(cell_spans(
                 row.right.as_ref(),
                 text_w,
+                hscroll,
                 rc,
                 active_side == Some(Side::After),
                 theme,
@@ -356,17 +392,30 @@ fn render_line(
     }
 }
 
-/// A rendered inline comment line, shown under the row it annotates.
-fn comment_line(side: Side, body: &str, width: usize, theme: &Theme) -> Line<'static> {
+/// Inline comment lines shown under the row they annotate, wrapped so a long
+/// comment stays fully readable (the tag prefixes the first line; continuations
+/// are indented to align under it).
+fn comment_lines(side: Side, body: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     let tag = match side {
         Side::Before => "before",
         Side::After => "after",
     };
-    let text = format!("      💬 ({tag}) {body}");
-    Line::from(Span::styled(
-        truncate_to_width(&text, width),
-        Style::default().fg(theme.accent),
-    ))
+    let prefix = format!("      💬 ({tag}) ");
+    let indent = cell_width(&prefix);
+    let avail = width.saturating_sub(indent).max(1);
+    let style = Style::default().fg(theme.accent);
+    wrap_text(body, avail)
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let text = if i == 0 {
+                format!("{prefix}{chunk}")
+            } else {
+                format!("{}{chunk}", " ".repeat(indent))
+            };
+            Line::from(Span::styled(text, style))
+        })
+        .collect()
 }
 
 /// (left fg, right fg) for a row kind; `None` cells render blank regardless.
@@ -382,6 +431,7 @@ fn side_colors(kind: RowKind, theme: &Theme) -> (Option<Color>, Option<Color>) {
 fn cell_spans(
     cell: Option<&DiffCell>,
     text_w: usize,
+    hscroll: usize,
     fg: Option<Color>,
     active: bool,
     theme: &Theme,
@@ -389,7 +439,7 @@ fn cell_spans(
     match cell {
         Some(c) => {
             let num = format!("{:>w$} ", c.line, w = NUM_W);
-            let text = fit(&c.text, text_w);
+            let text = fit(&drop_cols(&c.text, hscroll), text_w);
             let text_style = match fg {
                 Some(color) => Style::default().fg(color),
                 None => Style::default(),
@@ -414,6 +464,51 @@ fn fit(s: &str, w: usize) -> String {
     let t = truncate_to_width(s, w);
     let pad = w.saturating_sub(cell_width(&t));
     format!("{t}{}", " ".repeat(pad))
+}
+
+/// Drop the first `n` display columns of `s` (for horizontal scroll).
+fn drop_cols(s: &str, n: usize) -> String {
+    if n == 0 {
+        return s.to_string();
+    }
+    let mut used = 0;
+    let mut chars = s.chars();
+    for ch in chars.by_ref() {
+        used += cell_width(ch.encode_utf8(&mut [0u8; 4]));
+        if used >= n {
+            break;
+        }
+    }
+    chars.collect()
+}
+
+/// Greedy word-wrap to `width` cells, breaking at spaces where possible and hard-
+/// splitting words longer than the width. Always returns at least one line.
+fn wrap_text(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let mut out = Vec::new();
+    let mut line = String::new();
+    let mut w = 0;
+    for ch in s.chars() {
+        let cw = cell_width(ch.encode_utf8(&mut [0u8; 4]));
+        if w + cw > width {
+            // Prefer to break at the last space on the line.
+            if let Some(pos) = line.rfind(' ') {
+                let rest = line.split_off(pos + 1);
+                line.pop(); // drop the break space
+                out.push(std::mem::replace(&mut line, rest));
+            } else {
+                out.push(std::mem::take(&mut line));
+            }
+            w = cell_width(&line);
+        }
+        line.push(ch);
+        w += cw;
+    }
+    out.push(line);
+    out
 }
 
 fn centered(frame: &mut Frame, area: Rect, msg: &str, theme: &Theme) {
@@ -441,7 +536,7 @@ fn hint_line(review: &ReviewSession, theme: &Theme) -> Line<'static> {
         review.target.label(),
         if n == 1 { "" } else { "s" },
     );
-    let keys = "↑↓ move · Tab files/diff · h/l side · c comment · D delete · \
+    let keys = "↑↓ move · <> hscroll · Tab files/diff · h/l side · c comment · D delete · \
                 ⏎ reveal · e/o expand/collapse · q close";
     Line::from(vec![
         Span::styled(ctx, Style::default().fg(theme.accent)),
@@ -567,5 +662,74 @@ mod tests {
         let text = buffer_text(&term);
         assert!(text.contains("comment"), "editor label missing: {text:?}");
         assert!(text.contains("save"), "editor hint missing");
+    }
+
+    #[test]
+    fn wrap_text_breaks_at_spaces_and_hard_splits_long_words() {
+        let lines = wrap_text("the quick brown fox", 9);
+        assert!(lines.iter().all(|l| cell_width(l) <= 9), "{lines:?}");
+        assert!(lines.len() >= 2);
+        // A word longer than the width is hard-split rather than overflowing.
+        let long = wrap_text("AAAAAAAAAAAAAAAAAAAA", 5);
+        assert!(long.len() >= 4);
+        assert!(long.iter().all(|l| cell_width(l) <= 5));
+    }
+
+    #[test]
+    fn drop_cols_offsets_by_display_width() {
+        assert_eq!(drop_cols("hello world", 6), "world");
+        assert_eq!(drop_cols("hello", 0), "hello");
+        assert_eq!(drop_cols("hi", 10), "");
+    }
+
+    #[test]
+    fn horizontal_scroll_reveals_later_columns() {
+        // A line long enough to overflow the diff pane, changed near the end.
+        let tail = "x".repeat(60);
+        let before = format!("keep\nlead {tail} END\n");
+        let after = format!("keep\nlead {tail} DONE\n");
+        let file = build_review_file("w.rs".into(), FileStatus::Modified, &before, &after);
+        let mut app = App::new(Default::default(), Default::default());
+        app.review = Some(ReviewSession::new(
+            "p".into(),
+            None,
+            DiffTarget::WorkingVsHead,
+            vec![file],
+        ));
+        let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+        term.draw(|f| draw_review(f, &mut app, f.area())).unwrap();
+        assert!(
+            !buffer_text(&term).contains("DONE"),
+            "the changed tail is off-screen before scrolling"
+        );
+        app.review.as_mut().unwrap().scroll_h(60);
+        term.draw(|f| draw_review(f, &mut app, f.area())).unwrap();
+        assert!(
+            buffer_text(&term).contains("DONE"),
+            "horizontal scroll should bring the tail into view"
+        );
+    }
+
+    #[test]
+    fn a_long_comment_wraps_instead_of_truncating() {
+        let mut app = app_with_review();
+        {
+            let review = app.review.as_mut().unwrap();
+            review.set_all_revealed(true);
+            review.current_mut().unwrap().cursor = 1;
+            review.begin_comment();
+            for ch in "alpha bravo charlie delta echo foxtrot golf hotel india juliet".chars() {
+                review.editor_push_char(ch);
+            }
+            assert!(review.save_comment());
+        }
+        let mut term = Terminal::new(TestBackend::new(70, 40)).unwrap();
+        term.draw(|f| draw_review(f, &mut app, f.area())).unwrap();
+        let text = buffer_text(&term);
+        // The last word only appears if the comment wrapped rather than being cut.
+        assert!(
+            text.contains("juliet"),
+            "long comment should wrap, not truncate"
+        );
     }
 }

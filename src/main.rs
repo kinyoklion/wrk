@@ -1859,6 +1859,9 @@ fn handle_review_key(app: &mut App, key: KeyEvent) {
         KeyCode::PageUp | KeyCode::Char('u') => review.move_cursor(-10),
         KeyCode::Char('g') => review.cursor_to_edge(true),
         KeyCode::Char('G') => review.cursor_to_edge(false),
+        // Horizontal scroll for lines wider than the pane.
+        KeyCode::Char('<') | KeyCode::Char(',') => review.scroll_h(-8),
+        KeyCode::Char('>') | KeyCode::Char('.') => review.scroll_h(8),
         // Reveal the collapsed gap under the cursor; from the file list, Enter
         // jumps into the diff.
         KeyCode::Enter | KeyCode::Char(' ') => match review.focus {
