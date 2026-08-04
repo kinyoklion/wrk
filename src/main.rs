@@ -152,9 +152,13 @@ fn cmd_install_hooks() -> Result<()> {
     println!("installed hooks in {}", path.display());
     println!("hooks push status to the running wrk over its socket ($WRK_SOCK)");
     println!("(no-op for any Claude session not launched by wrk)");
-    match status::install_skill() {
-        Ok(skill) => println!("installed wrk-view skill in {}", skill.display()),
-        Err(e) => eprintln!("warning: could not install wrk-view skill: {e}"),
+    match status::install_skills() {
+        Ok(skills) => {
+            for path in skills {
+                println!("installed skill {}", path.display());
+            }
+        }
+        Err(e) => eprintln!("warning: could not install skills: {e}"),
     }
     Ok(())
 }
@@ -209,6 +213,11 @@ fn cmd_review(args: &[String]) -> Result<()> {
             Ok(())
         }
         "end" => {
+            // Read the mirrored comments (written by the running TUI) and print
+            // them as markdown for Claude to ingest, then ask the TUI to close.
+            let key = review_env_key();
+            let comments = review::read_mirror(&key);
+            print!("{}", format_review_comments(&comments));
             if let Some(sock) = sock {
                 let req = ipc::Request::Review(ipc::ReviewRequest {
                     tab: std::env::var("WRK_TAB").ok(),
@@ -217,7 +226,6 @@ fn cmd_review(args: &[String]) -> Result<()> {
                 });
                 let _ = ipc::send(Path::new(&sock), &req);
             }
-            println!("Ended the code review.");
             Ok(())
         }
         other => Err(anyhow!(
@@ -226,13 +234,55 @@ fn cmd_review(args: &[String]) -> Result<()> {
     }
 }
 
+/// Mirror-file key for an active review: the originating tab id, else the
+/// project name.
+fn review_mirror_key(session: &review::ReviewSession) -> String {
+    session
+        .tab_id
+        .clone()
+        .unwrap_or_else(|| session.project.clone())
+}
+
+/// The mirror key from the environment (client side of `wrk review end`):
+/// `WRK_TAB`, falling back to `WRK_PROJECT`.
+fn review_env_key() -> String {
+    std::env::var("WRK_TAB")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("WRK_PROJECT").ok())
+        .unwrap_or_default()
+}
+
+/// Render collected review comments as the markdown Claude reads on
+/// `/end-local-review`.
+fn format_review_comments(comments: &[review::ReviewComment]) -> String {
+    if comments.is_empty() {
+        return "No review comments were left.\n".to_string();
+    }
+    let mut out = format!("## Review comments ({})\n\n", comments.len());
+    for c in comments {
+        out.push_str(&format!(
+            "- `{}:{}` ({}): {}\n  > {}\n",
+            c.path,
+            c.line,
+            c.side,
+            c.body.trim(),
+            c.line_text.trim()
+        ));
+    }
+    out
+}
+
 fn cmd_uninstall_hooks() -> Result<()> {
     let (path, removed) = status::uninstall_hooks()?;
     println!("removed {removed} wrk hook entries from {}", path.display());
-    match status::uninstall_skill() {
-        Ok(Some(dir)) => println!("removed wrk-view skill from {}", dir.display()),
-        Ok(None) => {}
-        Err(e) => eprintln!("warning: could not remove wrk-view skill: {e}"),
+    match status::uninstall_skills() {
+        Ok(dirs) => {
+            for dir in dirs {
+                println!("removed skill {}", dir.display());
+            }
+        }
+        Err(e) => eprintln!("warning: could not remove skills: {e}"),
     }
     Ok(())
 }
@@ -953,13 +1003,28 @@ impl App {
                 let target = review::diff::DiffTarget::parse(target.as_deref().unwrap_or(""));
                 match review::diff::build_review(&path, &target) {
                     Ok(files) => {
-                        self.review =
-                            Some(review::ReviewSession::new(project, req.tab, target, files));
+                        let session = review::ReviewSession::new(project, req.tab, target, files);
+                        // Clear any stale mirror from a prior review of this tab.
+                        review::remove_mirror(&review_mirror_key(&session));
+                        self.review = Some(session);
                     }
                     Err(e) => push_error(&mut self.error, format!("wrk review: {e}")),
                 }
             }
-            ipc::ReviewKind::End => self.review = None,
+            ipc::ReviewKind::End => {
+                if let Some(session) = &self.review {
+                    review::remove_mirror(&review_mirror_key(session));
+                }
+                self.review = None;
+            }
+        }
+    }
+
+    /// Mirror the active review's comments to disk so `wrk review end` (a
+    /// separate process) can read them back and report them to Claude.
+    fn persist_review_comments(&self) {
+        if let Some(review) = &self.review {
+            let _ = review::write_mirror(&review_mirror_key(review), &review.comment_records());
         }
     }
 
@@ -1738,10 +1803,31 @@ fn handle_image_viewer_key(app: &mut App, key: KeyEvent) {
 const IMG_PAN_STEP: f32 = 0.2;
 
 /// Handle a key while the full-screen code-review overlay is open. Navigation is
-/// vim-ish; `q`/`Esc` closes (the review session is dropped, but comments — once
-/// PR 3 adds them — are already mirrored to disk for `wrk review end`).
+/// vim-ish; `q`/`Esc` closes (the review session is dropped, but comments are
+/// already mirrored to disk for `wrk review end`). While the comment editor is
+/// open, keys route to it instead.
 fn handle_review_key(app: &mut App, key: KeyEvent) {
-    use review::ReviewFocus;
+    use review::{ReviewFocus, Side};
+
+    // Comment editor captures input while typing.
+    if app.review.as_ref().is_some_and(|r| r.editing.is_some()) {
+        let review = app.review.as_mut().unwrap();
+        let mut changed = false;
+        match key.code {
+            KeyCode::Esc => review.cancel_comment(),
+            KeyCode::Enter => changed = review.save_comment(),
+            KeyCode::Backspace => review.editor_backspace(),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                review.editor_push_char(c)
+            }
+            _ => {}
+        }
+        if changed {
+            app.persist_review_comments();
+        }
+        return;
+    }
+
     if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
         app.review = None;
         return;
@@ -1749,9 +1835,17 @@ fn handle_review_key(app: &mut App, key: KeyEvent) {
     let Some(review) = app.review.as_mut() else {
         return;
     };
+    let mut changed = false;
     match key.code {
         KeyCode::Tab | KeyCode::BackTab => review.toggle_focus(),
-        KeyCode::Left | KeyCode::Char('h') => review.focus = ReviewFocus::Files,
+        // In the diff, ←/→ (h/l) pick the before/after comment side; in the file
+        // list they don't apply.
+        KeyCode::Left | KeyCode::Char('h') if review.focus == ReviewFocus::Diff => {
+            review.set_side(Side::Before)
+        }
+        KeyCode::Right | KeyCode::Char('l') if review.focus == ReviewFocus::Diff => {
+            review.set_side(Side::After)
+        }
         KeyCode::Right | KeyCode::Char('l') => review.focus = ReviewFocus::Diff,
         KeyCode::Down | KeyCode::Char('j') => match review.focus {
             ReviewFocus::Files => review.select_file(1),
@@ -1765,15 +1859,26 @@ fn handle_review_key(app: &mut App, key: KeyEvent) {
         KeyCode::PageUp | KeyCode::Char('u') => review.move_cursor(-10),
         KeyCode::Char('g') => review.cursor_to_edge(true),
         KeyCode::Char('G') => review.cursor_to_edge(false),
-        // Reveal the collapsed gap under the cursor; if focused on the file list,
-        // Enter jumps into the diff.
+        // Horizontal scroll for lines wider than the pane.
+        KeyCode::Char('<') | KeyCode::Char(',') => review.scroll_h(-8),
+        KeyCode::Char('>') | KeyCode::Char('.') => review.scroll_h(8),
+        // Reveal the collapsed gap under the cursor; from the file list, Enter
+        // jumps into the diff.
         KeyCode::Enter | KeyCode::Char(' ') => match review.focus {
             ReviewFocus::Files => review.focus = ReviewFocus::Diff,
             ReviewFocus::Diff => review.reveal_at_cursor(),
         },
         KeyCode::Char('e') => review.set_all_revealed(true),
         KeyCode::Char('o') => review.set_all_revealed(false),
+        // Comment on / delete a comment from the cursor row.
+        KeyCode::Char('c') if review.focus == ReviewFocus::Diff => review.begin_comment(),
+        KeyCode::Char('D') if review.focus == ReviewFocus::Diff => {
+            changed = review.delete_comment_at_cursor()
+        }
         _ => {}
+    }
+    if changed {
+        app.persist_review_comments();
     }
 }
 
@@ -3159,6 +3264,26 @@ mod tests {
         assert_eq!(a.status.subagents, 1);
         assert_eq!(b.status.event, Some(HookEvent::Waiting));
         assert_eq!(b.status.subagents, 0);
+    }
+
+    #[test]
+    fn format_review_comments_markdown() {
+        use crate::review::ReviewComment;
+
+        assert_eq!(
+            crate::format_review_comments(&[]),
+            "No review comments were left.\n"
+        );
+        let md = crate::format_review_comments(&[ReviewComment {
+            path: "src/main.rs".into(),
+            side: "after".into(),
+            line: 42,
+            line_text: "    x.unwrap()".into(),
+            body: "this can panic".into(),
+        }]);
+        assert!(md.starts_with("## Review comments (1)"));
+        assert!(md.contains("- `src/main.rs:42` (after): this can panic"));
+        assert!(md.contains("> x.unwrap()"));
     }
 
     #[test]
