@@ -439,6 +439,29 @@ pub fn remove_mirror(key: &str) {
     let _ = std::fs::remove_file(mirror_path(key));
 }
 
+/// Remove comment mirrors left by wrk instances that are no longer running. Keys
+/// are `<pid>-<…>`, so a dead leading pid means the mirror is a crash leak (and
+/// would otherwise let a stale `wrk review end` report old comments). Best-
+/// effort; called once at startup.
+pub fn sweep_stale_mirrors() {
+    let dir = crate::status::runtime_dir().join("review");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let dead_pid = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|stem| stem.split('-').next())
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .is_some_and(|pid| !crate::status::pid_is_alive(pid));
+        if dead_pid {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 fn sanitize(key: &str) -> String {
     key.chars()
         .map(|c| {

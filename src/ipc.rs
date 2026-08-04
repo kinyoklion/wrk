@@ -90,6 +90,33 @@ pub fn socket_path(pid: u32) -> PathBuf {
     socket_dir().join(format!("wrk-{pid}.sock"))
 }
 
+/// Parse the owning pid out of a socket path (`…/wrk-<pid>.sock`).
+pub fn pid_from_socket(path: &str) -> Option<u32> {
+    Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix("wrk-"))
+        .and_then(|n| n.strip_suffix(".sock"))
+        .and_then(|n| n.parse().ok())
+}
+
+/// Remove socket files left behind by wrk instances that are no longer running
+/// (unclean shutdown leaks `wrk-<pid>.sock`; nothing else reaps them). Best-
+/// effort; called once at startup.
+pub fn sweep_stale_sockets() {
+    let Ok(entries) = std::fs::read_dir(socket_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(pid) = path.to_str().and_then(pid_from_socket)
+            && !crate::status::pid_is_alive(pid)
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// Bind this process's socket and spawn an accept thread that forwards each
 /// parsed [`Request`] over the returned channel. Returns the socket path (for
 /// the env export and cleanup on exit) and the receiver (drained by the event
@@ -211,5 +238,17 @@ mod tests {
     fn socket_path_includes_pid() {
         let p = socket_path(4242);
         assert!(p.to_string_lossy().ends_with("wrk-4242.sock"));
+    }
+
+    #[test]
+    fn pid_round_trips_through_socket_path() {
+        let p = socket_path(4242);
+        assert_eq!(pid_from_socket(&p.to_string_lossy()), Some(4242));
+        assert_eq!(
+            pid_from_socket("/run/user/1000/wrk/sock/wrk-77.sock"),
+            Some(77)
+        );
+        assert_eq!(pid_from_socket("/tmp/not-a-wrk-socket"), None);
+        assert_eq!(pid_from_socket("wrk-abc.sock"), None);
     }
 }

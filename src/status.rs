@@ -81,6 +81,14 @@ impl TabStatus {
     }
 }
 
+/// Whether process `pid` is currently alive (Linux `/proc` check). Used to
+/// reclaim runtime artifacts (sockets, review mirrors) left by dead instances.
+/// A reused pid keeps its artifact around one extra generation — harmless, since
+/// the live instance uses a different pid.
+pub fn pid_is_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
 /// Base runtime directory for this user's wrk instance (holds the `sock/`
 /// subdir). Prefers `$XDG_RUNTIME_DIR/wrk`, falling back to `/tmp/wrk-<user>`.
 pub fn runtime_dir() -> PathBuf {
@@ -139,21 +147,14 @@ fn command_is_ours(cmd: &str) -> bool {
     HOOK_MARKERS.iter().any(|m| cmd.contains(m))
 }
 
-/// Absolute path to the running `wrk` binary, for embedding in hook commands.
-/// Falls back to a bare `wrk` (resolved via `PATH`) if it can't be determined.
-fn wrk_binary() -> String {
-    std::env::current_exe()
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "wrk".to_string())
-}
-
-fn hook_command(wrk: &str, kind: &str) -> String {
-    // Guard on WRK_SOCK so a Claude session not launched by wrk is a no-op; the
-    // trailing `; true` keeps the hook's exit status 0 either way (a failed
-    // `[ -n "" ]` test would otherwise be logged as a hook error). `wrk hook`
-    // itself never fails, but we still swallow its output for tidiness.
-    format!(r#"[ -n "$WRK_SOCK" ] && "{wrk}" hook {kind} >/dev/null 2>&1; true"#)
+fn hook_command(kind: &str) -> String {
+    // `$WRK_BIN` is the path to the running wrk, exported into every pane by the
+    // instance itself — so nothing machine-specific is baked into settings.json
+    // (portable across machines, and works under `cargo run`). Guard on WRK_SOCK
+    // (set together with WRK_BIN only in wrk-spawned panes) so a Claude session
+    // not launched by wrk is a no-op; the trailing `; true` keeps the hook's exit
+    // status 0 either way. `wrk hook` itself never fails; output is swallowed.
+    format!(r#"[ -n "$WRK_SOCK" ] && "$WRK_BIN" hook {kind} >/dev/null 2>&1; true"#)
 }
 
 fn settings_path() -> Result<PathBuf> {
@@ -172,15 +173,16 @@ const SKILL_INSTALL_MARKER: &str = "installed by `wrk install-hooks`";
 /// Directory (= `/command`) names of the skills wrk installs.
 const SKILL_NAMES: &[&str] = &["wrk-view", "start-local-review", "end-local-review"];
 
-/// The skills wrk installs into `~/.claude/skills/<name>/SKILL.md`, with `wrk`
-/// (the absolute binary path, resolved at install time) baked into every command
-/// — the skill `!`…`` preprocessor and hook shells don't load the user's PATH, so
-/// a bare `wrk` isn't reliably found.
-fn skill_specs(wrk: &str) -> Vec<(&'static str, String)> {
+/// The skills wrk installs into `~/.claude/skills/<name>/SKILL.md`. Every command
+/// invokes `"$WRK_BIN"` — the path to the running instance, exported into each
+/// pane — so nothing machine-specific is written to `~/.claude` (portable across
+/// machines and correct under `cargo run`). The `!`…`` preprocessor and hook
+/// shells inherit the pane env, so `$WRK_BIN` resolves there even without PATH.
+fn skill_specs() -> Vec<(&'static str, String)> {
     vec![
-        ("wrk-view", view_skill_markdown(wrk)),
-        ("start-local-review", review_start_skill_markdown(wrk)),
-        ("end-local-review", review_end_skill_markdown(wrk)),
+        ("wrk-view", view_skill_markdown()),
+        ("start-local-review", review_start_skill_markdown()),
+        ("end-local-review", review_end_skill_markdown()),
     ]
 }
 
@@ -189,27 +191,27 @@ fn marker_comment() -> String {
 }
 
 /// The `wrk-view` skill: teaches Claude to open files with `wrk view`.
-fn view_skill_markdown(wrk: &str) -> String {
+fn view_skill_markdown() -> String {
     format!(
         "---\n\
 name: wrk-view\n\
 description: Open a markdown file, README, or diagram in the wrk viewer. Use when the user asks to view, open, preview, show, or visualize a markdown/text file or diagram in the terminal.\n\
-allowed-tools: Bash({wrk} view *)\n\
+allowed-tools: Bash(\"$WRK_BIN\" view *)\n\
 ---\n\
 {marker}\n\
 \n\
 # View a file in the wrk viewer\n\
 \n\
-Run `{wrk} view <absolute-path>` to open a file in wrk's markdown viewer. Inside\n\
-a wrk session it opens as a new tab beside the conversation; in a plain shell it\n\
-opens a scrollable pager. It is read-only and never modifies the file.\n\
+Run `\"$WRK_BIN\" view <absolute-path>` to open a file in wrk's markdown viewer.\n\
+Inside a wrk session it opens as a new tab beside the conversation; in a plain\n\
+shell it opens a scrollable pager. It is read-only and never modifies the file.\n\
 \n\
 When the user asks to view, open, preview, show, or visualize a markdown file or\n\
 diagram:\n\
 \n\
 1. Resolve it to an absolute path (search with grep/find if they described the\n\
    file rather than naming it).\n\
-2. Run `{wrk} view <absolute-path>`.\n\
+2. Run `\"$WRK_BIN\" view <absolute-path>`.\n\
 3. Briefly confirm it is open.\n",
         marker = marker_comment()
     )
@@ -217,12 +219,12 @@ diagram:\n\
 
 /// The `/start-local-review` skill: model-invocable, so Claude inspects the repo
 /// and picks the comparison itself before opening the review overlay.
-fn review_start_skill_markdown(wrk: &str) -> String {
+fn review_start_skill_markdown() -> String {
     format!(
         "---\n\
 name: start-local-review\n\
 description: Start an in-editor code review in wrk. Use when the user asks to review changes, review a diff, do a local/code review, or look over their work side-by-side.\n\
-allowed-tools: Bash({wrk} review:*), Bash(git status:*), Bash(git log:*), Bash(git diff:*), Bash(git branch:*), Bash(git rev-parse:*)\n\
+allowed-tools: Bash(\"$WRK_BIN\" review:*), Bash(git status:*), Bash(git log:*), Bash(git diff:*), Bash(git branch:*), Bash(git rev-parse:*)\n\
 ---\n\
 {marker}\n\
 \n\
@@ -237,30 +239,30 @@ work out WHAT to review, then start it — don't invent feedback yourself.\n\
    - `git log --oneline <base>..HEAD` — are there local commits not on the base?\n\
 2. Choose the target:\n\
    - If the user named one, use it.\n\
-   - Else if there are uncommitted changes, review those: `{wrk} review start` (no argument = working tree vs HEAD).\n\
-   - Else if the branch has commits ahead of the base, review those: `{wrk} review start <base>..HEAD`.\n\
-3. Run `{wrk} review start <target>`. Then tell the user to comment in the wrk\n\
-   review pane and run `/end-local-review` when done. Wait for their comments —\n\
-   do not guess at review feedback.\n",
+   - Else if there are uncommitted changes, review those: `\"$WRK_BIN\" review start` (no argument = working tree vs HEAD).\n\
+   - Else if the branch has commits ahead of the base, review those: `\"$WRK_BIN\" review start <base>..HEAD`.\n\
+3. Run `\"$WRK_BIN\" review start <target>`. Then tell the user to comment in the\n\
+   wrk review pane and run `/end-local-review` when done. Wait for their\n\
+   comments — do not guess at review feedback.\n",
         marker = marker_comment()
     )
 }
 
 /// The `/end-local-review` skill: pulls the user's comments via `wrk review end`
-/// and hands them to Claude to act on. Uses the absolute `wrk` path because the
-/// `!`…`` preprocessor shell doesn't load the user's PATH.
-fn review_end_skill_markdown(wrk: &str) -> String {
+/// and hands them to Claude to act on. The `!`…`` preprocessor shell inherits the
+/// pane env, so `$WRK_BIN` resolves without relying on PATH.
+fn review_end_skill_markdown() -> String {
     format!(
         "---\n\
 name: end-local-review\n\
 description: End the in-editor code review in wrk and collect the user's comments. Use when the user says they are done reviewing, finished commenting, or asks to end the local review.\n\
-allowed-tools: Bash({wrk} review:*)\n\
+allowed-tools: Bash(\"$WRK_BIN\" review:*)\n\
 ---\n\
 {marker}\n\
 \n\
 # Collect local review comments\n\
 \n\
-!`{wrk} review end`\n\
+!`\"$WRK_BIN\" review end`\n\
 \n\
 The output above lists the comments the user left in the wrk review pane (file,\n\
 line, side, the comment, and the quoted line). Address each one:\n\
@@ -277,7 +279,7 @@ changed.\n",
 /// Write every wrk skill to `~/.claude/skills/<name>/SKILL.md`, overwriting any
 /// prior copy (so content fixes propagate). Returns the written paths.
 pub fn install_skills() -> Result<Vec<PathBuf>> {
-    install_skills_in(&claude_dir()?, &wrk_binary())
+    install_skills_in(&claude_dir()?)
 }
 
 /// Remove the wrk-installed skills. Returns the removed directories (only those
@@ -286,9 +288,9 @@ pub fn uninstall_skills() -> Result<Vec<PathBuf>> {
     uninstall_skills_in(&claude_dir()?)
 }
 
-fn install_skills_in(claude_dir: &Path, wrk: &str) -> Result<Vec<PathBuf>> {
+fn install_skills_in(claude_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut written = Vec::new();
-    for (name, markdown) in skill_specs(wrk) {
+    for (name, markdown) in skill_specs() {
         let dir = claude_dir.join("skills").join(name);
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = dir.join("SKILL.md");
@@ -341,14 +343,14 @@ fn write_settings(path: &Path, value: &Value) -> Result<()> {
 
 pub fn install_hooks() -> Result<PathBuf> {
     let path = settings_path()?;
-    install_hooks_at(&path, &wrk_binary())?;
+    install_hooks_at(&path)?;
     Ok(path)
 }
 
-/// Merge wrk's hook entries into the settings.json at `path`, embedding `wrk` as
-/// the binary path in each command. Split out from [`install_hooks`] so tests
-/// can drive it against a temp file with a deterministic binary path.
-fn install_hooks_at(path: &Path, wrk: &str) -> Result<()> {
+/// Merge wrk's hook entries into the settings.json at `path`. Commands reference
+/// `$WRK_BIN` (exported by the running instance) rather than a hardcoded path.
+/// Split out from [`install_hooks`] so tests can drive it against a temp file.
+fn install_hooks_at(path: &Path) -> Result<()> {
     let mut settings = read_settings(path)?;
 
     if !settings.is_object() {
@@ -372,7 +374,7 @@ fn install_hooks_at(path: &Path, wrk: &str) -> Result<()> {
             ));
         }
         let arr = arr_entry.as_array_mut().unwrap();
-        let new_cmd = hook_command(wrk, spec.kind);
+        let new_cmd = hook_command(spec.kind);
 
         // If a wrk-marked entry exists, refresh its command (so re-running
         // install-hooks upgrades legacy file-polling commands and picks up bug
@@ -521,10 +523,11 @@ mod tests {
     }
 
     #[test]
-    fn hook_command_guards_on_socket_and_invokes_wrk() {
-        let cmd = hook_command("/usr/bin/wrk", "busy");
+    fn hook_command_guards_on_socket_and_invokes_wrk_bin() {
+        let cmd = hook_command("busy");
         assert!(cmd.contains(r#"[ -n "$WRK_SOCK" ]"#));
-        assert!(cmd.contains(r#""/usr/bin/wrk" hook busy"#));
+        // Invokes the instance-provided binary path, never a hardcoded one.
+        assert!(cmd.contains(r#""$WRK_BIN" hook busy"#));
         assert!(cmd.trim_end().ends_with("; true"));
         assert!(command_is_ours(&cmd));
     }
@@ -544,7 +547,7 @@ mod tests {
     fn install_writes_all_events_with_matchers() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
-        install_hooks_at(&path, "/opt/wrk").unwrap();
+        install_hooks_at(&path).unwrap();
 
         let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         let hooks = v["hooks"].as_object().unwrap();
@@ -576,13 +579,13 @@ mod tests {
         });
         fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
 
-        install_hooks_at(&path, "/opt/wrk").unwrap();
+        install_hooks_at(&path).unwrap();
         let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         let stop = v["hooks"]["Stop"].as_array().unwrap();
         // Refreshed in place — not duplicated.
         assert_eq!(stop.len(), 1);
         let cmd = stop[0]["hooks"][0]["command"].as_str().unwrap();
-        assert!(cmd.contains(r#""/opt/wrk" hook stopped"#));
+        assert!(cmd.contains(r#""$WRK_BIN" hook stopped"#));
         assert!(!cmd.contains("WRK_STATUS_FILE"));
     }
 
@@ -614,22 +617,57 @@ mod tests {
     }
 
     #[test]
-    fn skills_have_names_markers_and_absolute_wrk_paths() {
-        // Every skill carries the marker and bakes in the absolute wrk path (so
-        // the `!`…`` preprocessor / hook shells, which lack the user's PATH, can
-        // find it); the review-start skill stays model-invocable; the end skill
-        // pulls comments via `wrk review end`.
-        let wrk = "/opt/bin/wrk";
-        for (name, md) in skill_specs(wrk) {
+    fn skills_use_wrk_bin_and_carry_markers() {
+        // Every skill carries the marker and invokes `"$WRK_BIN"` (the instance-
+        // provided path) — never a hardcoded path; the review-start skill stays
+        // model-invocable; the end skill pulls comments via `wrk review end`.
+        for (name, md) in skill_specs() {
             assert!(md.contains(&format!("name: {name}")), "{name} name");
             assert!(md.contains(SKILL_INSTALL_MARKER), "{name} marker");
-            assert!(md.contains(wrk), "{name} embeds the wrk path");
+            assert!(md.contains("\"$WRK_BIN\""), "{name} uses $WRK_BIN");
         }
-        let end = review_end_skill_markdown(wrk);
-        assert!(end.contains("!`/opt/bin/wrk review end`"));
-        let start = review_start_skill_markdown(wrk);
-        assert!(start.contains("/opt/bin/wrk review start"));
+        assert!(review_end_skill_markdown().contains("!`\"$WRK_BIN\" review end`"));
+        let start = review_start_skill_markdown();
+        assert!(start.contains("\"$WRK_BIN\" review start"));
         assert!(!start.contains("disable-model-invocation"));
+    }
+
+    /// Regression guard: nothing wrk writes into `~/.claude` (hook commands or
+    /// skills) may embed an absolute filesystem path — those are machine-specific
+    /// and break when the config is used on another machine or under `cargo run`.
+    /// Everything must go through `$WRK_BIN`.
+    #[test]
+    fn no_machine_specific_paths_in_hooks_or_skills() {
+        let looks_absolute = |s: &str| {
+            s.split_whitespace()
+                .any(|w| w.trim_matches('"').starts_with('/'))
+        };
+        for spec in HOOKS {
+            let cmd = hook_command(spec.kind);
+            assert!(
+                cmd.contains("$WRK_BIN"),
+                "hook {} must use $WRK_BIN",
+                spec.kind
+            );
+            assert!(
+                !looks_absolute(&cmd),
+                "hook {} embeds an absolute path: {cmd}",
+                spec.kind
+            );
+        }
+        for (name, md) in skill_specs() {
+            // Skill bodies legitimately mention `<absolute-path>` as a placeholder;
+            // check only that no line invokes wrk via an absolute path.
+            for line in md
+                .lines()
+                .filter(|l| l.contains("WRK") || l.contains("review") || l.contains("view"))
+            {
+                assert!(
+                    !line.contains("/wrk ") && !line.contains("/wrk\""),
+                    "{name} line embeds an absolute wrk path: {line}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -637,7 +675,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let claude = home.path().join(".claude");
 
-        let paths = install_skills_in(&claude, "/opt/bin/wrk").unwrap();
+        let paths = install_skills_in(&claude).unwrap();
         assert_eq!(paths.len(), SKILL_NAMES.len());
         assert!(claude.join("skills/wrk-view/SKILL.md").exists());
         assert!(claude.join("skills/start-local-review/SKILL.md").exists());
