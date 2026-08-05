@@ -234,23 +234,35 @@ fn cmd_review(args: &[String]) -> Result<()> {
     }
 }
 
-/// Mirror-file key for an active review: the originating tab id, else the
-/// project name.
+/// Mirror-file key for an active review, prefixed with this instance's pid so
+/// concurrent wrk instances never share a mirror file and a new instance never
+/// reads a dead predecessor's leftover mirror (a per-process `WRK_TAB` like
+/// "tab0" is otherwise reused by every instance). The pid also lets a startup
+/// sweep reclaim dead instances' mirrors. Suffix: the tab id, else the project.
 fn review_mirror_key(session: &review::ReviewSession) -> String {
-    session
+    let suffix = session
         .tab_id
         .clone()
-        .unwrap_or_else(|| session.project.clone())
+        .unwrap_or_else(|| session.project.clone());
+    format!("{}-{suffix}", std::process::id())
 }
 
-/// The mirror key from the environment (client side of `wrk review end`):
-/// `WRK_TAB`, falling back to `WRK_PROJECT`.
+/// The mirror key from the environment (client side of `wrk review end`). Must
+/// match [`review_mirror_key`]: the owning instance's pid (parsed from the
+/// `WRK_SOCK` path, which is `…/wrk-<pid>.sock`) + `WRK_TAB` (else `WRK_PROJECT`).
 fn review_env_key() -> String {
-    std::env::var("WRK_TAB")
+    let suffix = std::env::var("WRK_TAB")
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(|| std::env::var("WRK_PROJECT").ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    match std::env::var("WRK_SOCK")
+        .ok()
+        .and_then(|s| ipc::pid_from_socket(&s))
+    {
+        Some(pid) => format!("{pid}-{suffix}"),
+        None => suffix,
+    }
 }
 
 /// Render collected review comments as the markdown Claude reads on
@@ -673,12 +685,19 @@ impl App {
     }
 
     /// Environment common to every PTY wrk spawns for a project: `WRK_PROJECT`
-    /// (so `wrk view` can name its originating project) and `WRK_SOCK` (this
-    /// instance's IPC socket). Claude tabs additionally get `WRK_TAB`.
+    /// (so `wrk view` can name its originating project), `WRK_SOCK` (this
+    /// instance's IPC socket), and `WRK_BIN` (the path to *this* running `wrk`
+    /// binary). Hooks and skills invoke `"$WRK_BIN" …` rather than hardcoding a
+    /// path, so nothing machine-specific is baked into `~/.claude` — it works
+    /// wherever this instance runs, including under `cargo run`. Claude tabs
+    /// additionally get `WRK_TAB`.
     fn base_pty_env(&self, project_name: &str) -> Vec<(String, String)> {
         let mut env = vec![("WRK_PROJECT".to_string(), project_name.to_string())];
         if let Some(sock) = &self.socket_path {
             env.push(("WRK_SOCK".to_string(), sock.to_string_lossy().into_owned()));
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            env.push(("WRK_BIN".to_string(), exe.to_string_lossy().into_owned()));
         }
         env
     }
@@ -1310,6 +1329,12 @@ fn run_tui() -> Result<()> {
         Settings::default()
     });
     let mut app = App::new(store, settings);
+
+    // Reclaim runtime artifacts leaked by instances that exited uncleanly
+    // (sockets and review-comment mirrors whose owning pid is gone), so stale
+    // files don't accumulate or feed a later `wrk review end` old comments.
+    ipc::sweep_stale_sockets();
+    review::sweep_stale_mirrors();
 
     // IPC socket for `wrk view` and `wrk hook` run inside a pane. Non-fatal if
     // it can't bind — `wrk view` falls back to the pager and hook status pushes
@@ -3284,6 +3309,21 @@ mod tests {
         assert!(md.starts_with("## Review comments (1)"));
         assert!(md.contains("- `src/main.rs:42` (after): this can panic"));
         assert!(md.contains("> x.unwrap()"));
+    }
+
+    #[test]
+    fn review_mirror_key_is_pid_prefixed() {
+        use crate::review::{ReviewSession, diff::DiffTarget};
+        let s = ReviewSession::new(
+            "proj".into(),
+            Some("tab0".into()),
+            DiffTarget::WorkingVsHead,
+            vec![],
+        );
+        let key = crate::review_mirror_key(&s);
+        // "<pid>-tab0" — the pid prefix keeps concurrent instances (and dead
+        // predecessors, whose "tab0" repeats) from sharing a mirror file.
+        assert_eq!(key, format!("{}-tab0", std::process::id()));
     }
 
     #[test]
