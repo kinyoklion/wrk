@@ -100,18 +100,30 @@ pub fn pid_from_socket(path: &str) -> Option<u32> {
         .and_then(|n| n.parse().ok())
 }
 
+/// Is a live wrk actually listening on this socket path? A bound listener
+/// accepts the connection (even mid-request, via the listen backlog); a leftover
+/// socket file whose owner is gone refuses it (`ECONNREFUSED`). This is the
+/// authoritative liveness test — unlike a pid check it can't be fooled by pid
+/// reuse (an unrelated process inheriting a dead wrk's pid). The probe connects
+/// and immediately drops; the peer's accept loop reads an empty line and ignores
+/// it, so a live instance is never disturbed.
+fn socket_is_live(path: &Path) -> bool {
+    UnixStream::connect(path).is_ok()
+}
+
 /// Remove socket files left behind by wrk instances that are no longer running
-/// (unclean shutdown leaks `wrk-<pid>.sock`; nothing else reaps them). Best-
-/// effort; called once at startup.
+/// (unclean shutdown leaks `wrk-<pid>.sock`; nothing else reaps them). Liveness
+/// is probed by connecting, not by checking the owning pid — a crashed wrk whose
+/// pid was later reused by an unrelated process would pass a `/proc` check and
+/// leave the dead socket lingering (then `wrk view`/`wrk hook` connect to a path
+/// with no wrk behind it). Best-effort; called once at startup.
 pub fn sweep_stale_sockets() {
     let Ok(entries) = std::fs::read_dir(socket_dir()) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if let Some(pid) = path.to_str().and_then(pid_from_socket)
-            && !crate::status::pid_is_alive(pid)
-        {
+        if path.to_str().and_then(pid_from_socket).is_some() && !socket_is_live(&path) {
             let _ = std::fs::remove_file(&path);
         }
     }
@@ -238,6 +250,25 @@ mod tests {
     fn socket_path_includes_pid() {
         let p = socket_path(4242);
         assert!(p.to_string_lossy().ends_with("wrk-4242.sock"));
+    }
+
+    #[test]
+    fn socket_is_live_only_when_a_listener_is_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wrk-99.sock");
+
+        // No file yet → not live.
+        assert!(!socket_is_live(&path));
+
+        // A bound listener → live.
+        let listener = UnixListener::bind(&path).unwrap();
+        assert!(socket_is_live(&path));
+
+        // Dropping the listener leaves the socket *file* behind (as an unclean
+        // shutdown does) but nothing listens → connect refused → not live.
+        drop(listener);
+        assert!(path.exists());
+        assert!(!socket_is_live(&path));
     }
 
     #[test]
