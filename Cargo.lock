@@ -3522,7 +3522,7 @@ dependencies = [
 
 [[package]]
 name = "wrk"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -3546,7 +3546,7 @@ dependencies = [
 
 [[package]]
 name = "wrk-markdown"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "carcimaid",
  "image",
@@ -3560,7 +3560,7 @@ dependencies = [
 
 [[package]]
 name = "wrk-md"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "clap",
