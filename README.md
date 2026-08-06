@@ -265,7 +265,7 @@ the embedded PTY child.
 [[project]]
 name = "wrk"
 path = "/home/rlamb/projects/wrk"
-layout = "tabbed"   # optional, defaults to split
+layout = "split"    # optional, defaults to tabbed
 claude_sessions = [
   { name = "main",      session_id = "5d1f9f10-56bc-43f2-9dd5-ca711af4f3f9" },
   { name = "refactor" },   # no session_id → wrk mints a UUID on first run
