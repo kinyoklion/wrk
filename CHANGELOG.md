@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.17](https://github.com/kinyoklion/wrk/compare/wrk-v0.1.16...wrk-v0.1.17) (2026-08-06)
+
+### Features
+
+* **layout:** default new projects to tabbed layout (#92) ([#92](https://github.com/kinyoklion/wrk/issues/92))
+
 ## [0.1.16](https://github.com/kinyoklion/wrk/compare/wrk-v0.1.15...wrk-v0.1.16) (2026-08-06)
 
 ### Features
