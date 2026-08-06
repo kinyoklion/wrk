@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.16](https://github.com/kinyoklion/wrk/compare/wrk-v0.1.15...wrk-v0.1.16) (2026-08-06)
+
+### Features
+
+* **review:** line comments, reporting, and review skills (#42) (#85) ([#42](https://github.com/kinyoklion/wrk/issues/42)) ([#85](https://github.com/kinyoklion/wrk/issues/85)) ([#42](https://github.com/kinyoklion/wrk/issues/42)) ([#42](https://github.com/kinyoklion/wrk/issues/42)) ([#81](https://github.com/kinyoklion/wrk/issues/81)) ([#83](https://github.com/kinyoklion/wrk/issues/83)) ([#42](https://github.com/kinyoklion/wrk/issues/42)) ([#42](https://github.com/kinyoklion/wrk/issues/42)) ([#42](https://github.com/kinyoklion/wrk/issues/42))
+* **review:** read-only side-by-side review overlay (#42) (#83) ([#42](https://github.com/kinyoklion/wrk/issues/42)) ([#83](https://github.com/kinyoklion/wrk/issues/83)) ([#42](https://github.com/kinyoklion/wrk/issues/42)) ([#81](https://github.com/kinyoklion/wrk/issues/81))
+* **review:** diff engine for in-TUI code review (#42) (#81) ([#42](https://github.com/kinyoklion/wrk/issues/42)) ([#81](https://github.com/kinyoklion/wrk/issues/81)) ([#42](https://github.com/kinyoklion/wrk/issues/42))
+
+### Bug Fixes
+
+* **ipc:** probe stale sockets by connecting, not by pid liveness (#91) ([#91](https://github.com/kinyoklion/wrk/issues/91))
+* **deps:** raise ratatui floor to 0.30.2 for CellDiffOption (#88) (#90) ([#88](https://github.com/kinyoklion/wrk/issues/88)) ([#90](https://github.com/kinyoklion/wrk/issues/90))
+* **review:** portable $WRK_BIN for hooks/skills + reap unclean-shutdown artifacts (#42) (#89) ([#42](https://github.com/kinyoklion/wrk/issues/42)) ([#89](https://github.com/kinyoklion/wrk/issues/89))
+* **ui:** collapse the status line responsively on narrow windows (#27) (#80) ([#27](https://github.com/kinyoklion/wrk/issues/27)) ([#80](https://github.com/kinyoklion/wrk/issues/80))
+
 ## [0.1.15](https://github.com/kinyoklion/wrk/compare/wrk-v0.1.14...wrk-v0.1.15) (2026-07-29)
 
 ### Features
