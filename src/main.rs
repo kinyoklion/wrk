@@ -632,7 +632,7 @@ impl App {
             error,
             info: None,
             last_click: None,
-            layout_mode: LayoutMode::Split,
+            layout_mode: LayoutMode::Tabbed,
             sidebar_hidden: false,
             claude_pct: 50,
             shell_passthrough: false,
