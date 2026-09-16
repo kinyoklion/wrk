@@ -5,7 +5,7 @@
 //! into a side-by-side view). Because we keep both full file texts, collapsed
 //! unchanged regions can be revealed without re-running git.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow};
@@ -329,6 +329,30 @@ fn decode(bytes: Vec<u8>) -> Option<String> {
 
 // --- git plumbing ---------------------------------------------------------
 
+/// Resolve the top-level directory of the git repository enclosing `dir`.
+///
+/// Runs `git rev-parse --show-toplevel` with `dir` as the working directory, so
+/// a worktree nested inside a non-git parent resolves to the worktree's own root
+/// (not the parent). All the other git commands then run from this root, where
+/// `git diff --name-status` / `git show <rev>:<path>` emit repo-root-relative
+/// paths that agree with the working-tree reads in [`new_side`]. Errors when
+/// `dir` is not inside a git repository.
+pub fn resolve_repo_root(dir: &Path) -> Result<PathBuf> {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .with_context(|| format!("running `git rev-parse` in {}", dir.display()))?;
+    if !out.status.success() {
+        return Err(anyhow!("not a git repository: {}", dir.display()));
+    }
+    let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if root.is_empty() {
+        return Err(anyhow!("not a git repository: {}", dir.display()));
+    }
+    Ok(PathBuf::from(root))
+}
+
 /// The changed files under `target`, sorted by path. For `WorkingVsHead` this
 /// includes untracked files (reported as `Added`).
 pub fn changed_files(project: &Path, target: &DiffTarget) -> Result<Vec<(String, FileStatus)>> {
@@ -633,5 +657,72 @@ mod tests {
             .unwrap();
         assert_eq!(replaced.left.as_ref().unwrap().text, "two");
         assert_eq!(replaced.right.as_ref().unwrap().text, "TWO");
+    }
+
+    /// `resolve_repo_root` walks up from a nested subdirectory to the repo root,
+    /// and errors when handed a directory it can't enter (no repo to find).
+    #[test]
+    fn resolve_repo_root_from_subdir() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+
+        let sub = root.join("a/b/c");
+        std::fs::create_dir_all(&sub).unwrap();
+        let resolved = resolve_repo_root(&sub).unwrap();
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            root.canonicalize().unwrap()
+        );
+
+        // A directory that can't be entered can't resolve to a repo.
+        assert!(resolve_repo_root(&root.join("does-not-exist")).is_err());
+    }
+
+    /// The #94 shape: a worktree nested inside a directory that is itself not a
+    /// git repo. Resolving from the worktree yields the worktree's own root (not
+    /// the non-git container), and a diff built there sees its changes.
+    #[test]
+    fn resolve_repo_root_in_worktree_nested_in_non_git_dir() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "t@example.com"]);
+        git(&main, &["config", "user.name", "Test"]);
+        git(&main, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(main.join("file.txt"), "a\n").unwrap();
+        git(&main, &["add", "."]);
+        git(&main, &["commit", "-qm", "init"]);
+
+        // Non-git container holding the worktree.
+        let wt = dir.path().join("container").join("wt");
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "feature",
+            ],
+        );
+
+        let root = resolve_repo_root(&wt).unwrap();
+        assert_eq!(root.canonicalize().unwrap(), wt.canonicalize().unwrap());
+
+        std::fs::write(wt.join("file.txt"), "a\nb\n").unwrap();
+        let files = build_review(&root, &DiffTarget::WorkingVsHead).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "file.txt");
+        assert_eq!(files[0].status, FileStatus::Modified);
     }
 }

@@ -63,6 +63,11 @@ pub struct ReviewRequest {
     /// Project (`WRK_PROJECT`) whose working tree is reviewed; `None` → active.
     #[serde(default)]
     pub project: Option<String>,
+    /// Directory `wrk review start` was invoked in. The diff is built against
+    /// the git repo enclosing it (which may be a worktree nested inside a
+    /// non-git project directory); `None` → fall back to the project path.
+    #[serde(default)]
+    pub cwd: Option<String>,
     pub kind: ReviewKind,
 }
 
@@ -212,6 +217,7 @@ mod tests {
         let start = Request::Review(ReviewRequest {
             tab: Some("tab7".into()),
             project: Some("web".into()),
+            cwd: Some("/home/me/proj/worktree".into()),
             kind: ReviewKind::Start {
                 target: Some("main..HEAD".into()),
             },
@@ -221,7 +227,7 @@ mod tests {
         assert!(json.contains(r#""action":"start""#));
         assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), start);
 
-        // End needs no fields beyond the action tag; absent tab/project default.
+        // End needs no fields beyond the action tag; absent tab/project/cwd default.
         let end: Request =
             serde_json::from_str(r#"{"cmd":"review","kind":{"action":"end"}}"#).unwrap();
         assert_eq!(
@@ -229,6 +235,7 @@ mod tests {
             Request::Review(ReviewRequest {
                 tab: None,
                 project: None,
+                cwd: None,
                 kind: ReviewKind::End,
             })
         );

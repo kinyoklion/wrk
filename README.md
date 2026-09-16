@@ -403,7 +403,9 @@ back to the Claude session that opened the review (file, line, side, and the
 quoted line) for it to act on.
 
 Manually, the same is available as `wrk review start [<rev>|<a>..<b>]` and
-`wrk review end` (run from inside a wrk pane). Diffing shells out to `git`.
+`wrk review end` (run from inside a wrk pane). The review targets the git
+repository enclosing the directory you run it from — so a worktree nested inside
+a non-git project directory works. Diffing shells out to `git`.
 
 ## License
 

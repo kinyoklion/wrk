@@ -82,9 +82,26 @@ enum Command {
     /// `wrk review start [target]` / `wrk review end`. `target` is a git rev or
     /// `a..b` range; empty compares the working tree to HEAD.
     Review {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        #[command(subcommand)]
+        action: ReviewAction,
     },
+}
+
+/// `wrk review` subcommands. Modeled as real clap subcommands (rather than a
+/// raw arg vec) so `wrk review start --help` prints help and a `target`
+/// beginning with `-` is rejected instead of opening a review against a bogus
+/// rev (#95).
+#[derive(Subcommand)]
+enum ReviewAction {
+    /// Open the review overlay for the git repository enclosing the current
+    /// directory. `target` is a git rev or `a..b` range; omit it to compare the
+    /// working tree to HEAD.
+    Start {
+        /// Git revision or `a..b` range to review (default: working tree vs HEAD).
+        target: Option<String>,
+    },
+    /// Close the active review overlay and print the collected comments.
+    End,
 }
 
 fn main() -> Result<()> {
@@ -97,7 +114,7 @@ fn main() -> Result<()> {
         Some(Command::InstallHooks) => cmd_install_hooks(),
         Some(Command::UninstallHooks) => cmd_uninstall_hooks(),
         Some(Command::Hook { kind }) => cmd_hook(&kind),
-        Some(Command::Review { args }) => cmd_review(&args),
+        Some(Command::Review { action }) => cmd_review(action),
         None => run_tui(),
     }
 }
@@ -183,24 +200,31 @@ fn cmd_hook(kind: &str) -> Result<()> {
 /// Start or end an in-TUI code review in the running wrk instance:
 /// `wrk review start [target]` opens the review overlay; `wrk review end`
 /// closes it. Both require being inside a wrk-managed pane (`WRK_SOCK` set).
-fn cmd_review(args: &[String]) -> Result<()> {
-    let sub = args.first().map(String::as_str).unwrap_or("");
-    let rest = args.get(1..).unwrap_or(&[]).join(" ");
+fn cmd_review(action: ReviewAction) -> Result<()> {
     let sock = std::env::var("WRK_SOCK").ok().filter(|s| !s.is_empty());
-    match sub {
-        "start" => {
+    match action {
+        ReviewAction::Start { target } => {
             let sock = sock.ok_or_else(|| {
                 anyhow!("`wrk review` must be run inside a wrk-managed pane (no WRK_SOCK)")
             })?;
-            let target = review::diff::DiffTarget::parse(&rest);
+            let target = target.unwrap_or_default();
+            let target = target.trim();
+            let parsed = review::diff::DiffTarget::parse(target);
+            // Send the directory `wrk review start` ran in so the TUI diffs the
+            // git repo enclosing it — the project dir may be a non-git container
+            // of clones/worktrees, so its own cwd can't be assumed (#94).
+            let cwd = std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned());
             let req = ipc::Request::Review(ipc::ReviewRequest {
                 tab: std::env::var("WRK_TAB").ok(),
                 project: std::env::var("WRK_PROJECT").ok(),
+                cwd,
                 kind: ipc::ReviewKind::Start {
-                    target: if rest.trim().is_empty() {
+                    target: if target.is_empty() {
                         None
                     } else {
-                        Some(rest.trim().to_string())
+                        Some(target.to_string())
                     },
                 },
             });
@@ -208,11 +232,11 @@ fn cmd_review(args: &[String]) -> Result<()> {
             println!(
                 "Opened a code review ({}) in the wrk review pane. \
                  Review it there, then run /end-local-review to collect comments.",
-                target.label()
+                parsed.label()
             );
             Ok(())
         }
-        "end" => {
+        ReviewAction::End => {
             // Read the mirrored comments (written by the running TUI) and print
             // them as markdown for Claude to ingest, then ask the TUI to close.
             let key = review_env_key();
@@ -222,15 +246,13 @@ fn cmd_review(args: &[String]) -> Result<()> {
                 let req = ipc::Request::Review(ipc::ReviewRequest {
                     tab: std::env::var("WRK_TAB").ok(),
                     project: std::env::var("WRK_PROJECT").ok(),
+                    cwd: None,
                     kind: ipc::ReviewKind::End,
                 });
                 let _ = ipc::send(Path::new(&sock), &req);
             }
             Ok(())
         }
-        other => Err(anyhow!(
-            "unknown `wrk review` subcommand '{other}'; use `start [target]` or `end`"
-        )),
     }
 }
 
@@ -1019,8 +1041,29 @@ impl App {
                     );
                     return;
                 };
+                // Diff the git repo enclosing the directory `wrk review start`
+                // ran in (its worktree/repo root), falling back to the project
+                // path. The project dir itself may be a non-git container of many
+                // clones/worktrees, so running git there fails (#94).
+                let start_dir = req
+                    .cwd
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from);
+                let repo_root = match &start_dir {
+                    Some(dir) => review::diff::resolve_repo_root(dir)
+                        .or_else(|_| review::diff::resolve_repo_root(&path)),
+                    None => review::diff::resolve_repo_root(&path),
+                };
+                let repo_root = match repo_root {
+                    Ok(root) => root,
+                    Err(e) => {
+                        push_error(&mut self.error, format!("wrk review: {e}"));
+                        return;
+                    }
+                };
                 let target = review::diff::DiffTarget::parse(target.as_deref().unwrap_or(""));
-                match review::diff::build_review(&path, &target) {
+                match review::diff::build_review(&repo_root, &target) {
                     Ok(files) => {
                         let session = review::ReviewSession::new(project, req.tab, target, files);
                         // Clear any stale mirror from a prior review of this tab.
