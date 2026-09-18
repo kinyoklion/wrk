@@ -45,6 +45,17 @@ pub struct Settings {
     /// `false` to quit immediately.
     #[serde(default = "default_true")]
     pub confirm_quit: bool,
+
+    /// Which harness new tabs use by default. `claude` unless overridden.
+    #[serde(default)]
+    pub default_harness: HarnessKind,
+
+    /// Per-harness configuration (`[harness.claude]`, `[harness.kimi]`): whether
+    /// the harness is offered, and a custom launch command. Anything unset falls
+    /// back to built-in defaults (see [`Settings::harness_command`] /
+    /// [`Settings::harness_enabled`]).
+    #[serde(default)]
+    pub harness: HarnessTable,
 }
 
 fn default_true() -> bool {
@@ -60,8 +71,78 @@ impl Default for Settings {
             markdown: MarkdownConfig::default(),
             keys: KeyConfig::default(),
             confirm_quit: true,
+            default_harness: HarnessKind::default(),
+            harness: HarnessTable::default(),
         }
     }
+}
+
+// -----------------------------------------------------------------------------
+// Harnesses
+// -----------------------------------------------------------------------------
+
+/// A coding-agent CLI wrk can drive in a tab. Claude Code is the default;
+/// others are opt-in. Flows through settings → store (`SessionRef.harness`) →
+/// tab (`ClaudeTab.harness`) → spawn/status so each tab knows which agent it is
+/// and how to build its launch, resume, and hook commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HarnessKind {
+    #[default]
+    Claude,
+    Kimi,
+}
+
+impl HarnessKind {
+    /// Every harness wrk knows about, in display order.
+    pub const ALL: [HarnessKind; 2] = [HarnessKind::Claude, HarnessKind::Kimi];
+
+    /// Stable lowercase id used in config, the `wrk hook --harness` flag, and
+    /// user-facing labels.
+    pub fn id(self) -> &'static str {
+        match self {
+            HarnessKind::Claude => "claude",
+            HarnessKind::Kimi => "kimi",
+        }
+    }
+
+    /// Parse the `--harness` flag / a config id. `None` for anything unknown.
+    pub fn from_id(s: &str) -> Option<Self> {
+        match s {
+            "claude" => Some(HarnessKind::Claude),
+            "kimi" => Some(HarnessKind::Kimi),
+            _ => None,
+        }
+    }
+
+    /// True for Claude — lets `serde(skip_serializing_if)` keep the on-disk
+    /// schema byte-identical for claude-only configs (the common case).
+    pub fn is_claude(&self) -> bool {
+        matches!(self, HarnessKind::Claude)
+    }
+}
+
+/// On-disk `[harness.<kind>]` tables. Each is optional; a missing table means
+/// "use the built-in defaults for that harness".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HarnessTable {
+    pub claude: Option<HarnessConfig>,
+    pub kimi: Option<HarnessConfig>,
+}
+
+/// User overrides for one harness. Both fields optional so partial tables
+/// (`[harness.kimi] enabled = true`) work.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HarnessConfig {
+    /// Whether the harness is offered in the new-tab picker and gets hooks/
+    /// skills installed. Unset → the harness's built-in default (claude on,
+    /// kimi off).
+    pub enabled: Option<bool>,
+    /// Full launch command + wrapper args, e.g. `["steam-run", "kimi"]`. Unset →
+    /// the harness's built-in default command.
+    pub command: Option<Vec<String>>,
 }
 
 impl Settings {
@@ -85,6 +166,90 @@ impl Settings {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
         vec![shell]
     }
+
+    /// The launch command (+ wrapper args) for `harness`, without any session
+    /// flag. Resolution order:
+    /// - Claude: `[harness.claude].command` → the legacy top-level
+    ///   `claude_command` → `["claude"]`, with a trailing `--continue` stripped
+    ///   (see [`Self::claude_base`]).
+    /// - Kimi: `[harness.kimi].command` → `["kimi"]`.
+    ///
+    /// Empty command vectors are ignored so a stray `command = []` can't produce
+    /// an unspawnable tab.
+    pub fn harness_command(&self, harness: HarnessKind) -> Vec<String> {
+        let configured = match harness {
+            HarnessKind::Claude => self.harness.claude.as_ref(),
+            HarnessKind::Kimi => self.harness.kimi.as_ref(),
+        }
+        .and_then(|c| c.command.as_ref())
+        .filter(|c| !c.is_empty());
+
+        match harness {
+            HarnessKind::Claude => {
+                let mut cmd = configured.cloned().unwrap_or_else(|| self.claude_base());
+                if cmd.last().map(|s| s == "--continue").unwrap_or(false) {
+                    cmd.pop();
+                }
+                cmd
+            }
+            HarnessKind::Kimi => configured.cloned().unwrap_or_else(default_kimi),
+        }
+    }
+
+    /// Whether `harness` is offered (new-tab picker) and gets hooks/skills
+    /// installed. Defaults: claude on, kimi off (opt-in). A `[harness.<kind>]`
+    /// with `enabled = …` overrides the default.
+    pub fn harness_enabled(&self, harness: HarnessKind) -> bool {
+        let configured = match harness {
+            HarnessKind::Claude => self.harness.claude.as_ref(),
+            HarnessKind::Kimi => self.harness.kimi.as_ref(),
+        }
+        .and_then(|c| c.enabled);
+        configured.unwrap_or(match harness {
+            HarnessKind::Claude => true,
+            HarnessKind::Kimi => false,
+        })
+    }
+
+    /// Enabled harnesses in display order. Always non-empty (claude is on unless
+    /// explicitly disabled; if the user disables every harness we still fall
+    /// back to claude so tabs remain spawnable).
+    pub fn enabled_harnesses(&self) -> Vec<HarnessKind> {
+        let list: Vec<HarnessKind> = HarnessKind::ALL
+            .into_iter()
+            .filter(|&h| self.harness_enabled(h))
+            .collect();
+        if list.is_empty() {
+            vec![HarnessKind::Claude]
+        } else {
+            list
+        }
+    }
+
+    /// Which harness a fresh tab uses by default. Honors `default_harness`, but
+    /// falls back to the first enabled harness if that one was disabled.
+    pub fn default_harness(&self) -> HarnessKind {
+        if self.harness_enabled(self.default_harness) {
+            self.default_harness
+        } else {
+            self.enabled_harnesses()[0]
+        }
+    }
+
+    /// Extra environment variables to export into a harness's PTY, on top of the
+    /// shared `WRK_*` set. Kimi gets `KIMI_DISABLE_TELEMETRY=1` so a machine
+    /// without a Kimi account (e.g. a local-LLM setup) doesn't stall on the
+    /// telemetry/update check at startup.
+    pub fn harness_pane_env(&self, harness: HarnessKind) -> Vec<(String, String)> {
+        match harness {
+            HarnessKind::Claude => Vec::new(),
+            HarnessKind::Kimi => vec![("KIMI_DISABLE_TELEMETRY".to_string(), "1".to_string())],
+        }
+    }
+}
+
+fn default_kimi() -> Vec<String> {
+    vec!["kimi".into()]
 }
 
 fn default_claude() -> Vec<String> {
@@ -482,5 +647,87 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cfg.resolve().border_focused, Color::Cyan);
+    }
+
+    // --- Harnesses ---
+
+    #[test]
+    fn harness_defaults_claude_on_kimi_off() {
+        let s = Settings::default();
+        assert!(s.harness_enabled(HarnessKind::Claude));
+        assert!(!s.harness_enabled(HarnessKind::Kimi));
+        assert_eq!(s.enabled_harnesses(), vec![HarnessKind::Claude]);
+        assert_eq!(s.default_harness(), HarnessKind::Claude);
+        assert_eq!(s.harness_command(HarnessKind::Claude), vec!["claude"]);
+        assert_eq!(s.harness_command(HarnessKind::Kimi), vec!["kimi"]);
+    }
+
+    #[test]
+    fn claude_command_is_back_compat_for_claude_harness() {
+        // The legacy top-level `claude_command` (with a trailing --continue that
+        // is stripped) still drives the Claude harness when no `[harness.claude]`
+        // command is set.
+        let s = Settings {
+            claude_command: vec!["steam-run".into(), "claude".into(), "--continue".into()],
+            ..Settings::default()
+        };
+        assert_eq!(
+            s.harness_command(HarnessKind::Claude),
+            vec!["steam-run", "claude"]
+        );
+    }
+
+    #[test]
+    fn harness_table_overrides_command_and_enabled() {
+        let s: Settings = toml::from_str(
+            "default_harness = \"kimi\"\n\
+             [harness.kimi]\nenabled = true\ncommand = [\"steam-run\", \"kimi\"]\n",
+        )
+        .unwrap();
+        assert!(s.harness_enabled(HarnessKind::Kimi));
+        assert_eq!(
+            s.harness_command(HarnessKind::Kimi),
+            vec!["steam-run", "kimi"]
+        );
+        assert_eq!(
+            s.enabled_harnesses(),
+            vec![HarnessKind::Claude, HarnessKind::Kimi]
+        );
+        assert_eq!(s.default_harness(), HarnessKind::Kimi);
+    }
+
+    #[test]
+    fn default_harness_falls_back_when_disabled() {
+        // default_harness names a harness that isn't enabled → fall back to the
+        // first enabled one instead of returning something unspawnable.
+        let s: Settings =
+            toml::from_str("default_harness = \"kimi\"\n[harness.kimi]\nenabled = false\n")
+                .unwrap();
+        assert_eq!(s.default_harness(), HarnessKind::Claude);
+    }
+
+    #[test]
+    fn empty_command_is_ignored() {
+        let s: Settings = toml::from_str("[harness.kimi]\ncommand = []\n").unwrap();
+        // A stray empty command falls back to the built-in default.
+        assert_eq!(s.harness_command(HarnessKind::Kimi), vec!["kimi"]);
+    }
+
+    #[test]
+    fn kimi_pane_env_disables_telemetry() {
+        let s = Settings::default();
+        assert!(s.harness_pane_env(HarnessKind::Claude).is_empty());
+        assert_eq!(
+            s.harness_pane_env(HarnessKind::Kimi),
+            vec![("KIMI_DISABLE_TELEMETRY".to_string(), "1".to_string())]
+        );
+    }
+
+    #[test]
+    fn harness_kind_id_round_trips() {
+        for h in HarnessKind::ALL {
+            assert_eq!(HarnessKind::from_id(h.id()), Some(h));
+        }
+        assert_eq!(HarnessKind::from_id("nope"), None);
     }
 }

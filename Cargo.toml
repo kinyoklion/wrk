@@ -18,6 +18,10 @@ crossterm = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "0.8"
+# Format-preserving TOML editing for merging wrk's `[[hooks]]` into the user's
+# `~/.kimi-code/config.toml` without clobbering their comments or other tables
+# (already in the tree transitively via `toml`).
+toml_edit = "0.22"
 notify = "8"
 nucleo-matcher = "0.3"
 directories = { workspace = true }

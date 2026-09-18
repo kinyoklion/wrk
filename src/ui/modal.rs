@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
 use crate::session::DiscoveredSession;
-use crate::settings::Theme;
+use crate::settings::{HarnessKind, Theme};
 
 /// Single-field modal for opening a markdown file as a tab in the active
 /// project's primary pane.
@@ -261,11 +261,15 @@ impl ConfirmQuitModal {
     }
 }
 
-/// Modal for picking which Claude session to attach to a new tab.
+/// Modal for picking which agent session to attach to a new tab.
 ///
 /// Index 0 is always the synthetic "New session" entry. Indices ≥ 1 are
 /// discovered on-disk sessions (newest first). The caller checks `confirmed`
-/// then reads `selected_session_id()` (None = new) and `tab_name`.
+/// then reads `harness`, `selected_session_id()` (None = new) and `tab_name`.
+///
+/// When more than one harness is enabled, ←/→ cycle `harness`. Only Claude has
+/// on-disk session discovery today, so selecting another harness collapses the
+/// list to just "New session".
 #[derive(Debug, Clone)]
 pub struct ClaudeTabPickerModal {
     /// None = "New session"; Some = a discovered session.
@@ -274,21 +278,78 @@ pub struct ClaudeTabPickerModal {
     pub tab_name: String,
     pub name_focused: bool,
     pub confirmed: bool,
+    /// The harness the new tab will run.
+    pub harness: HarnessKind,
+    /// Enabled harnesses to cycle through (display order); always non-empty.
+    pub harnesses: Vec<HarnessKind>,
+    /// Discovered Claude sessions, kept so the list can be restored when the
+    /// harness cycles back to Claude.
+    discovered: Vec<DiscoveredSession>,
 }
 
 impl ClaudeTabPickerModal {
-    pub fn new(discovered: &[DiscoveredSession]) -> Self {
-        let mut sessions: Vec<Option<DiscoveredSession>> = vec![None];
-        for s in discovered {
-            sessions.push(Some(s.clone()));
-        }
-        Self {
-            sessions,
+    pub fn new(
+        discovered: &[DiscoveredSession],
+        harnesses: Vec<HarnessKind>,
+        default_harness: HarnessKind,
+    ) -> Self {
+        let harnesses = if harnesses.is_empty() {
+            vec![HarnessKind::Claude]
+        } else {
+            harnesses
+        };
+        let harness = if harnesses.contains(&default_harness) {
+            default_harness
+        } else {
+            harnesses[0]
+        };
+        let mut m = Self {
+            sessions: Vec::new(),
             selected_idx: 0,
             tab_name: String::new(),
             name_focused: false,
             confirmed: false,
+            harness,
+            harnesses,
+            discovered: discovered.to_vec(),
+        };
+        m.rebuild_sessions();
+        m
+    }
+
+    /// Whether the harness selector row/cycle is shown (more than one enabled).
+    pub fn show_harness(&self) -> bool {
+        self.harnesses.len() > 1
+    }
+
+    /// Cycle the selected harness by `delta` (±1), wrapping, and rebuild the
+    /// session list for it. No-op when only one harness is enabled.
+    pub fn cycle_harness(&mut self, delta: isize) {
+        if self.harnesses.len() < 2 {
+            return;
         }
+        let cur = self
+            .harnesses
+            .iter()
+            .position(|&h| h == self.harness)
+            .unwrap_or(0) as isize;
+        let n = self.harnesses.len() as isize;
+        let next = ((cur + delta).rem_euclid(n)) as usize;
+        self.harness = self.harnesses[next];
+        self.rebuild_sessions();
+    }
+
+    /// Rebuild the session list for the current harness: Claude offers its
+    /// discovered on-disk sessions; other harnesses offer only "New session".
+    fn rebuild_sessions(&mut self) {
+        let mut sessions: Vec<Option<DiscoveredSession>> = vec![None];
+        if self.harness == HarnessKind::Claude {
+            for s in &self.discovered {
+                sessions.push(Some(s.clone()));
+            }
+        }
+        self.sessions = sessions;
+        self.selected_idx = 0;
     }
 
     /// Session ID of the selected entry, or `None` for "New session".
@@ -328,26 +389,58 @@ impl ClaudeTabPickerModal {
     pub fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) -> Position {
         let popup = centered_rect(60, 70, area);
         Clear.render(popup, buf);
+        let title = if self.show_harness() {
+            " add agent session "
+        } else {
+            " add claude session "
+        };
         let block = Block::default()
-            .title(" add claude session ")
+            .title(title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.border_focused));
         let inner = block.inner(popup);
         block.render(popup, buf);
 
-        // Layout: name label + field, blank, session list, footer
-        let list_height = inner.height.saturating_sub(5).max(1);
-        let layout = Layout::default()
+        // Optional harness selector row (only when >1 harness is enabled), then
+        // name label + field, blank, session list, footer.
+        let harness_rows: u16 = if self.show_harness() { 1 } else { 0 };
+        let list_height = inner.height.saturating_sub(5 + harness_rows).max(1);
+        let mut constraints = Vec::new();
+        if self.show_harness() {
+            constraints.push(Constraint::Length(1)); // harness selector
+        }
+        constraints.extend([
+            Constraint::Length(1), // label
+            Constraint::Length(1), // name input
+            Constraint::Length(1), // blank
+            Constraint::Length(list_height),
+            Constraint::Min(0),
+            Constraint::Length(1), // footer
+        ]);
+        let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1), // label
-                Constraint::Length(1), // name input
-                Constraint::Length(1), // blank
-                Constraint::Length(list_height),
-                Constraint::Min(0),
-                Constraint::Length(1), // footer
-            ])
+            .constraints(constraints)
             .split(inner);
+        // Index into `rows` shifts by one when the harness row is present.
+        let base = harness_rows as usize;
+        let layout = &rows[base..];
+
+        if self.show_harness() {
+            let names: Vec<String> = self
+                .harnesses
+                .iter()
+                .map(|h| {
+                    if *h == self.harness {
+                        format!("[{}]", h.id())
+                    } else {
+                        format!(" {} ", h.id())
+                    }
+                })
+                .collect();
+            Paragraph::new(format!("harness (←/→): {}", names.join(" ")))
+                .style(Style::default().fg(theme.accent))
+                .render(rows[0], buf);
+        }
 
         let name_hint = if self.name_focused {
             "tab name:"
@@ -414,6 +507,8 @@ impl ClaudeTabPickerModal {
 
         let footer = if self.name_focused {
             "Enter/Esc: back to list"
+        } else if self.show_harness() {
+            "↑/↓: select   ←/→: harness   Tab: name   Enter: confirm   Esc: cancel"
         } else {
             "↑/↓: select   Tab: name   Enter: confirm   Esc: cancel"
         };
