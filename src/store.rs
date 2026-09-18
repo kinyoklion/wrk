@@ -5,6 +5,8 @@ use anyhow::{Context, Result, anyhow};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
+use crate::settings::HarnessKind;
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LayoutMode {
@@ -21,13 +23,17 @@ pub enum LayoutMode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionRef {
     pub name: String,
-    /// Claude session UUID. When present, wrk launches `claude --resume <id>`.
-    /// When absent, wrk mints a fresh UUID for this tab at spawn time and
-    /// launches `claude --session-id <uuid>`, then persists the UUID here.
-    /// Once persisted with an ID, subsequent project opens resume the same
-    /// session deterministically — `claude --continue` is not used.
+    /// Agent session id used to resume the same conversation. For Claude it's a
+    /// UUID wrk mints at spawn time (`claude --session-id <uuid>`); for Kimi it's
+    /// the id the agent assigns, learned from its `SessionStart`/status hooks and
+    /// persisted here. When present, wrk resumes (`claude --resume <id>` /
+    /// `kimi --session <id>`); when absent, a fresh session is started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Which coding-agent harness this tab runs. Defaults to Claude and is
+    /// omitted from the TOML when Claude, so claude-only configs are unchanged.
+    #[serde(default, skip_serializing_if = "HarnessKind::is_claude")]
+    pub harness: HarnessKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -213,6 +219,7 @@ mod tests {
                 claude_sessions: vec![SessionRef {
                     name: "claude".into(),
                     session_id: None,
+                    harness: HarnessKind::Claude,
                 }],
             })
             .unwrap();
@@ -220,5 +227,48 @@ mod tests {
         let loaded = load_from(&path).unwrap();
         assert_eq!(loaded, store);
         assert_eq!(loaded.projects[0].claude_sessions.len(), 1);
+    }
+
+    /// A `harness` field round-trips, defaults to Claude when absent, and is
+    /// omitted from the serialized TOML for Claude tabs (schema unchanged for
+    /// claude-only configs) but written for non-Claude ones.
+    #[test]
+    fn round_trip_with_harness() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("projects.toml");
+        let mut store = ProjectStore::default();
+        store
+            .add(Project {
+                name: "p".into(),
+                path: PathBuf::from("/tmp/p"),
+                tags: vec![],
+                layout_mode: None,
+                shell_passthrough: None,
+                claude_sessions: vec![
+                    SessionRef {
+                        name: "c".into(),
+                        session_id: Some("uuid-1".into()),
+                        harness: HarnessKind::Claude,
+                    },
+                    SessionRef {
+                        name: "k".into(),
+                        session_id: Some("session_abc".into()),
+                        harness: HarnessKind::Kimi,
+                    },
+                ],
+            })
+            .unwrap();
+        save_to(&store, &path).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        // Claude tab omits the key; kimi tab records it.
+        assert!(text.contains(r#"harness = "kimi""#));
+        assert_eq!(text.matches("harness").count(), 1);
+
+        let loaded = load_from(&path).unwrap();
+        assert_eq!(loaded, store);
+        // A hand-written entry with no `harness` key defaults to Claude.
+        let back: SessionRef = toml::from_str("name = \"x\"\n").unwrap();
+        assert_eq!(back.harness, HarnessKind::Claude);
     }
 }

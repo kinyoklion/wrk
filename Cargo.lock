@@ -3539,6 +3539,7 @@ dependencies = [
  "similar",
  "tempfile",
  "toml",
+ "toml_edit",
  "uuid",
  "vte",
  "wrk-markdown",

@@ -176,8 +176,8 @@ wrk-md --print --width 80 F # force a wrap width for --print (else terminal widt
 | `wrk add <path> [--name N]` | append to `projects.toml` |
 | `wrk rm <name>` | remove from `projects.toml` |
 | `wrk view <file>` | open a markdown file — as a tab in the running wrk (from inside a pane), else in the `wrk-md` pager |
-| `wrk install-hooks` | merge wrk hooks into `~/.claude/settings.json` **and** install the `wrk-view` skill |
-| `wrk uninstall-hooks` | remove both |
+| `wrk install-hooks` | install wrk's status hooks + skills for each enabled harness (Claude → `~/.claude`; Kimi → `~/.kimi-code`) |
+| `wrk uninstall-hooks` | remove them from every harness |
 
 ### Letting Claude open files
 
@@ -303,6 +303,24 @@ claude_command = ["steam-run", "claude"]
 # Optional. Defaults to $SHELL, then /bin/bash.
 # shell_command = ["zsh"]
 
+# --- Harnesses -------------------------------------------------------------
+# A tab runs a coding-agent "harness". Claude is the default and always
+# enabled; others are opt-in. `default_harness` picks what new tabs use.
+# When more than one harness is enabled, the new-tab picker (Alt+t/…)
+# shows a harness selector you cycle with the ← / → keys.
+#
+# default_harness = "claude"    # "claude" | "kimi"
+#
+# [harness.kimi]
+# enabled = true                # off by default; opt in here
+# command = ["steam-run", "kimi"]   # custom launch command (like claude_command)
+#
+# Kimi note: `install-hooks` installs Kimi's status hooks + skills too, but
+# Kimi 2.0.0 does not currently run config.toml hooks, so a Kimi tab resumes
+# via `kimi --continue` (its directory's latest session) and the sidebar
+# status uses the idle-time heuristic. Point Kimi at your model in
+# ~/.kimi-code/config.toml; wrk exports KIMI_DISABLE_TELEMETRY=1 to Kimi panes.
+
 # Ask for confirmation before quitting the app. Defaults to true; set
 # false to quit immediately.
 # confirm_quit = true
@@ -375,10 +393,17 @@ Adds hook entries to `~/.claude/settings.json` — `UserPromptSubmit` (busy),
 `SubagentStop` to track sub-agents — that run `wrk hook <kind>`. That command
 pushes the state to the running wrk over its Unix socket (`WRK_SOCK`), tagged
 with the tab id (`WRK_TAB`); there are no status files and no polling. The hook
-commands are gated on `[ -n "$WRK_SOCK" ]` and only fire for Claude sessions
-launched by wrk — other sessions are unaffected. Re-run `install-hooks` to pick
-up updates (it also upgrades older file-based installs in place);
-`uninstall-hooks` removes only the wrk-installed entries.
+commands are gated on `[ -n "$WRK_SOCK" ]` and only fire for sessions launched by
+wrk — other sessions are unaffected. Re-run `install-hooks` to pick up updates
+(it also upgrades older file-based installs in place); `uninstall-hooks` removes
+only the wrk-installed entries.
+
+When the Kimi harness is enabled, `install-hooks` also writes the equivalent
+`[[hooks]]` into `~/.kimi-code/config.toml` (merged in place, preserving your
+provider config) and Kimi skills into `~/.kimi-code/skills/`. Note that Kimi
+2.0.0 does not yet run those config hooks, so Kimi tabs currently fall back to
+the idle-time status heuristic; the entries are installed and ready for when a
+future Kimi build honors them.
 
 `install-hooks` also installs three **skills** into `~/.claude/skills/`:
 `wrk-view` (open a file), and `start-local-review` / `end-local-review` (the code

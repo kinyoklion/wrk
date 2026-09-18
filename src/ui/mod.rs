@@ -313,7 +313,28 @@ fn draw_primary_pane(frame: &mut Frame, area: Rect, focused: bool, app: &mut App
     } else {
         match app.active_claude() {
             Some(p) => frame.render_widget(PtyPaneWidget(p), content_area),
-            None => placeholder(frame),
+            // An agent tab exists but its PTY isn't running (spawn failed, or the
+            // process exited — e.g. a bad launch command). Say so, rather than the
+            // misleading "no project selected".
+            None => {
+                let msg = app
+                    .active_session()
+                    .and_then(|s| s.active_claude_tab())
+                    .map(|t| {
+                        format!(
+                            "{} ({}) is not running — its process exited. Check the \
+                             harness command in settings.toml, then reopen the project \
+                             (Enter in the sidebar) to restart it.",
+                            t.name,
+                            t.harness.id()
+                        )
+                    })
+                    .unwrap_or_else(|| "session not running".to_string());
+                let para = Paragraph::new(msg)
+                    .style(Style::default().fg(theme.hint))
+                    .wrap(ratatui::widgets::Wrap { trim: true });
+                frame.render_widget(para, content_area);
+            }
         }
     }
 }

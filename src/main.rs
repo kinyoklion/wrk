@@ -34,7 +34,7 @@ use ratatui::layout::Rect;
 use crate::keymap::{GlobalAction, KeyMap};
 use crate::pane::Focus;
 use crate::pane::terminal::PtyPane;
-use crate::settings::{Settings, Theme};
+use crate::settings::{HarnessKind, Settings, Theme};
 use crate::store::{LayoutMode, Project, ProjectStore, SessionRef};
 use crate::ui::ModalState;
 use crate::ui::modal::{
@@ -73,11 +73,16 @@ enum Command {
     InstallHooks,
     /// Remove the wrk-installed hooks and the `wrk-view` skill.
     UninstallHooks,
-    /// Push a status update to the running wrk instance. Invoked by the Claude
-    /// Code hooks installed by `install-hooks`; reads `WRK_SOCK`/`WRK_TAB` from
-    /// the environment and is a silent no-op outside a wrk session.
+    /// Push a status update to the running wrk instance. Invoked by the agent
+    /// hooks installed by `install-hooks`; reads `WRK_SOCK`/`WRK_TAB` from the
+    /// environment and is a silent no-op outside a wrk session. `--harness kimi`
+    /// additionally parses the session id off the hook's stdin JSON.
     #[command(hide = true)]
-    Hook { kind: String },
+    Hook {
+        kind: String,
+        #[arg(long)]
+        harness: Option<String>,
+    },
     /// Start or end an in-TUI code review in the running wrk instance:
     /// `wrk review start [target]` / `wrk review end`. `target` is a git rev or
     /// `a..b` range; empty compares the working tree to HEAD.
@@ -113,7 +118,7 @@ fn main() -> Result<()> {
         Some(Command::View { path }) => cmd_view(&path),
         Some(Command::InstallHooks) => cmd_install_hooks(),
         Some(Command::UninstallHooks) => cmd_uninstall_hooks(),
-        Some(Command::Hook { kind }) => cmd_hook(&kind),
+        Some(Command::Hook { kind, harness }) => cmd_hook(&kind, harness.as_deref()),
         Some(Command::Review { action }) => cmd_review(action),
         None => run_tui(),
     }
@@ -165,36 +170,87 @@ fn viewer_binary() -> PathBuf {
 }
 
 fn cmd_install_hooks() -> Result<()> {
-    let path = status::install_hooks()?;
-    println!("installed hooks in {}", path.display());
-    println!("hooks push status to the running wrk over its socket ($WRK_SOCK)");
-    println!("(no-op for any Claude session not launched by wrk)");
-    match status::install_skills() {
-        Ok(skills) => {
-            for path in skills {
-                println!("installed skill {}", path.display());
+    // Install hooks + skills for every enabled harness (Claude by default; Kimi
+    // when opted in via `[harness.kimi] enabled = true`). Settings that fail to
+    // load fall back to defaults so `install-hooks` still works out of the box.
+    let settings = settings::load().unwrap_or_default();
+    for harness in settings.enabled_harnesses() {
+        match harness {
+            HarnessKind::Claude => {
+                let path = status::install_hooks()?;
+                println!("installed claude hooks in {}", path.display());
+                match status::install_skills() {
+                    Ok(skills) => {
+                        for path in skills {
+                            println!("installed claude skill {}", path.display());
+                        }
+                    }
+                    Err(e) => eprintln!("warning: could not install claude skills: {e}"),
+                }
+            }
+            HarnessKind::Kimi => {
+                let path = status::install_kimi_hooks()?;
+                println!("installed kimi hooks in {}", path.display());
+                match status::install_kimi_skills() {
+                    Ok(skills) => {
+                        for path in skills {
+                            println!("installed kimi skill {}", path.display());
+                        }
+                    }
+                    Err(e) => eprintln!("warning: could not install kimi skills: {e}"),
+                }
             }
         }
-        Err(e) => eprintln!("warning: could not install skills: {e}"),
     }
+    println!("hooks push status to the running wrk over its socket ($WRK_SOCK)");
+    println!("(no-op for any agent session not launched by wrk)");
     Ok(())
 }
 
-/// Push a status update to the running wrk instance. Invoked by Claude Code
-/// hooks as `wrk hook <kind>`; reads `WRK_SOCK` (the instance socket) and
-/// `WRK_TAB` (the originating tab id) from the environment. Best-effort and
+/// Push a status update to the running wrk instance. Invoked by agent hooks as
+/// `wrk hook <kind> [--harness <name>]`; reads `WRK_SOCK` (the instance socket)
+/// and `WRK_TAB` (the originating tab id) from the environment. Best-effort and
 /// always exits 0 — a missing socket, stale instance, or unknown kind is a
-/// silent no-op so hooks never surface errors to Claude.
-fn cmd_hook(kind: &str) -> Result<()> {
+/// silent no-op so hooks never surface errors to the agent.
+///
+/// For `--harness kimi`, the hook's stdin carries the event JSON, which includes
+/// the agent's `session_id`; we parse it (best-effort) and forward it so wrk can
+/// learn and persist a Kimi tab's session for later resume. Other harnesses (and
+/// missing/garbled stdin) simply omit it.
+fn cmd_hook(kind: &str, harness: Option<&str>) -> Result<()> {
     let (Ok(sock), Ok(tab)) = (std::env::var("WRK_SOCK"), std::env::var("WRK_TAB")) else {
         return Ok(());
     };
     let Some(kind) = status::StatusKind::from_arg(kind) else {
         return Ok(());
     };
-    let req = ipc::Request::Status(ipc::StatusUpdate { tab, kind });
+    let session_id = if harness == Some("kimi") {
+        read_stdin_session_id()
+    } else {
+        None
+    };
+    let req = ipc::Request::Status(ipc::StatusUpdate {
+        tab,
+        kind,
+        session_id,
+    });
     let _ = ipc::send(Path::new(&sock), &req);
     Ok(())
+}
+
+/// Read the hook event JSON on stdin and pull out `session_id`. Best-effort: any
+/// read/parse failure (or an absent field) yields `None`. The agent writes the
+/// JSON and closes stdin, so the read terminates promptly at EOF.
+fn read_stdin_session_id() -> Option<String> {
+    use std::io::Read;
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf).ok()?;
+    let value: serde_json::Value = serde_json::from_str(buf.trim()).ok()?;
+    value
+        .get("session_id")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 /// Start or end an in-TUI code review in the running wrk instance:
@@ -308,15 +364,31 @@ fn format_review_comments(comments: &[review::ReviewComment]) -> String {
 }
 
 fn cmd_uninstall_hooks() -> Result<()> {
+    // Remove wrk's hooks/skills from every harness regardless of enabled state,
+    // so disabling a harness first doesn't strand its entries.
     let (path, removed) = status::uninstall_hooks()?;
     println!("removed {removed} wrk hook entries from {}", path.display());
     match status::uninstall_skills() {
         Ok(dirs) => {
             for dir in dirs {
-                println!("removed skill {}", dir.display());
+                println!("removed claude skill {}", dir.display());
             }
         }
-        Err(e) => eprintln!("warning: could not remove skills: {e}"),
+        Err(e) => eprintln!("warning: could not remove claude skills: {e}"),
+    }
+    match status::uninstall_kimi_hooks() {
+        Ok((path, removed)) => {
+            println!("removed {removed} wrk hook entries from {}", path.display())
+        }
+        Err(e) => eprintln!("warning: could not remove kimi hooks: {e}"),
+    }
+    match status::uninstall_kimi_skills() {
+        Ok(dirs) => {
+            for dir in dirs {
+                println!("removed kimi skill {}", dir.display());
+            }
+        }
+        Err(e) => eprintln!("warning: could not remove kimi skills: {e}"),
     }
     Ok(())
 }
@@ -399,14 +471,25 @@ fn cmd_rm(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// A single running (or dead) Claude tab within a project.
+/// A single running (or dead) agent tab within a project. Named `ClaudeTab` for
+/// historical reasons; it now hosts any [`HarnessKind`] (Claude, Kimi, …).
 pub struct ClaudeTab {
     pub name: String,
-    /// Claude session UUID — used to resume the same conversation. `None` until
-    /// the tab is first spawned; at that point wrk generates a fresh UUID,
-    /// launches `claude --session-id <uuid>`, and records it here so every
-    /// later open resumes deterministically via `--resume <uuid>`.
+    /// Which coding-agent harness this tab runs.
+    pub harness: HarnessKind,
+    /// Agent session id — used to resume the same conversation. For Claude, wrk
+    /// mints a fresh UUID at first spawn (`--session-id <uuid>`) and records it
+    /// here. For Kimi it's the id the agent reveals via its `SessionStart`/status
+    /// hooks (recorded when it arrives); Kimi 2.0.0 does not fire config hooks, so
+    /// in practice this stays `None` and Kimi resumes via `--continue` instead
+    /// (see [`ClaudeTab::fresh`]). A later open resumes from this id when present.
     pub session_id: Option<String>,
+    /// Transient (not persisted): true only for a just-created tab that should
+    /// start a *new* session. Distinguishes "add a new Kimi tab" (fresh `kimi`)
+    /// from "reopen an existing one" (`kimi --continue`), since without a learned
+    /// session id those look identical. Cleared after the first spawn. Ignored by
+    /// Claude (its `session_id` drives new-vs-resume).
+    pub fresh: bool,
     /// Opaque per-tab id exported to the PTY as `WRK_TAB`, so hook-driven status
     /// pushes (`wrk hook`) can be routed back to this tab. Stable for the tab's
     /// lifetime, independent of the Claude session ID.
@@ -749,18 +832,26 @@ impl App {
         // later open resumes deterministically via `--resume <id>`.
         if session.tabs.is_empty() {
             if project.claude_sessions.is_empty() {
+                // Empty project: one auto-tab. Not marked `fresh` — a Kimi auto-tab
+                // `--continue`s (resumes the dir's latest session, or starts fresh
+                // if none); Claude still mints a new session at spawn.
                 session.tabs.push(Tab::Claude(ClaudeTab {
                     name: project.name.clone(),
+                    harness: self.settings.default_harness(),
                     session_id: None,
+                    fresh: false,
                     status_id: new_status_id(),
                     status: status::TabStatus::default(),
                     pane: None,
                 }));
             } else {
+                // Reopening persisted tabs — resume, never restart.
                 for sr in &project.claude_sessions {
                     session.tabs.push(Tab::Claude(ClaudeTab {
                         name: sr.name.clone(),
+                        harness: sr.harness,
                         session_id: sr.session_id.clone(),
+                        fresh: false,
                         status_id: new_status_id(),
                         status: status::TabStatus::default(),
                         pane: None,
@@ -776,18 +867,10 @@ impl App {
         for tab in session.claude_tabs_mut() {
             let dead = tab.pane.as_mut().is_some_and(|p| p.child_finished());
             if tab.pane.is_none() || dead {
-                let cmd = match tab.session_id.clone() {
-                    Some(id) => claude_resume_command(&self.settings, &id),
-                    None => {
-                        let id = new_session_id();
-                        let cmd = claude_new_command(&self.settings, &id, &tab.name);
-                        tab.session_id = Some(id);
-                        assigned_new = true;
-                        cmd
-                    }
-                };
+                let cmd = spawn_command_for_tab(&self.settings, tab, &mut assigned_new);
                 let mut env = base_env.clone();
                 env.push(("WRK_TAB".to_string(), tab.status_id.clone()));
+                env.extend(self.settings.harness_pane_env(tab.harness));
                 let spawned = PtyPane::spawn(
                     &cmd,
                     &project.path,
@@ -871,11 +954,18 @@ impl App {
         Ok(())
     }
 
-    /// Add a new Claude tab to the active project.
-    /// `session_id = None` → new session: a fresh UUID is generated up front
-    /// (`claude --session-id <uuid> --name <name>`) and recorded immediately.
-    /// `session_id = Some(id)` → `claude --resume <id>`.
-    fn add_claude_tab(&mut self, name: String, session_id: Option<String>, body: Rect) {
+    /// Add a new agent tab (running `harness`) to the active project.
+    /// `session_id = Some(id)` resumes that session. `session_id = None` starts a
+    /// new one: Claude mints a fresh UUID up front and records it immediately;
+    /// Kimi starts a bare new session (the tab is persisted so a later reopen
+    /// resumes it via `--continue`).
+    fn add_claude_tab(
+        &mut self,
+        name: String,
+        harness: HarnessKind,
+        session_id: Option<String>,
+        body: Rect,
+    ) {
         let Some(project_name) = self.active_project_name.clone() else {
             return;
         };
@@ -894,19 +984,22 @@ impl App {
             return;
         };
 
-        // Resume an existing session, or mint a new one with a fresh UUID so it
-        // is tracked deterministically from the very first spawn.
-        let (cmd, session_id) = match session_id {
-            Some(id) => (claude_resume_command(&self.settings, &id), Some(id)),
-            None => {
+        // Resume an existing session, or start a new one. Claude mints its UUID
+        // here so it's tracked from the first spawn; Kimi keeps `session_id` None
+        // until its SessionStart hook reveals the id (handle_status_update).
+        let (cmd, session_id) = match (session_id, harness) {
+            (Some(id), h) => (resume_agent_command(&self.settings, h, &id), Some(id)),
+            (None, HarnessKind::Claude) => {
                 let id = new_session_id();
-                let cmd = claude_new_command(&self.settings, &id, &name);
+                let cmd = new_agent_command(&self.settings, HarnessKind::Claude, &id, &name);
                 (cmd, Some(id))
             }
+            (None, h) => (new_agent_command(&self.settings, h, "", &name), None),
         };
         let status_id = new_status_id();
         let mut env = self.base_pty_env(&project_name);
         env.push(("WRK_TAB".to_string(), status_id.clone()));
+        env.extend(self.settings.harness_pane_env(harness));
 
         let pane = match PtyPane::spawn(
             &cmd,
@@ -917,7 +1010,10 @@ impl App {
         ) {
             Ok(p) => Some(p),
             Err(e) => {
-                push_error(&mut self.error, format!("claude spawn failed: {e}"));
+                push_error(
+                    &mut self.error,
+                    format!("{} spawn failed: {e}", harness.id()),
+                );
                 None
             }
         };
@@ -925,7 +1021,11 @@ impl App {
         let session = self.sessions.entry(project_name.clone()).or_default();
         session.tabs.push(Tab::Claude(ClaudeTab {
             name,
+            harness,
             session_id,
+            // The initial (fresh) spawn happened above; a later respawn of this
+            // Kimi tab should resume via `--continue`, not restart.
+            fresh: false,
             status_id,
             status: status::TabStatus::default(),
             pane,
@@ -1095,13 +1195,27 @@ impl App {
     /// transition into its status. Unknown tab ids are ignored — a stale push
     /// from a tab that was closed simply has no target.
     fn handle_status_update(&mut self, update: ipc::StatusUpdate) {
-        for session in self.sessions.values_mut() {
+        // Find the tab this push targets, folding in the status kind. If the push
+        // also carried a session id (Kimi hooks do), and it's new/changed for a
+        // Kimi tab, adopt it so the session can be resumed later — then persist.
+        let mut learned_session_for: Option<String> = None;
+        'outer: for (project_name, session) in self.sessions.iter_mut() {
             for tab in session.claude_tabs_mut() {
                 if tab.status_id == update.tab {
                     tab.status.apply(update.kind);
-                    return;
+                    if let Some(id) = &update.session_id
+                        && tab.harness == HarnessKind::Kimi
+                        && tab.session_id.as_deref() != Some(id.as_str())
+                    {
+                        tab.session_id = Some(id.clone());
+                        learned_session_for = Some(project_name.clone());
+                    }
+                    break 'outer;
                 }
             }
+        }
+        if let Some(project_name) = learned_session_for {
+            self.persist_claude_sessions(&project_name);
         }
     }
 
@@ -1211,21 +1325,26 @@ impl App {
                 .map(|t| SessionRef {
                     name: t.name.clone(),
                     session_id: t.session_id.clone(),
+                    harness: t.harness,
                 })
                 .collect::<Vec<_>>(),
             None => return,
         };
-        if let Some(p) = self
+        let Some(p) = self
             .store
             .projects
             .iter_mut()
             .find(|p| p.name == project_name)
-        {
-            // Persist the live tab list faithfully. A tab keeps `session_id =
-            // None` only if it hasn't been spawned yet; once spawned it always
-            // has a UUID (assigned at spawn time), so restarts resume it.
-            p.claude_sessions = tabs;
-        }
+        else {
+            // No matching project in the store (e.g. a session with no persisted
+            // project) — nothing to write. Skip the save so we never clobber the
+            // config with an unrelated snapshot.
+            return;
+        };
+        // Persist the live tab list faithfully. A Claude tab keeps `session_id =
+        // None` only until its first spawn (a UUID is minted then); a Kimi tab
+        // until its SessionStart hook reveals the id — after which restarts resume.
+        p.claude_sessions = tabs;
         if let Err(e) = store::save(&self.store) {
             push_error(&mut self.error, format!("save failed: {e}"));
         }
@@ -1279,34 +1398,93 @@ fn new_session_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// Build the command to **resume** an existing Claude session: `claude --resume
-/// <id>`.
+/// Build the command to **resume** an existing agent session for `harness`.
 ///
-/// `claude --continue` is intentionally not used. It resumes "the most recent
-/// session in this directory", which is non-deterministic when multiple wrk
-/// projects share a path: project A could end up attached to a session that
-/// actually belongs to project B simply because B was used more recently.
-fn claude_resume_command(settings: &Settings, session_id: &str) -> Vec<String> {
-    let mut cmd = settings.claude_base();
-    cmd.push("--resume".to_string());
+/// - Claude: `claude --resume <id>`. `claude --continue` is intentionally not
+///   used — it resumes "the most recent session in this directory", which is
+///   non-deterministic when multiple wrk projects share a path.
+/// - Kimi: `kimi --session <id>`. Kimi assigns the id itself; wrk learns it from
+///   the `SessionStart`/status hooks and persists it, so resumption is likewise
+///   pinned to this tab's own session.
+fn resume_agent_command(
+    settings: &Settings,
+    harness: HarnessKind,
+    session_id: &str,
+) -> Vec<String> {
+    let mut cmd = settings.harness_command(harness);
+    match harness {
+        HarnessKind::Claude => cmd.push("--resume".to_string()),
+        HarnessKind::Kimi => cmd.push("--session".to_string()),
+    }
     cmd.push(session_id.to_string());
     cmd
 }
 
-/// Build the command to **create** a new Claude session with a caller-chosen
-/// UUID and display name: `claude --session-id <id> --name <name>`.
+/// Build the command to **continue** the most recent session in the working
+/// directory: `kimi --continue`. Used for Kimi tabs that have no learned session
+/// id (the common case, since Kimi 2.0.0 doesn't fire the hooks that would reveal
+/// one) — `--continue` resumes the directory's latest session, or starts a fresh
+/// one if there is none. Not used for Claude (its resume is id-pinned).
+fn continue_agent_command(settings: &Settings, harness: HarnessKind) -> Vec<String> {
+    let mut cmd = settings.harness_command(harness);
+    cmd.push("--continue".to_string());
+    cmd
+}
+
+/// Build the command to **start a new** agent session for `harness`.
 ///
-/// Assigning the ID up front (rather than guessing it from the filesystem after
-/// the fact) is what makes resumption deterministic — the tab is bound to its
-/// own session from the very first launch, so it can never latch onto another
-/// project's conversation. The `--name` labels the session after its project
-/// (shown in Claude's `/resume` picker and terminal title).
-fn claude_new_command(settings: &Settings, session_id: &str, name: &str) -> Vec<String> {
-    let mut cmd = settings.claude_base();
-    cmd.push("--session-id".to_string());
-    cmd.push(session_id.to_string());
-    cmd.push("--name".to_string());
-    cmd.push(name.to_string());
+/// - Claude: `claude --session-id <id> --name <name>`. Assigning the UUID up
+///   front (rather than guessing it from the filesystem afterwards) is what makes
+///   resumption deterministic — the tab is bound to its own session from launch.
+///   `--name` labels it after its project. Callers pass a freshly minted UUID.
+/// - Kimi: bare `kimi`. Kimi mints its own session id and reveals it via the
+///   `SessionStart` hook, so wrk doesn't pass one in; `session_id`/`name` are
+///   unused here (the hook-pushed id gets persisted once the session starts).
+fn new_agent_command(
+    settings: &Settings,
+    harness: HarnessKind,
+    session_id: &str,
+    name: &str,
+) -> Vec<String> {
+    let mut cmd = settings.harness_command(harness);
+    match harness {
+        HarnessKind::Claude => {
+            cmd.push("--session-id".to_string());
+            cmd.push(session_id.to_string());
+            cmd.push("--name".to_string());
+            cmd.push(name.to_string());
+        }
+        HarnessKind::Kimi => {}
+    }
+    cmd
+}
+
+/// Build the launch command for `tab`, mutating it as needed. Claude mints and
+/// records a session UUID on first spawn (setting `*assigned_new` so the caller
+/// persists it). Kimi: a learned session id resumes precisely (`--session`); a
+/// just-created (`fresh`) tab starts a new session (bare `kimi`); any other Kimi
+/// tab continues the directory's latest session (`--continue`). `fresh` is
+/// cleared afterwards so a later respawn of a live tab resumes, not restarts.
+fn spawn_command_for_tab(
+    settings: &Settings,
+    tab: &mut ClaudeTab,
+    assigned_new: &mut bool,
+) -> Vec<String> {
+    let cmd = match (tab.session_id.clone(), tab.harness) {
+        (Some(id), h) => resume_agent_command(settings, h, &id),
+        (None, HarnessKind::Claude) => {
+            let id = new_session_id();
+            let cmd = new_agent_command(settings, HarnessKind::Claude, &id, &tab.name);
+            tab.session_id = Some(id);
+            *assigned_new = true;
+            cmd
+        }
+        (None, HarnessKind::Kimi) if tab.fresh => {
+            new_agent_command(settings, HarnessKind::Kimi, "", &tab.name)
+        }
+        (None, HarnessKind::Kimi) => continue_agent_command(settings, HarnessKind::Kimi),
+    };
+    tab.fresh = false;
     cmd
 }
 
@@ -2043,6 +2221,8 @@ fn dispatch_global_action(app: &mut App, action: GlobalAction, body: Rect) -> bo
                 .unwrap_or_default();
             app.modal = Some(ModalState::ClaudeTabPicker(ClaudeTabPickerModal::new(
                 &discovered,
+                app.settings.enabled_harnesses(),
+                app.settings.default_harness(),
             )));
         }
         GlobalAction::CloseClaudeTab => {
@@ -2449,6 +2629,9 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                     KeyCode::Tab => m.name_focused = true,
                     KeyCode::Up => m.select_prev(),
                     KeyCode::Down => m.select_next(),
+                    // ←/→ cycle the harness when more than one is enabled.
+                    KeyCode::Left => m.cycle_harness(-1),
+                    KeyCode::Right => m.cycle_harness(1),
                     KeyCode::Enter => {
                         m.confirmed = true;
                         consumed_modal = Some(());
@@ -2489,7 +2672,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                 } else {
                     m.tab_name.trim().to_string()
                 };
-                app.add_claude_tab(name, session_id, body);
+                app.add_claude_tab(name, m.harness, session_id, body);
             }
             Some(ModalState::UrlPicker(m)) => {
                 if let Some(url) = m.confirmed_url {
@@ -3111,10 +3294,11 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, ClaudeTab, Focus, MarkdownTab, ModalState, Project, ProjectSession, ProjectStore,
-        Settings, Tab, claude_new_command, claude_resume_command, expand_tilde, new_session_id,
-        normalize_paste,
+        App, ClaudeTab, Focus, HarnessKind, MarkdownTab, ModalState, Project, ProjectSession,
+        ProjectStore, Settings, Tab, continue_agent_command, expand_tilde, new_agent_command,
+        new_session_id, normalize_paste, resume_agent_command,
     };
+    use crate::settings::HarnessConfig;
     use std::path::PathBuf;
 
     #[test]
@@ -3171,7 +3355,7 @@ mod tests {
     fn resume_command_uses_resume_flag() {
         let s = Settings::default();
         assert_eq!(
-            claude_resume_command(&s, "abc-123"),
+            resume_agent_command(&s, HarnessKind::Claude, "abc-123"),
             vec!["claude", "--resume", "abc-123"]
         );
     }
@@ -3180,7 +3364,7 @@ mod tests {
     fn new_command_pins_session_id_and_name() {
         let s = Settings::default();
         assert_eq!(
-            claude_new_command(&s, "abc-123", "my project"),
+            new_agent_command(&s, HarnessKind::Claude, "abc-123", "my project"),
             vec!["claude", "--session-id", "abc-123", "--name", "my project"]
         );
     }
@@ -3199,11 +3383,11 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(
-            claude_resume_command(&s, "id1"),
+            resume_agent_command(&s, HarnessKind::Claude, "id1"),
             vec!["steam-run", "claude", "--resume", "id1"]
         );
         assert_eq!(
-            claude_new_command(&s, "id1", "proj"),
+            new_agent_command(&s, HarnessKind::Claude, "id1", "proj"),
             vec![
                 "steam-run",
                 "claude",
@@ -3212,6 +3396,91 @@ mod tests {
                 "--name",
                 "proj"
             ]
+        );
+    }
+
+    #[test]
+    fn kimi_command_builders_use_session_continue_and_bare_launch() {
+        // Kimi: a learned id resumes with `--session <id>`; a fresh tab starts
+        // bare; reopens `--continue` the directory's latest session. A custom
+        // command (e.g. `steam-run kimi`) is honored via [harness.kimi].
+        let s = Settings {
+            harness: crate::settings::HarnessTable {
+                kimi: Some(HarnessConfig {
+                    enabled: Some(true),
+                    command: Some(vec!["steam-run".into(), "kimi".into()]),
+                }),
+                ..Default::default()
+            },
+            ..Settings::default()
+        };
+        assert_eq!(
+            resume_agent_command(&s, HarnessKind::Kimi, "session_abc"),
+            vec!["steam-run", "kimi", "--session", "session_abc"]
+        );
+        assert_eq!(
+            new_agent_command(&s, HarnessKind::Kimi, "", "proj"),
+            vec!["steam-run", "kimi"]
+        );
+        assert_eq!(
+            continue_agent_command(&s, HarnessKind::Kimi),
+            vec!["steam-run", "kimi", "--continue"]
+        );
+    }
+
+    #[test]
+    fn spawn_command_resolves_per_harness_and_state() {
+        let s = Settings::default();
+        // Claude, no id → mint a UUID (session-id + name), flag assigned_new.
+        let mut assigned = false;
+        let mut t = ClaudeTab {
+            name: "p".into(),
+            harness: HarnessKind::Claude,
+            session_id: None,
+            fresh: false,
+            status_id: String::new(),
+            status: crate::status::TabStatus::default(),
+            pane: None,
+        };
+        let cmd = super::spawn_command_for_tab(&s, &mut t, &mut assigned);
+        assert!(assigned && t.session_id.is_some());
+        assert_eq!(cmd[..2], ["claude", "--session-id"]);
+
+        // Kimi, fresh → bare new session, then `fresh` is cleared.
+        let mut assigned = false;
+        let mut t = ClaudeTab {
+            name: "p".into(),
+            harness: HarnessKind::Kimi,
+            session_id: None,
+            fresh: true,
+            status_id: String::new(),
+            status: crate::status::TabStatus::default(),
+            pane: None,
+        };
+        assert_eq!(
+            super::spawn_command_for_tab(&s, &mut t, &mut assigned),
+            vec!["kimi"]
+        );
+        assert!(!t.fresh && !assigned);
+        // A subsequent (non-fresh) spawn continues the session.
+        assert_eq!(
+            super::spawn_command_for_tab(&s, &mut t, &mut assigned),
+            vec!["kimi", "--continue"]
+        );
+
+        // Kimi with a learned id resumes it precisely.
+        let mut t = ClaudeTab {
+            name: "p".into(),
+            harness: HarnessKind::Kimi,
+            session_id: Some("session_z".into()),
+            fresh: false,
+            status_id: String::new(),
+            status: crate::status::TabStatus::default(),
+            pane: None,
+        };
+        assert_eq!(
+            super::spawn_command_for_tab(&s, &mut t, &mut assigned),
+            vec!["kimi", "--session", "session_z"]
         );
     }
 
@@ -3228,7 +3497,9 @@ mod tests {
     fn claude_tab(name: &str) -> Tab {
         Tab::Claude(ClaudeTab {
             name: name.to_string(),
+            harness: HarnessKind::Claude,
             session_id: None,
+            fresh: false,
             status_id: String::new(),
             status: crate::status::TabStatus::default(),
             pane: None,
@@ -3314,15 +3585,18 @@ mod tests {
         app.handle_status_update(StatusUpdate {
             tab: "tb".into(),
             kind: StatusKind::Waiting,
+            session_id: None,
         });
         app.handle_status_update(StatusUpdate {
             tab: "ta".into(),
             kind: StatusKind::SubagentStart,
+            session_id: None,
         });
         // An unknown id must be a harmless no-op.
         app.handle_status_update(StatusUpdate {
             tab: "ghost".into(),
             kind: StatusKind::Busy,
+            session_id: None,
         });
 
         let s = app.active_session().unwrap();
@@ -3332,6 +3606,52 @@ mod tests {
         assert_eq!(a.status.subagents, 1);
         assert_eq!(b.status.event, Some(HookEvent::Waiting));
         assert_eq!(b.status.subagents, 0);
+    }
+
+    /// A Kimi hook that carries a session id teaches wrk the tab's session (so it
+    /// can be resumed); a Claude tab ignores a pushed id (wrk owns Claude's id).
+    #[test]
+    fn status_update_learns_kimi_session_id_only_for_kimi_tabs() {
+        use crate::ipc::StatusUpdate;
+        use crate::status::StatusKind;
+
+        let mut app = app_with_tabs(vec![claude_tab("c"), claude_tab("k")]);
+        {
+            let s = app.sessions.get_mut("p").unwrap();
+            if let Tab::Claude(c) = &mut s.tabs[0] {
+                c.status_id = "tc".into();
+                c.harness = HarnessKind::Claude;
+                c.session_id = Some("claude-uuid".into());
+            }
+            if let Tab::Claude(k) = &mut s.tabs[1] {
+                k.status_id = "tk".into();
+                k.harness = HarnessKind::Kimi;
+                k.session_id = None;
+            }
+        }
+
+        // Kimi tab: the pushed id is adopted.
+        app.handle_status_update(StatusUpdate {
+            tab: "tk".into(),
+            kind: StatusKind::Stopped,
+            session_id: Some("session_xyz".into()),
+        });
+        // Claude tab: a pushed id is ignored (wrk minted its own).
+        app.handle_status_update(StatusUpdate {
+            tab: "tc".into(),
+            kind: StatusKind::Busy,
+            session_id: Some("should-be-ignored".into()),
+        });
+
+        let s = app.active_session().unwrap();
+        assert_eq!(
+            s.tabs[1].as_claude().unwrap().session_id.as_deref(),
+            Some("session_xyz")
+        );
+        assert_eq!(
+            s.tabs[0].as_claude().unwrap().session_id.as_deref(),
+            Some("claude-uuid")
+        );
     }
 
     #[test]

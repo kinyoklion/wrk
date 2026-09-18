@@ -44,13 +44,19 @@ pub struct OpenRequest {
     pub project: Option<String>,
 }
 
-/// A status push from a Claude Code hook, tagging the originating tab.
+/// A status push from an agent hook (`wrk hook`), tagging the originating tab.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusUpdate {
     /// The tab's opaque id (from `WRK_TAB`).
     pub tab: String,
     /// The state transition.
     pub kind: StatusKind,
+    /// The agent's own session id, when the hook revealed it (Kimi hooks carry
+    /// `session_id` on stdin; `wrk hook --harness kimi` forwards it). Lets wrk
+    /// learn and persist a Kimi tab's session id for deterministic resume.
+    /// Omitted from the wire when absent, so the Claude push stays unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// A `wrk review` request from a Claude session: start a review of its project's
@@ -205,11 +211,36 @@ mod tests {
         let req = Request::Status(StatusUpdate {
             tab: "tab3".to_string(),
             kind: StatusKind::Waiting,
+            session_id: None,
         });
         let json = serde_json::to_string(&req).unwrap();
+        // No session id → the field is omitted, so the Claude push is unchanged.
         assert_eq!(json, r#"{"cmd":"status","tab":"tab3","kind":"waiting"}"#);
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
+    }
+
+    #[test]
+    fn status_request_carries_session_id_when_present() {
+        let req = Request::Status(StatusUpdate {
+            tab: "tab0".to_string(),
+            kind: StatusKind::Stopped,
+            session_id: Some("session_abc".to_string()),
+        });
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains(r#""session_id":"session_abc""#));
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), req);
+        // A push without the field still parses (default None) — Claude hooks.
+        let back: Request =
+            serde_json::from_str(r#"{"cmd":"status","tab":"t","kind":"busy"}"#).unwrap();
+        assert_eq!(
+            back,
+            Request::Status(StatusUpdate {
+                tab: "t".to_string(),
+                kind: StatusKind::Busy,
+                session_id: None,
+            })
+        );
     }
 
     #[test]

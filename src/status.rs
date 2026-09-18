@@ -279,7 +279,7 @@ changed.\n",
 /// Write every wrk skill to `~/.claude/skills/<name>/SKILL.md`, overwriting any
 /// prior copy (so content fixes propagate). Returns the written paths.
 pub fn install_skills() -> Result<Vec<PathBuf>> {
-    install_skills_in(&claude_dir()?)
+    write_skills_in(&claude_dir()?, &skill_specs())
 }
 
 /// Remove the wrk-installed skills. Returns the removed directories (only those
@@ -288,10 +288,13 @@ pub fn uninstall_skills() -> Result<Vec<PathBuf>> {
     uninstall_skills_in(&claude_dir()?)
 }
 
-fn install_skills_in(claude_dir: &Path) -> Result<Vec<PathBuf>> {
+/// Write each `(name, markdown)` skill under `<base_dir>/skills/<name>/SKILL.md`,
+/// overwriting any prior copy. Shared by the Claude and Kimi installers — only
+/// the base directory and the skill bodies differ.
+fn write_skills_in(base_dir: &Path, specs: &[(&'static str, String)]) -> Result<Vec<PathBuf>> {
     let mut written = Vec::new();
-    for (name, markdown) in skill_specs() {
-        let dir = claude_dir.join("skills").join(name);
+    for (name, markdown) in specs {
+        let dir = base_dir.join("skills").join(name);
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = dir.join("SKILL.md");
         fs::write(&path, markdown).with_context(|| format!("writing {}", path.display()))?;
@@ -472,6 +475,299 @@ fn entry_has_marker(entry: &Value) -> bool {
             .and_then(|c| c.as_str())
             .is_some_and(command_is_ours)
     })
+}
+
+// -----------------------------------------------------------------------------
+// Kimi Coder harness
+//
+// Kimi keeps hooks in a TOML `[[hooks]]` array in `~/.kimi-code/config.toml` (not
+// JSON like Claude), and skills in `~/.kimi-code/skills/<name>/SKILL.md` with its
+// own frontmatter and `/skill:` invocation. Because that config file also holds
+// the user's hand-written, commented provider/model config, hooks are merged with
+// `toml_edit` (format-preserving) so only our `[[hooks]]` entries change. The hook
+// commands push status over the same socket as Claude's (`wrk hook <kind>`); the
+// extra `--harness kimi` flag tells `wrk hook` to also read the session id Kimi
+// passes on stdin, so a Kimi tab's session can be learned and persisted.
+// -----------------------------------------------------------------------------
+
+/// Kimi's config/data home: `$KIMI_CODE_HOME` when set, else `~/.kimi-code`
+/// (mirrors Kimi Code's own resolution so hooks/skills land where it looks).
+fn kimi_dir() -> Result<PathBuf> {
+    if let Ok(home) = std::env::var("KIMI_CODE_HOME")
+        && !home.is_empty()
+    {
+        return Ok(PathBuf::from(home));
+    }
+    let home = std::env::var("HOME").context("HOME env var not set")?;
+    Ok(PathBuf::from(home).join(".kimi-code"))
+}
+
+fn kimi_config_path() -> Result<PathBuf> {
+    Ok(kimi_dir()?.join("config.toml"))
+}
+
+/// One Kimi hook: the lifecycle event, an optional regex matcher (empty = all,
+/// omitted from the TOML), and the `wrk hook` kind it fires.
+struct KimiHookSpec {
+    event: &'static str,
+    matcher: &'static str,
+    kind: &'static str,
+}
+
+/// Kimi lifecycle events mapped onto wrk's shared status vocabulary. `SessionStart`
+/// (fires on both startup and resume) seeds the session id and marks the tab idle;
+/// `PermissionResult` clears the "waiting" dot once the user approves.
+const KIMI_HOOKS: &[KimiHookSpec] = &[
+    KimiHookSpec {
+        event: "SessionStart",
+        matcher: "",
+        kind: "stopped",
+    },
+    KimiHookSpec {
+        event: "UserPromptSubmit",
+        matcher: "",
+        kind: "busy",
+    },
+    KimiHookSpec {
+        event: "Stop",
+        matcher: "",
+        kind: "stopped",
+    },
+    KimiHookSpec {
+        event: "PermissionRequest",
+        matcher: "",
+        kind: "waiting",
+    },
+    KimiHookSpec {
+        event: "PermissionResult",
+        matcher: "",
+        kind: "busy",
+    },
+    KimiHookSpec {
+        event: "SubagentStart",
+        matcher: "",
+        kind: "subagent-start",
+    },
+    KimiHookSpec {
+        event: "SubagentStop",
+        matcher: "",
+        kind: "subagent-stop",
+    },
+];
+
+/// The shell command for a Kimi hook. Same guard/`$WRK_BIN` shape as Claude's
+/// (see [`hook_command`]) so `command_is_ours` recognizes it; the extra
+/// `--harness kimi` makes `wrk hook` read the session id off stdin.
+fn kimi_hook_command(kind: &str) -> String {
+    format!(r#"[ -n "$WRK_SOCK" ] && "$WRK_BIN" hook {kind} --harness kimi >/dev/null 2>&1; true"#)
+}
+
+/// Whether a `[[hooks]]` table's `command` is one wrk wrote.
+fn kimi_table_is_ours(table: &toml_edit::Table) -> bool {
+    table
+        .get("command")
+        .and_then(|v| v.as_str())
+        .is_some_and(command_is_ours)
+}
+
+pub fn install_kimi_hooks() -> Result<PathBuf> {
+    let path = kimi_config_path()?;
+    install_kimi_hooks_at(&path)?;
+    Ok(path)
+}
+
+/// Merge wrk's `[[hooks]]` into the Kimi `config.toml` at `path`, preserving every
+/// other table and all comments. Our previous entries (matched by command marker)
+/// are dropped and rewritten so re-running refreshes commands without duplicating.
+fn install_kimi_hooks_at(path: &Path) -> Result<()> {
+    use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
+
+    let text = if path.exists() {
+        fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?
+    } else {
+        String::new()
+    };
+    let mut doc: DocumentMut = text
+        .parse()
+        .with_context(|| format!("parsing {}", path.display()))?;
+
+    if doc.get("hooks").is_none() {
+        doc["hooks"] = Item::ArrayOfTables(ArrayOfTables::new());
+    }
+    let hooks = doc["hooks"]
+        .as_array_of_tables_mut()
+        .ok_or_else(|| anyhow!("{}: `hooks` is not an array of tables", path.display()))?;
+
+    // Drop our previous entries (highest index first so removals don't shift).
+    let ours: Vec<usize> = (0..hooks.len())
+        .filter(|&i| hooks.get(i).is_some_and(kimi_table_is_ours))
+        .collect();
+    for i in ours.into_iter().rev() {
+        hooks.remove(i);
+    }
+    // Append a fresh entry per spec.
+    for spec in KIMI_HOOKS {
+        let mut t = Table::new();
+        t["event"] = value(spec.event);
+        if !spec.matcher.is_empty() {
+            t["matcher"] = value(spec.matcher);
+        }
+        t["command"] = value(kimi_hook_command(spec.kind));
+        hooks.push(t);
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+pub fn uninstall_kimi_hooks() -> Result<(PathBuf, usize)> {
+    let path = kimi_config_path()?;
+    let removed = uninstall_kimi_hooks_at(&path)?;
+    Ok((path, removed))
+}
+
+/// Remove wrk's `[[hooks]]` entries from the Kimi `config.toml` at `path`, leaving
+/// everything else untouched. Returns how many entries were removed.
+fn uninstall_kimi_hooks_at(path: &Path) -> Result<usize> {
+    use toml_edit::DocumentMut;
+
+    if !path.exists() {
+        return Ok(0);
+    }
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut doc: DocumentMut = text
+        .parse()
+        .with_context(|| format!("parsing {}", path.display()))?;
+
+    let Some(hooks) = doc
+        .get_mut("hooks")
+        .and_then(|i| i.as_array_of_tables_mut())
+    else {
+        return Ok(0);
+    };
+    let ours: Vec<usize> = (0..hooks.len())
+        .filter(|&i| hooks.get(i).is_some_and(kimi_table_is_ours))
+        .collect();
+    let removed = ours.len();
+    for i in ours.into_iter().rev() {
+        hooks.remove(i);
+    }
+    let empty = hooks.is_empty();
+    if empty {
+        doc.remove("hooks");
+    }
+    fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))?;
+    Ok(removed)
+}
+
+/// The Kimi skills wrk installs into `~/.kimi-code/skills/<name>/SKILL.md`. Same
+/// three commands as the Claude skills, but in Kimi's frontmatter (`name`,
+/// `description`, `whenToUse`; no `allowed-tools`) and invoked as `/skill:<name>`.
+/// Kimi has no `!`…`` output-injection preprocessor, so `end-local-review` tells
+/// the model to run `"$WRK_BIN" review end` itself and act on the output.
+fn kimi_skill_specs() -> Vec<(&'static str, String)> {
+    vec![
+        ("wrk-view", kimi_view_skill_markdown()),
+        ("start-local-review", kimi_review_start_skill_markdown()),
+        ("end-local-review", kimi_review_end_skill_markdown()),
+    ]
+}
+
+fn kimi_view_skill_markdown() -> String {
+    format!(
+        "---\n\
+name: wrk-view\n\
+description: Open a markdown file, README, or diagram in the wrk viewer. Use when the user asks to view, open, preview, show, or visualize a markdown/text file or diagram in the terminal.\n\
+whenToUse: When the user asks to view, open, preview, show, or visualize a markdown file or diagram in the terminal.\n\
+---\n\
+{marker}\n\
+\n\
+# View a file in the wrk viewer\n\
+\n\
+Run `\"$WRK_BIN\" view <absolute-path>` to open a file in wrk's markdown viewer.\n\
+Inside a wrk session it opens as a new tab beside the conversation; in a plain\n\
+shell it opens a scrollable pager. It is read-only and never modifies the file.\n\
+\n\
+When the user asks to view, open, preview, show, or visualize a markdown file or\n\
+diagram:\n\
+\n\
+1. Resolve it to an absolute path (search with grep/find if they described the\n\
+   file rather than naming it).\n\
+2. Run `\"$WRK_BIN\" view <absolute-path>`.\n\
+3. Briefly confirm it is open.\n",
+        marker = marker_comment()
+    )
+}
+
+fn kimi_review_start_skill_markdown() -> String {
+    format!(
+        "---\n\
+name: start-local-review\n\
+description: Start an in-editor code review in wrk. Use when the user asks to review changes, review a diff, do a local/code review, or look over their work side-by-side.\n\
+whenToUse: When the user asks to review changes, review a diff, do a local/code review, or look over their work side-by-side.\n\
+---\n\
+{marker}\n\
+\n\
+# Start a local code review in wrk\n\
+\n\
+Open a side-by-side review in wrk so the user can comment on the diff. First\n\
+work out WHAT to review, then start it — don't invent feedback yourself.\n\
+\n\
+1. Inspect the repository:\n\
+   - `git status --porcelain` — are there uncommitted changes?\n\
+   - `git branch --show-current`, and the base branch (`git rev-parse --abbrev-ref origin/HEAD` when it exists, else assume `main`/`master`).\n\
+   - `git log --oneline <base>..HEAD` — are there local commits not on the base?\n\
+2. Choose the target:\n\
+   - If the user named one, use it.\n\
+   - Else if there are uncommitted changes, review those: `\"$WRK_BIN\" review start` (no argument = working tree vs HEAD).\n\
+   - Else if the branch has commits ahead of the base, review those: `\"$WRK_BIN\" review start <base>..HEAD`.\n\
+3. Run `\"$WRK_BIN\" review start <target>`. Then tell the user to comment in the\n\
+   wrk review pane and run `/skill:end-local-review` when done. Wait for their\n\
+   comments — do not guess at review feedback.\n",
+        marker = marker_comment()
+    )
+}
+
+fn kimi_review_end_skill_markdown() -> String {
+    format!(
+        "---\n\
+name: end-local-review\n\
+description: End the in-editor code review in wrk and collect the user's comments. Use when the user says they are done reviewing, finished commenting, or asks to end the local review.\n\
+whenToUse: When the user says they are done reviewing, finished commenting, or asks to end the local review.\n\
+---\n\
+{marker}\n\
+\n\
+# Collect local review comments\n\
+\n\
+Run this command and read its output:\n\
+\n\
+```\n\
+\"$WRK_BIN\" review end\n\
+```\n\
+\n\
+The output lists the comments the user left in the wrk review pane (file, line,\n\
+side, the comment, and the quoted line). Address each one:\n\
+\n\
+- Make the requested change, or\n\
+- If you disagree or need clarification, say so and ask.\n\
+\n\
+Work through them in file order and finish with a short summary of what you\n\
+changed.\n",
+        marker = marker_comment()
+    )
+}
+
+/// Write the Kimi skills into `~/.kimi-code/skills/<name>/SKILL.md`.
+pub fn install_kimi_skills() -> Result<Vec<PathBuf>> {
+    write_skills_in(&kimi_dir()?, &kimi_skill_specs())
+}
+
+/// Remove the wrk-installed Kimi skills (only those carrying wrk's marker).
+pub fn uninstall_kimi_skills() -> Result<Vec<PathBuf>> {
+    uninstall_skills_in(&kimi_dir()?)
 }
 
 #[cfg(test)]
@@ -675,7 +971,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let claude = home.path().join(".claude");
 
-        let paths = install_skills_in(&claude).unwrap();
+        let paths = write_skills_in(&claude, &skill_specs()).unwrap();
         assert_eq!(paths.len(), SKILL_NAMES.len());
         assert!(claude.join("skills/wrk-view/SKILL.md").exists());
         assert!(claude.join("skills/start-local-review/SKILL.md").exists());
@@ -701,5 +997,125 @@ mod tests {
         let removed = uninstall_skills_in(&claude).unwrap();
         assert!(!removed.contains(&dir));
         assert!(dir.join("SKILL.md").exists());
+    }
+
+    // --- Kimi harness ---
+
+    #[test]
+    fn kimi_hook_command_shape_and_marker() {
+        let cmd = kimi_hook_command("busy");
+        assert!(cmd.contains(r#"[ -n "$WRK_SOCK" ]"#));
+        assert!(cmd.contains(r#""$WRK_BIN" hook busy --harness kimi"#));
+        assert!(cmd.trim_end().ends_with("; true"));
+        // Recognized as ours by the shared marker check (so re-install refreshes
+        // and uninstall removes it), and embeds no machine-specific path.
+        assert!(command_is_ours(&cmd));
+        assert!(
+            !cmd.split_whitespace()
+                .any(|w| w.trim_matches('"').starts_with('/'))
+        );
+    }
+
+    #[test]
+    fn install_kimi_hooks_preserves_other_tables_and_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // A user config with a comment, a scalar, and a provider table.
+        fs::write(
+            &path,
+            "# my kimi config\ndefault_model = \"lmstudio/local\"\n\n\
+             [providers.lmstudio]\ntype = \"openai\"\nbase_url = \"http://localhost:1234/v1\"\n",
+        )
+        .unwrap();
+
+        install_kimi_hooks_at(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        // Untouched user content survives verbatim.
+        assert!(text.contains("# my kimi config"));
+        assert!(text.contains("default_model = \"lmstudio/local\""));
+        assert!(text.contains("[providers.lmstudio]"));
+        // Our hooks landed and parse as a valid array of tables.
+        let doc: toml_edit::DocumentMut = text.parse().unwrap();
+        let hooks = doc["hooks"].as_array_of_tables().unwrap();
+        assert_eq!(hooks.len(), KIMI_HOOKS.len());
+        // Re-running does not duplicate (matched by marker and rewritten).
+        install_kimi_hooks_at(&path).unwrap();
+        let doc: toml_edit::DocumentMut = fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(
+            doc["hooks"].as_array_of_tables().unwrap().len(),
+            KIMI_HOOKS.len()
+        );
+    }
+
+    #[test]
+    fn uninstall_kimi_hooks_removes_only_ours() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // A user's own hook alongside a scalar; then install ours on top.
+        fs::write(
+            &path,
+            "default_model = \"lmstudio/local\"\n\n\
+             [[hooks]]\nevent = \"Stop\"\ncommand = \"notify-send done\"\n",
+        )
+        .unwrap();
+        install_kimi_hooks_at(&path).unwrap();
+
+        let removed = uninstall_kimi_hooks_at(&path).unwrap();
+        assert_eq!(removed, KIMI_HOOKS.len());
+        let text = fs::read_to_string(&path).unwrap();
+        // The user's own hook and scalar survive; none of ours remain.
+        assert!(text.contains("notify-send done"));
+        assert!(text.contains("default_model = \"lmstudio/local\""));
+        assert!(!text.contains("$WRK_BIN"));
+        // A second uninstall removes nothing.
+        assert_eq!(uninstall_kimi_hooks_at(&path).unwrap(), 0);
+    }
+
+    #[test]
+    fn uninstall_kimi_hooks_drops_empty_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        install_kimi_hooks_at(&path).unwrap();
+        uninstall_kimi_hooks_at(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        // No stray empty `[[hooks]]` left behind.
+        assert!(!text.contains("[[hooks]]"));
+    }
+
+    #[test]
+    fn kimi_skills_use_wrk_bin_carry_markers_and_slash_skill() {
+        for (name, md) in kimi_skill_specs() {
+            assert!(md.contains(&format!("name: {name}")), "{name} name");
+            assert!(md.contains(SKILL_INSTALL_MARKER), "{name} marker");
+            assert!(md.contains("\"$WRK_BIN\""), "{name} uses $WRK_BIN");
+            // Kimi frontmatter, not Claude's.
+            assert!(!md.contains("allowed-tools"), "{name} has no allowed-tools");
+        }
+        // The end-review skill has the model run the command (no Claude `!`…`` injection).
+        let end = kimi_review_end_skill_markdown();
+        assert!(end.contains("\"$WRK_BIN\" review end"));
+        assert!(!end.contains("!`"));
+        // The start-review skill points at the Kimi-style command name.
+        assert!(kimi_review_start_skill_markdown().contains("/skill:end-local-review"));
+    }
+
+    #[test]
+    fn kimi_skills_round_trip_and_preserve_foreign() {
+        let home = tempfile::tempdir().unwrap();
+        let kimi = home.path().join(".kimi-code");
+
+        let paths = write_skills_in(&kimi, &kimi_skill_specs()).unwrap();
+        assert_eq!(paths.len(), SKILL_NAMES.len());
+        assert!(kimi.join("skills/wrk-view/SKILL.md").exists());
+
+        // A user's own same-named skill (no marker) survives uninstall.
+        let foreign = kimi.join("skills/mine");
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(foreign.join("SKILL.md"), "---\nname: mine\n---\nmine\n").unwrap();
+
+        let removed = uninstall_skills_in(&kimi).unwrap();
+        assert_eq!(removed.len(), SKILL_NAMES.len());
+        assert!(!kimi.join("skills/wrk-view/SKILL.md").exists());
+        assert!(foreign.join("SKILL.md").exists());
     }
 }
