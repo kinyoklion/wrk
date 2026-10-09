@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.17](https://github.com/kinyoklion/wrk/compare/wrk-v0.1.16...wrk-v0.1.17) (2026-10-09)
+
+### Features
+
+* **sessions:** follow in-tab session switches and remember past session names (#87, #99, #100, #86) (#101) ([#87](https://github.com/kinyoklion/wrk/issues/87)) ([#99](https://github.com/kinyoklion/wrk/issues/99)) ([#100](https://github.com/kinyoklion/wrk/issues/100)) ([#86](https://github.com/kinyoklion/wrk/issues/86)) ([#101](https://github.com/kinyoklion/wrk/issues/101))
+* **harness:** add Kimi coding-agent harness alongside Claude (#98) ([#98](https://github.com/kinyoklion/wrk/issues/98))
+* **layout:** default new projects to tabbed layout (#92) ([#92](https://github.com/kinyoklion/wrk/issues/92))
+
+### Bug Fixes
+
+* **review:** resolve repo from invocation dir; real subcommands for `review` (#94, #95) (#96) ([#94](https://github.com/kinyoklion/wrk/issues/94)) ([#95](https://github.com/kinyoklion/wrk/issues/95)) ([#96](https://github.com/kinyoklion/wrk/issues/96)) ([#94](https://github.com/kinyoklion/wrk/issues/94)) ([#95](https://github.com/kinyoklion/wrk/issues/95))
+
 ## [0.1.16](https://github.com/kinyoklion/wrk/compare/wrk-v0.1.15...wrk-v0.1.16) (2026-08-06)
 
 ### Features
