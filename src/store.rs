@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -61,12 +62,30 @@ pub struct Project {
     /// spawns one fresh new Claude session on open and records its ID here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub claude_sessions: Vec<SessionRef>,
+    /// Every agent session wrk has hosted for this project, session id → tab
+    /// name. Unlike `claude_sessions` (the live tab list) entries survive their
+    /// tab being closed or the tab switching sessions, so the new-tab picker can
+    /// label past sessions. Backfilled from `claude_sessions` on load.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub session_names: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectStore {
     #[serde(default, rename = "project")]
     pub projects: Vec<Project>,
+}
+
+impl Project {
+    /// Record the name of every live tab's session in `session_names`. A live
+    /// tab's current name wins over an older recorded one.
+    pub fn remember_live_session_names(&mut self) {
+        for sr in &self.claude_sessions {
+            if let Some(id) = &sr.session_id {
+                self.session_names.insert(id.clone(), sr.name.clone());
+            }
+        }
+    }
 }
 
 impl ProjectStore {
@@ -113,8 +132,11 @@ pub fn load_from(path: &Path) -> Result<ProjectStore> {
         return Ok(ProjectStore::default());
     }
     let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let store: ProjectStore =
+    let mut store: ProjectStore =
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    for project in &mut store.projects {
+        project.remember_live_session_names();
+    }
     Ok(store)
 }
 
@@ -162,6 +184,7 @@ mod tests {
                 layout_mode: None,
                 shell_passthrough: None,
                 claude_sessions: vec![],
+                session_names: BTreeMap::new(),
             })
             .unwrap();
         store
@@ -172,6 +195,7 @@ mod tests {
                 layout_mode: Some(LayoutMode::Tabbed),
                 shell_passthrough: Some(true),
                 claude_sessions: vec![],
+                session_names: BTreeMap::new(),
             })
             .unwrap();
         save_to(&store, &path).unwrap();
@@ -189,6 +213,7 @@ mod tests {
             layout_mode: None,
             shell_passthrough: None,
             claude_sessions: vec![],
+            session_names: BTreeMap::new(),
         };
         store.add(p.clone()).unwrap();
         assert!(store.add(p).is_err());
@@ -221,6 +246,7 @@ mod tests {
                     session_id: None,
                     harness: HarnessKind::Claude,
                 }],
+                session_names: BTreeMap::new(),
             })
             .unwrap();
         save_to(&store, &path).unwrap();
@@ -256,6 +282,10 @@ mod tests {
                         harness: HarnessKind::Kimi,
                     },
                 ],
+                session_names: BTreeMap::from([
+                    ("uuid-1".into(), "c".into()),
+                    ("session_abc".into(), "k".into()),
+                ]),
             })
             .unwrap();
         save_to(&store, &path).unwrap();
@@ -270,5 +300,35 @@ mod tests {
         // A hand-written entry with no `harness` key defaults to Claude.
         let back: SessionRef = toml::from_str("name = \"x\"\n").unwrap();
         assert_eq!(back.harness, HarnessKind::Claude);
+    }
+
+    /// Names of closed tabs' sessions survive a save/load, and a config written
+    /// before `session_names` existed is backfilled from its live tabs.
+    #[test]
+    fn session_names_round_trip_and_backfill() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("projects.toml");
+        fs::write(
+            &path,
+            "[[project]]\nname = \"p\"\npath = \"/tmp/p\"\n\n\
+             [[project.claude_sessions]]\nname = \"live\"\nsession_id = \"id-live\"\n",
+        )
+        .unwrap();
+        let mut store = load_from(&path).unwrap();
+        assert_eq!(
+            store.projects[0]
+                .session_names
+                .get("id-live")
+                .map(String::as_str),
+            Some("live")
+        );
+
+        store.projects[0]
+            .session_names
+            .insert("id-closed".into(), "closed".into());
+        save_to(&store, &path).unwrap();
+        let loaded = load_from(&path).unwrap();
+        assert_eq!(loaded, store);
+        assert_eq!(loaded.projects[0].session_names.len(), 2);
     }
 }

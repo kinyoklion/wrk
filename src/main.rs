@@ -9,7 +9,7 @@ mod status;
 mod store;
 mod ui;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
@@ -213,44 +213,54 @@ fn cmd_install_hooks() -> Result<()> {
 /// always exits 0 — a missing socket, stale instance, or unknown kind is a
 /// silent no-op so hooks never surface errors to the agent.
 ///
-/// For `--harness kimi`, the hook's stdin carries the event JSON, which includes
-/// the agent's `session_id`; we parse it (best-effort) and forward it so wrk can
-/// learn and persist a Kimi tab's session for later resume. Other harnesses (and
-/// missing/garbled stdin) simply omit it.
-fn cmd_hook(kind: &str, harness: Option<&str>) -> Result<()> {
+/// The hook's stdin carries the agent's event JSON; its `session_id` and
+/// `source` are forwarded so wrk can follow a tab whose session changed (Claude
+/// `/clear`, `/resume`) and learn a Kimi tab's id. Missing/garbled stdin simply
+/// omits them. `--harness` is still accepted (installed Kimi hooks pass it) but
+/// no longer changes behavior.
+fn cmd_hook(kind: &str, _harness: Option<&str>) -> Result<()> {
     let (Ok(sock), Ok(tab)) = (std::env::var("WRK_SOCK"), std::env::var("WRK_TAB")) else {
         return Ok(());
     };
     let Some(kind) = status::StatusKind::from_arg(kind) else {
         return Ok(());
     };
-    let session_id = if harness == Some("kimi") {
-        read_stdin_session_id()
-    } else {
-        None
-    };
+    let (session_id, source) = read_stdin_hook_event();
     let req = ipc::Request::Status(ipc::StatusUpdate {
         tab,
         kind,
         session_id,
+        source,
     });
     let _ = ipc::send(Path::new(&sock), &req);
     Ok(())
 }
 
-/// Read the hook event JSON on stdin and pull out `session_id`. Best-effort: any
-/// read/parse failure (or an absent field) yields `None`. The agent writes the
-/// JSON and closes stdin, so the read terminates promptly at EOF.
-fn read_stdin_session_id() -> Option<String> {
-    use std::io::Read;
+/// Read the hook event JSON on stdin and pull out `session_id` and `source`.
+/// Best-effort: any read/parse failure (or an absent field) yields `None`. The
+/// agent writes the JSON and closes stdin, so the read ends promptly at EOF; an
+/// interactive stdin (a manual `wrk hook` run) is skipped rather than blocking.
+fn read_stdin_hook_event() -> (Option<String>, Option<String>) {
+    use std::io::{IsTerminal, Read};
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return (None, None);
+    }
     let mut buf = String::new();
-    std::io::stdin().read_to_string(&mut buf).ok()?;
-    let value: serde_json::Value = serde_json::from_str(buf.trim()).ok()?;
-    value
-        .get("session_id")?
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+    if stdin.lock().read_to_string(&mut buf).is_err() {
+        return (None, None);
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(buf.trim()) else {
+        return (None, None);
+    };
+    let field = |k: &str| {
+        value
+            .get(k)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    (field("session_id"), field("source"))
 }
 
 /// Start or end an in-TUI code review in the running wrk instance:
@@ -457,6 +467,7 @@ fn cmd_add(path: &Path, name: Option<String>) -> Result<()> {
         layout_mode: None,
         shell_passthrough: None,
         claude_sessions: vec![],
+        session_names: BTreeMap::new(),
     })?;
     store::save(&store)?;
     println!("added '{resolved_name}'");
@@ -490,6 +501,10 @@ pub struct ClaudeTab {
     /// session id those look identical. Cleared after the first spawn. Ignored by
     /// Claude (its `session_id` drives new-vs-resume).
     pub fresh: bool,
+    /// Transient: whether a hook has reported this tab's session id since its
+    /// last spawn. The first report is the launch itself — a differing id there
+    /// is the same conversation under a new id, not a user-initiated switch.
+    pub id_reported: bool,
     /// Opaque per-tab id exported to the PTY as `WRK_TAB`, so hook-driven status
     /// pushes (`wrk hook`) can be routed back to this tab. Stable for the tab's
     /// lifetime, independent of the Claude session ID.
@@ -840,6 +855,7 @@ impl App {
                     harness: self.settings.default_harness(),
                     session_id: None,
                     fresh: false,
+                    id_reported: false,
                     status_id: new_status_id(),
                     status: status::TabStatus::default(),
                     pane: None,
@@ -852,6 +868,7 @@ impl App {
                         harness: sr.harness,
                         session_id: sr.session_id.clone(),
                         fresh: false,
+                        id_reported: false,
                         status_id: new_status_id(),
                         status: status::TabStatus::default(),
                         pane: None,
@@ -868,6 +885,7 @@ impl App {
             let dead = tab.pane.as_mut().is_some_and(|p| p.child_finished());
             if tab.pane.is_none() || dead {
                 let cmd = spawn_command_for_tab(&self.settings, tab, &mut assigned_new);
+                tab.id_reported = false;
                 let mut env = base_env.clone();
                 env.push(("WRK_TAB".to_string(), tab.status_id.clone()));
                 env.extend(self.settings.harness_pane_env(tab.harness));
@@ -1026,6 +1044,7 @@ impl App {
             // The initial (fresh) spawn happened above; a later respawn of this
             // Kimi tab should resume via `--continue`, not restart.
             fresh: false,
+            id_reported: false,
             status_id,
             status: status::TabStatus::default(),
             pane,
@@ -1195,26 +1214,43 @@ impl App {
     /// transition into its status. Unknown tab ids are ignored — a stale push
     /// from a tab that was closed simply has no target.
     fn handle_status_update(&mut self, update: ipc::StatusUpdate) {
-        // Find the tab this push targets, folding in the status kind. If the push
-        // also carried a session id (Kimi hooks do), and it's new/changed for a
-        // Kimi tab, adopt it so the session can be resumed later — then persist.
-        let mut learned_session_for: Option<String> = None;
+        // Find the tab this push targets and fold in the status kind. When the
+        // push carries a session id that differs from the tab's, the tab now
+        // hosts a different session (Claude `/clear`/`/resume`, or a Kimi id
+        // learned for the first time): adopt it so a restart resumes it, rename
+        // the tab if it's a genuinely different conversation, and persist.
+        let mut changed_project: Option<String> = None;
         'outer: for (project_name, session) in self.sessions.iter_mut() {
             for tab in session.claude_tabs_mut() {
-                if tab.status_id == update.tab {
-                    tab.status.apply(update.kind);
-                    if let Some(id) = &update.session_id
-                        && tab.harness == HarnessKind::Kimi
-                        && tab.session_id.as_deref() != Some(id.as_str())
-                    {
-                        tab.session_id = Some(id.clone());
-                        learned_session_for = Some(project_name.clone());
-                    }
-                    break 'outer;
+                if tab.status_id != update.tab {
+                    continue;
                 }
+                tab.status.apply(update.kind);
+                let first_report = !tab.id_reported;
+                if update.session_id.is_some() {
+                    tab.id_reported = true;
+                }
+                if let Some(id) = &update.session_id
+                    && tab.session_id.as_deref() != Some(id.as_str())
+                {
+                    let continued = first_report
+                        || tab.session_id.is_none()
+                        || update.source.as_deref() == Some("compact");
+                    let empty = BTreeMap::new();
+                    let names = self
+                        .store
+                        .find(project_name)
+                        .map_or(&empty, |p| &p.session_names);
+                    if let Some(name) = switched_tab_name(&tab.name, id, names, continued) {
+                        tab.name = name;
+                    }
+                    tab.session_id = Some(id.clone());
+                    changed_project = Some(project_name.clone());
+                }
+                break 'outer;
             }
         }
-        if let Some(project_name) = learned_session_for {
+        if let Some(project_name) = changed_project {
             self.persist_claude_sessions(&project_name);
         }
     }
@@ -1345,6 +1381,7 @@ impl App {
         // None` only until its first spawn (a UUID is minted then); a Kimi tab
         // until its SessionStart hook reveals the id — after which restarts resume.
         p.claude_sessions = tabs;
+        p.remember_live_session_names();
         if let Err(e) = store::save(&self.store) {
             push_error(&mut self.error, format!("save failed: {e}"));
         }
@@ -1391,6 +1428,38 @@ impl App {
             push_error(&mut self.error, format!("save failed: {e}"));
         }
     }
+}
+
+/// The new name for a tab whose session id just changed to `new_id`, or `None`
+/// to keep `current`. A session wrk already knows keeps its recorded name; a
+/// `continued` conversation (same one under a new id) keeps the tab's name; a
+/// genuinely new one gets a fresh ` (N)` suffix.
+fn switched_tab_name(
+    current: &str,
+    new_id: &str,
+    session_names: &BTreeMap<String, String>,
+    continued: bool,
+) -> Option<String> {
+    if let Some(known) = session_names.get(new_id) {
+        return Some(known.clone());
+    }
+    (!continued).then(|| next_session_name(current, session_names))
+}
+
+/// Name for a tab that switched to a new conversation: `current`'s base (any
+/// trailing ` (N)` stripped) with the lowest ` (N)`, N ≥ 2, that no recorded
+/// session already uses — so the old session keeps its name in the picker.
+fn next_session_name(current: &str, session_names: &BTreeMap<String, String>) -> String {
+    let base = current
+        .strip_suffix(')')
+        .and_then(|s| s.rsplit_once(" ("))
+        .filter(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(current, |(b, _)| b);
+    let taken = |name: &str| session_names.values().any(|v| v == name);
+    (2..)
+        .map(|n| format!("{base} ({n})"))
+        .find(|name| !taken(name))
+        .expect("unbounded range")
 }
 
 /// A fresh Claude session UUID (v4) for a brand-new tab.
@@ -2206,18 +2275,7 @@ fn dispatch_global_action(app: &mut App, action: GlobalAction, body: Rect) -> bo
             let _ = body;
             let discovered = app
                 .active_project()
-                .map(|p| {
-                    let known: std::collections::HashMap<String, String> = p
-                        .claude_sessions
-                        .iter()
-                        .filter_map(|sr| {
-                            sr.session_id
-                                .as_ref()
-                                .map(|id| (id.clone(), sr.name.clone()))
-                        })
-                        .collect();
-                    session::discover_sessions_named(&p.path, &known)
-                })
+                .map(|p| session::discover_sessions_named(&p.path, &p.session_names))
                 .unwrap_or_default();
             app.modal = Some(ModalState::ClaudeTabPicker(ClaudeTabPickerModal::new(
                 &discovered,
@@ -2549,6 +2607,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                         layout_mode: None,
                         shell_passthrough: None,
                         claude_sessions: vec![],
+                        session_names: BTreeMap::new(),
                     })?;
                     store::save(&store)?;
                     Ok(())
@@ -3299,6 +3358,7 @@ mod tests {
         new_session_id, normalize_paste, resume_agent_command,
     };
     use crate::settings::HarnessConfig;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     #[test]
@@ -3438,6 +3498,7 @@ mod tests {
             harness: HarnessKind::Claude,
             session_id: None,
             fresh: false,
+            id_reported: false,
             status_id: String::new(),
             status: crate::status::TabStatus::default(),
             pane: None,
@@ -3453,6 +3514,7 @@ mod tests {
             harness: HarnessKind::Kimi,
             session_id: None,
             fresh: true,
+            id_reported: false,
             status_id: String::new(),
             status: crate::status::TabStatus::default(),
             pane: None,
@@ -3474,6 +3536,7 @@ mod tests {
             harness: HarnessKind::Kimi,
             session_id: Some("session_z".into()),
             fresh: false,
+            id_reported: false,
             status_id: String::new(),
             status: crate::status::TabStatus::default(),
             pane: None,
@@ -3500,6 +3563,7 @@ mod tests {
             harness: HarnessKind::Claude,
             session_id: None,
             fresh: false,
+            id_reported: false,
             status_id: String::new(),
             status: crate::status::TabStatus::default(),
             pane: None,
@@ -3586,17 +3650,20 @@ mod tests {
             tab: "tb".into(),
             kind: StatusKind::Waiting,
             session_id: None,
+            source: None,
         });
         app.handle_status_update(StatusUpdate {
             tab: "ta".into(),
             kind: StatusKind::SubagentStart,
             session_id: None,
+            source: None,
         });
         // An unknown id must be a harmless no-op.
         app.handle_status_update(StatusUpdate {
             tab: "ghost".into(),
             kind: StatusKind::Busy,
             session_id: None,
+            source: None,
         });
 
         let s = app.active_session().unwrap();
@@ -3608,10 +3675,11 @@ mod tests {
         assert_eq!(b.status.subagents, 0);
     }
 
-    /// A Kimi hook that carries a session id teaches wrk the tab's session (so it
-    /// can be resumed); a Claude tab ignores a pushed id (wrk owns Claude's id).
+    /// A pushed session id that differs from the tab's is adopted for every
+    /// harness: a Kimi tab learns its id, and a Claude tab follows a `/clear` or
+    /// `/resume`. A push matching the tab's current id changes nothing.
     #[test]
-    fn status_update_learns_kimi_session_id_only_for_kimi_tabs() {
+    fn status_update_adopts_changed_session_ids() {
         use crate::ipc::StatusUpdate;
         use crate::status::StatusKind;
 
@@ -3620,37 +3688,92 @@ mod tests {
             let s = app.sessions.get_mut("p").unwrap();
             if let Tab::Claude(c) = &mut s.tabs[0] {
                 c.status_id = "tc".into();
-                c.harness = HarnessKind::Claude;
                 c.session_id = Some("claude-uuid".into());
             }
             if let Tab::Claude(k) = &mut s.tabs[1] {
                 k.status_id = "tk".into();
                 k.harness = HarnessKind::Kimi;
-                k.session_id = None;
             }
         }
+        let push = |app: &mut App, tab: &str, id: &str, source: Option<&str>| {
+            app.handle_status_update(StatusUpdate {
+                tab: tab.into(),
+                kind: StatusKind::Session,
+                session_id: Some(id.into()),
+                source: source.map(str::to_string),
+            });
+        };
+        let tab = |app: &App, i: usize| {
+            let t = app.active_session().unwrap().tabs[i].as_claude().unwrap();
+            (t.name.clone(), t.session_id.clone())
+        };
 
-        // Kimi tab: the pushed id is adopted.
-        app.handle_status_update(StatusUpdate {
-            tab: "tk".into(),
-            kind: StatusKind::Stopped,
-            session_id: Some("session_xyz".into()),
-        });
-        // Claude tab: a pushed id is ignored (wrk minted its own).
+        // Kimi learns its id without being renamed.
+        push(&mut app, "tk", "session_xyz", None);
+        assert_eq!(tab(&app, 1), ("k".into(), Some("session_xyz".into())));
+
+        // Claude's launch report matches the minted id: a no-op.
+        push(&mut app, "tc", "claude-uuid", Some("startup"));
+        assert_eq!(tab(&app, 0), ("c".into(), Some("claude-uuid".into())));
+
+        // `/clear` → a new conversation: adopted and given a fresh suffix.
+        push(&mut app, "tc", "cleared", Some("clear"));
+        assert_eq!(tab(&app, 0), ("c (2)".into(), Some("cleared".into())));
+
+        // Compaction under a new id is the same conversation: name kept.
+        push(&mut app, "tc", "compacted", Some("compact"));
+        assert_eq!(tab(&app, 0), ("c (2)".into(), Some("compacted".into())));
+    }
+
+    /// The first id a freshly spawned tab reports is its launch: even when it
+    /// differs from the id wrk spawned with, it's the same conversation.
+    #[test]
+    fn first_session_report_after_spawn_keeps_the_name() {
+        use crate::ipc::StatusUpdate;
+        use crate::status::StatusKind;
+
+        let mut app = app_with_tabs(vec![claude_tab("c")]);
+        if let Tab::Claude(c) = &mut app.sessions.get_mut("p").unwrap().tabs[0] {
+            c.status_id = "tc".into();
+            c.session_id = Some("spawned".into());
+        }
         app.handle_status_update(StatusUpdate {
             tab: "tc".into(),
-            kind: StatusKind::Busy,
-            session_id: Some("should-be-ignored".into()),
+            kind: StatusKind::Session,
+            session_id: Some("forked".into()),
+            source: Some("resume".into()),
         });
+        let t = app.active_session().unwrap().tabs[0].as_claude().unwrap();
+        assert_eq!(t.name, "c");
+        assert_eq!(t.session_id.as_deref(), Some("forked"));
+    }
 
-        let s = app.active_session().unwrap();
+    #[test]
+    fn switched_tab_name_prefers_known_names_then_suffixes() {
+        let names = BTreeMap::from([
+            ("a".to_string(), "proj".to_string()),
+            ("b".to_string(), "proj (2)".to_string()),
+        ]);
+        // A session wrk already named keeps that name, continued or not.
         assert_eq!(
-            s.tabs[1].as_claude().unwrap().session_id.as_deref(),
-            Some("session_xyz")
+            super::switched_tab_name("proj (2)", "a", &names, false),
+            Some("proj".into())
         );
         assert_eq!(
-            s.tabs[0].as_claude().unwrap().session_id.as_deref(),
-            Some("claude-uuid")
+            super::switched_tab_name("x", "a", &names, true),
+            Some("proj".into())
+        );
+        // An unknown, continued conversation keeps the tab's name.
+        assert_eq!(super::switched_tab_name("proj", "new", &names, true), None);
+        // An unknown new conversation takes the lowest free suffix, built from
+        // the base name rather than stacking suffixes.
+        assert_eq!(
+            super::switched_tab_name("proj (2)", "new", &names, false),
+            Some("proj (3)".into())
+        );
+        assert_eq!(
+            super::next_session_name("notes (draft)", &names),
+            "notes (draft) (2)"
         );
     }
 
@@ -3710,6 +3833,7 @@ mod tests {
             layout_mode: None,
             shell_passthrough: None,
             claude_sessions: vec![],
+            session_names: BTreeMap::new(),
         });
         app.active_project_name = Some(name.clone());
         let session = ProjectSession {
