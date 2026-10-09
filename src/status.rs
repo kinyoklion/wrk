@@ -30,6 +30,9 @@ pub enum StatusKind {
     SubagentStart,
     /// A sub-agent finished.
     SubagentStop,
+    /// The agent (re)started a session — startup, `/resume`, `/clear`. Carries
+    /// only the session id; the tab's state is unchanged.
+    Session,
 }
 
 impl StatusKind {
@@ -41,6 +44,7 @@ impl StatusKind {
             "waiting" => Self::Waiting,
             "subagent-start" => Self::SubagentStart,
             "subagent-stop" => Self::SubagentStop,
+            "session" => Self::Session,
             _ => return None,
         })
     }
@@ -77,6 +81,7 @@ impl TabStatus {
             StatusKind::Waiting => self.event = Some(HookEvent::Waiting),
             StatusKind::SubagentStart => self.subagents = self.subagents.saturating_add(1),
             StatusKind::SubagentStop => self.subagents = self.subagents.saturating_sub(1),
+            StatusKind::Session => {}
         }
     }
 }
@@ -110,6 +115,11 @@ struct HookSpec {
 }
 
 const HOOKS: &[HookSpec] = &[
+    HookSpec {
+        event: "SessionStart",
+        matcher: "",
+        kind: "session",
+    },
     HookSpec {
         event: "UserPromptSubmit",
         matcher: "",
@@ -782,6 +792,7 @@ mod tests {
             ("waiting", StatusKind::Waiting),
             ("subagent-start", StatusKind::SubagentStart),
             ("subagent-stop", StatusKind::SubagentStop),
+            ("session", StatusKind::Session),
         ] {
             assert_eq!(StatusKind::from_arg(arg), Some(kind));
         }

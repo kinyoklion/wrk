@@ -51,12 +51,15 @@ pub struct StatusUpdate {
     pub tab: String,
     /// The state transition.
     pub kind: StatusKind,
-    /// The agent's own session id, when the hook revealed it (Kimi hooks carry
-    /// `session_id` on stdin; `wrk hook --harness kimi` forwards it). Lets wrk
-    /// learn and persist a Kimi tab's session id for deterministic resume.
-    /// Omitted from the wire when absent, so the Claude push stays unchanged.
+    /// The agent's own session id, read from the hook event JSON on stdin. Lets
+    /// wrk follow a tab whose session changed (Claude `/clear`, `/resume`) and
+    /// learn a Kimi tab's id, so a restart resumes the tab's current session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// The hook event's `source` (Claude `SessionStart`: `startup`, `resume`,
+    /// `clear`, `compact`), used to tell a continued conversation from a new one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// A `wrk review` request from a Claude session: start a review of its project's
@@ -212,6 +215,7 @@ mod tests {
             tab: "tab3".to_string(),
             kind: StatusKind::Waiting,
             session_id: None,
+            source: None,
         });
         let json = serde_json::to_string(&req).unwrap();
         // No session id → the field is omitted, so the Claude push is unchanged.
@@ -226,6 +230,7 @@ mod tests {
             tab: "tab0".to_string(),
             kind: StatusKind::Stopped,
             session_id: Some("session_abc".to_string()),
+            source: None,
         });
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains(r#""session_id":"session_abc""#));
@@ -239,6 +244,7 @@ mod tests {
                 tab: "t".to_string(),
                 kind: StatusKind::Busy,
                 session_id: None,
+                source: None,
             })
         );
     }

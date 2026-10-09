@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// Discover Claude sessions stored on disk for a given project directory.
 ///
@@ -62,7 +62,7 @@ pub fn discover_sessions(project_path: &Path) -> Vec<DiscoveredSession> {
 /// name from `known` (mapping session_id → name).
 pub fn discover_sessions_named(
     project_path: &Path,
-    known: &HashMap<String, String>,
+    known: &BTreeMap<String, String>,
 ) -> Vec<DiscoveredSession> {
     let mut sessions = discover_sessions(project_path);
     for s in &mut sessions {
