@@ -1,6 +1,7 @@
 mod ipc;
 mod keymap;
 mod pane;
+mod plugin;
 mod proc;
 mod review;
 mod session;
@@ -38,7 +39,7 @@ use crate::settings::{HarnessKind, Settings, Theme};
 use crate::store::{LayoutMode, Project, ProjectStore, SessionRef};
 use crate::ui::ModalState;
 use crate::ui::modal::{
-    AddProjectModal, ClaudeTabPickerModal, ConfirmDeleteModal, ConfirmQuitModal,
+    AddField, AddProjectModal, ClaudeTabPickerModal, ConfirmDeleteModal, ConfirmQuitModal,
     ConfirmUnloadModal, OpenMarkdownModal, UrlPickerModal,
 };
 
@@ -468,6 +469,8 @@ fn cmd_add(path: &Path, name: Option<String>) -> Result<()> {
         shell_passthrough: None,
         claude_sessions: vec![],
         session_names: BTreeMap::new(),
+        plugin: None,
+        plugin_config: BTreeMap::new(),
     })?;
     store::save(&store)?;
     println!("added '{resolved_name}'");
@@ -513,6 +516,24 @@ pub struct ClaudeTab {
     /// event yet", at which point the UI falls back to the idle-time heuristic.
     pub status: status::TabStatus,
     pub pane: Option<PtyPane>,
+    /// Transient: where this tab's plugin attach stands, for a plugin-backed
+    /// project (always `Idle` for an internal one). Drives the pane placeholder
+    /// while the command is resolved off the UI thread, and stops a second
+    /// attach being queued while one is in flight.
+    pub plugin_attach: PluginAttach,
+}
+
+/// Progress of a plugin tab's attach (see [`ClaudeTab::plugin_attach`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum PluginAttach {
+    /// Nothing in flight: an internal tab, or a plugin tab that is running or
+    /// whose session has ended.
+    #[default]
+    Idle,
+    /// An attach job is in flight; the pane appears when it completes.
+    Pending,
+    /// The last attach failed; the reason is shown in the pane.
+    Failed(String),
 }
 
 static TAB_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -630,6 +651,8 @@ pub struct ProjectSession {
     /// Index into `tabs` of the currently shown tab.
     pub active_tab: usize,
     pub shell: Option<PtyPane>,
+    /// Transient: a plugin shell attach is in flight (plugin projects only).
+    pub shell_pending: bool,
 }
 
 impl ProjectSession {
@@ -720,6 +743,9 @@ pub struct App {
     /// Active code-review overlay (started by `wrk review`). When `Some`, it
     /// takes over the screen and input until dismissed.
     pub review: Option<review::ReviewSession>,
+    /// Session plugins: runs attach/list/close jobs off the UI thread and
+    /// hands back results, drained each tick by the event loop.
+    pub plugins: plugin::PluginHost,
 }
 
 impl App {
@@ -729,6 +755,7 @@ impl App {
         let theme = settings.theme.resolve();
         let md_theme = settings.markdown.resolve();
         let heading_images = settings.markdown.heading_images.unwrap_or(true);
+        let plugins = plugin::PluginHost::new(settings.plugin.clone(), plugin::default_base_dir());
         let (keymap, keymap_warnings) = KeyMap::build(&settings.keys.global);
         // Surface any keymap warnings (invalid bindings, conflicts) via the
         // status-bar error slot; they remain visible until the user dismisses
@@ -764,6 +791,7 @@ impl App {
             heading_images,
             image_viewer: None,
             review: None,
+            plugins,
         }
     }
 
@@ -859,6 +887,7 @@ impl App {
                     status_id: new_status_id(),
                     status: status::TabStatus::default(),
                     pane: None,
+                    plugin_attach: PluginAttach::Idle,
                 }));
             } else {
                 // Reopening persisted tabs — resume, never restart.
@@ -872,54 +901,61 @@ impl App {
                         status_id: new_status_id(),
                         status: status::TabStatus::default(),
                         pane: None,
+                        plugin_attach: PluginAttach::Idle,
                     }));
                 }
             }
         }
 
-        // Spawn any missing or dead claude panes. Tabs without a session_id are
-        // assigned a fresh UUID here (`--session-id`) and persisted afterward.
         let claude_content = claude_pane_split(claude_inner, session.tabs.len()).1;
         let mut assigned_new = false;
-        for tab in session.claude_tabs_mut() {
-            let dead = tab.pane.as_mut().is_some_and(|p| p.child_finished());
-            if tab.pane.is_none() || dead {
-                let cmd = spawn_command_for_tab(&self.settings, tab, &mut assigned_new);
-                tab.id_reported = false;
-                let mut env = base_env.clone();
-                env.push(("WRK_TAB".to_string(), tab.status_id.clone()));
-                env.extend(self.settings.harness_pane_env(tab.harness));
-                let spawned = PtyPane::spawn(
-                    &cmd,
-                    &project.path,
-                    claude_content.height,
-                    claude_content.width,
-                    &env,
-                );
-                match spawned {
-                    Ok(p) => tab.pane = Some(p),
-                    Err(e) => push_error(&mut self.error, format!("claude spawn failed: {e}")),
+        // An internal project spawns its harness PTYs right here. A plugin
+        // project's commands come from its plugin, so its attaches are queued
+        // (below) and the panes appear as results arrive — the UI never waits
+        // on a plugin.
+        if project.is_internal() {
+            // Spawn any missing or dead claude panes. Tabs without a session_id are
+            // assigned a fresh UUID here (`--session-id`) and persisted afterward.
+            for tab in session.claude_tabs_mut() {
+                let dead = tab.pane.as_mut().is_some_and(|p| p.child_finished());
+                if tab.pane.is_none() || dead {
+                    let cmd = spawn_command_for_tab(&self.settings, tab, &mut assigned_new);
+                    tab.id_reported = false;
+                    let mut env = base_env.clone();
+                    env.push(("WRK_TAB".to_string(), tab.status_id.clone()));
+                    env.extend(self.settings.harness_pane_env(tab.harness));
+                    let spawned = PtyPane::spawn(
+                        &cmd,
+                        &project.path,
+                        claude_content.height,
+                        claude_content.width,
+                        &env,
+                    );
+                    match spawned {
+                        Ok(p) => tab.pane = Some(p),
+                        Err(e) => push_error(&mut self.error, format!("claude spawn failed: {e}")),
+                    }
                 }
             }
-        }
 
-        // Spawn shell if missing or dead.
-        let shell_dead = session.shell.as_mut().is_some_and(|p| p.child_finished());
-        if session.shell.is_none() || shell_dead {
-            let cmd = self.settings.shell();
-            session.shell = match PtyPane::spawn(
-                &cmd,
-                &project.path,
-                shell_inner.height,
-                shell_inner.width,
-                &base_env,
-            ) {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    push_error(&mut self.error, format!("shell spawn failed: {e}"));
-                    None
-                }
-            };
+            // Spawn shell if missing or dead.
+            let shell_dead = session.shell.as_mut().is_some_and(|p| p.child_finished());
+            if session.shell.is_none() || shell_dead {
+                let cmd = self.settings.shell();
+                session.shell = match PtyPane::spawn(
+                    &cmd,
+                    &project.path,
+                    shell_inner.height,
+                    shell_inner.width,
+                    &base_env,
+                ) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        push_error(&mut self.error, format!("shell spawn failed: {e}"));
+                        None
+                    }
+                };
+            }
         }
 
         // Resize live panes to current geometry (covers terminal resize while inactive).
@@ -935,6 +971,10 @@ impl App {
         // Persist any freshly-assigned session IDs so the next open resumes them.
         if assigned_new {
             self.persist_claude_sessions(&project.name);
+        }
+
+        if let Some(plugin) = &project.plugin {
+            self.request_plugin_panes(&project, plugin);
         }
 
         self.focus = Focus::Claude;
@@ -987,6 +1027,11 @@ impl App {
         let Some(project_name) = self.active_project_name.clone() else {
             return;
         };
+        // A plugin project's sessions come from its plugin, off the UI thread.
+        if let Some(project) = self.active_project().filter(|p| !p.is_internal()).cloned() {
+            self.add_plugin_tab(&project, name, session_id);
+            return;
+        }
         let layout = compute_layout(body, self);
         let claude_inner = layout.claude_inner();
         // After this spawn there will be at least one tab → strip will render →
@@ -1048,12 +1093,248 @@ impl App {
             status_id,
             status: status::TabStatus::default(),
             pane,
+            plugin_attach: PluginAttach::Idle,
         }));
         let new_idx = session.tabs.len() - 1;
         session.active_tab = new_idx;
 
         // Persist to store.
         self.persist_claude_sessions(&project_name);
+    }
+
+    /// Add a tab to plugin project `project`. It appears at once (as
+    /// "connecting…") and its command arrives from the plugin later
+    /// ([`App::handle_plugin_event`]). `session_id: None` is the picker's
+    /// "New session".
+    fn add_plugin_tab(&mut self, project: &Project, name: String, session_id: Option<String>) {
+        let Some(plugin) = project.plugin.clone() else {
+            return;
+        };
+        let status_id = new_status_id();
+        let job = plugin::Job::Attach {
+            project: plugin::payload(project),
+            tab: status_id.clone(),
+            session_id: session_id.clone(),
+            fresh: session_id.is_none(),
+            name: name.clone(),
+        };
+        let session = self.sessions.entry(project.name.clone()).or_default();
+        session.tabs.push(Tab::Claude(ClaudeTab {
+            name,
+            // The plugin decides what runs; the harness is unused for its tabs.
+            harness: HarnessKind::default(),
+            session_id,
+            fresh: false,
+            id_reported: false,
+            status_id,
+            status: status::TabStatus::default(),
+            pane: None,
+            plugin_attach: PluginAttach::Pending,
+        }));
+        session.active_tab = session.tabs.len() - 1;
+        self.persist_claude_sessions(&project.name);
+        self.plugins.submit(&plugin, job);
+    }
+
+    /// Queue attaches for a plugin project's tabs that have no live pane, and
+    /// for its shell, skipping any already in flight. Results come back as
+    /// [`plugin::PluginEvent`]s ([`App::handle_plugin_event`]).
+    fn request_plugin_panes(&mut self, project: &Project, plugin: &str) {
+        let payload = plugin::payload(project);
+        let Some(session) = self.sessions.get_mut(&project.name) else {
+            return;
+        };
+        let mut jobs = Vec::new();
+        for tab in session.claude_tabs_mut() {
+            if tab.pane.as_mut().is_some_and(|p| p.child_finished()) {
+                tab.pane = None;
+            }
+            if tab.pane.is_none() && tab.plugin_attach != PluginAttach::Pending {
+                tab.plugin_attach = PluginAttach::Pending;
+                jobs.push(plugin::Job::Attach {
+                    project: payload.clone(),
+                    tab: tab.status_id.clone(),
+                    session_id: tab.session_id.clone(),
+                    fresh: tab.fresh,
+                    name: tab.name.clone(),
+                });
+                tab.fresh = false;
+            }
+        }
+        if session.shell.as_mut().is_some_and(|p| p.child_finished()) {
+            session.shell = None;
+        }
+        if session.shell.is_none() && !session.shell_pending {
+            session.shell_pending = true;
+            jobs.push(plugin::Job::Shell { project: payload });
+        }
+        for job in jobs {
+            self.plugins.submit(plugin, job);
+        }
+    }
+
+    /// Apply a finished plugin job (drained from [`plugin::PluginHost`] each tick).
+    fn handle_plugin_event(&mut self, event: plugin::PluginEvent, body: Rect) {
+        match event {
+            plugin::PluginEvent::Attached {
+                plugin,
+                project,
+                tab,
+                result,
+            } => self.finish_plugin_attach(&plugin, &project, &tab, result, body),
+            plugin::PluginEvent::Shell {
+                plugin,
+                project,
+                result,
+            } => self.finish_plugin_shell(&plugin, &project, result, body),
+            plugin::PluginEvent::Sessions {
+                plugin,
+                project,
+                result,
+            } => self.show_plugin_sessions(&plugin, &project, result),
+        }
+    }
+
+    /// Spawn a plugin tab's pane from its attach result, or record why not (the
+    /// pane placeholder shows it).
+    fn finish_plugin_attach(
+        &mut self,
+        plugin: &str,
+        project_name: &str,
+        status_id: &str,
+        result: Result<plugin::AttachResponse>,
+        body: Rect,
+    ) {
+        let Some(project) = self.store.find(project_name).cloned() else {
+            return;
+        };
+        let Some(tab_count) = self.sessions.get(project_name).map(|s| s.tabs.len()) else {
+            return;
+        };
+        let content = claude_pane_split(compute_layout(body, self).claude_inner(), tab_count).1;
+        let mut env = self.base_pty_env(project_name);
+        env.push(("WRK_TAB".to_string(), status_id.to_string()));
+        let tab = self
+            .sessions
+            .get_mut(project_name)
+            .and_then(|s| s.claude_tabs_mut().find(|t| t.status_id == status_id));
+        let Some(tab) = tab else {
+            // The tab closed mid-attach: release any session the plugin started.
+            if let Ok(resp) = result
+                && let Some(session_id) = resp.session_id
+            {
+                let job = plugin::Job::Close {
+                    project: plugin::payload(&project),
+                    session_id,
+                };
+                self.plugins.submit(plugin, job);
+            }
+            return;
+        };
+        let resp = match result {
+            Ok(resp) => resp,
+            Err(e) => {
+                tab.plugin_attach = PluginAttach::Failed(format!("{e:#}"));
+                return;
+            }
+        };
+        let adopted = resp
+            .session_id
+            .filter(|id| tab.session_id.as_deref() != Some(id.as_str()));
+        if let Some(id) = &adopted {
+            tab.session_id = Some(id.clone());
+        }
+        env.extend(resp.env);
+        let cwd = resp.cwd.map(PathBuf::from).unwrap_or(project.path);
+        tab.id_reported = false;
+        tab.plugin_attach =
+            match PtyPane::spawn(&resp.command, &cwd, content.height, content.width, &env) {
+                Ok(pane) => {
+                    tab.pane = Some(pane);
+                    PluginAttach::Idle
+                }
+                Err(e) => PluginAttach::Failed(format!("{e:#}")),
+            };
+        if adopted.is_some() {
+            self.persist_claude_sessions(project_name);
+        }
+    }
+
+    /// Spawn a plugin project's shell pane: the plugin's shell when it offered
+    /// one, otherwise — including when the plugin failed — a local shell.
+    fn finish_plugin_shell(
+        &mut self,
+        plugin: &str,
+        project_name: &str,
+        result: Result<Option<plugin::AttachResponse>>,
+        body: Rect,
+    ) {
+        let Some(project) = self.store.find(project_name).cloned() else {
+            return;
+        };
+        let shell_inner = compute_layout(body, self).shell_inner();
+        let mut env = self.base_pty_env(project_name);
+        let (command, cwd) = match result {
+            Ok(Some(resp)) => {
+                env.extend(resp.env);
+                let cwd = resp.cwd.map(PathBuf::from).unwrap_or(project.path);
+                (resp.command, cwd)
+            }
+            Ok(None) => (self.settings.shell(), project.path),
+            Err(e) => {
+                push_error(
+                    &mut self.error,
+                    format!("plugin '{plugin}': using a local shell ({e:#})"),
+                );
+                (self.settings.shell(), project.path)
+            }
+        };
+        let Some(session) = self.sessions.get_mut(project_name) else {
+            return;
+        };
+        session.shell_pending = false;
+        session.shell =
+            match PtyPane::spawn(&command, &cwd, shell_inner.height, shell_inner.width, &env) {
+                Ok(pane) => Some(pane),
+                Err(e) => {
+                    push_error(&mut self.error, format!("shell spawn failed: {e}"));
+                    None
+                }
+            };
+    }
+
+    /// Fill the open new-tab picker with a plugin's session list, if it is
+    /// still showing that plugin's project.
+    fn show_plugin_sessions(
+        &mut self,
+        plugin: &str,
+        project_name: &str,
+        result: Result<Vec<plugin::PluginSession>>,
+    ) {
+        if self.active_project_name.as_deref() != Some(project_name) {
+            return;
+        }
+        let Some(ModalState::ClaudeTabPicker(picker)) = self.modal.as_mut() else {
+            return;
+        };
+        if picker.plugin_label() != Some(plugin) {
+            return;
+        }
+        match result {
+            Ok(sessions) => {
+                let sessions: Vec<session::DiscoveredSession> = sessions
+                    .into_iter()
+                    .map(|s| session::DiscoveredSession {
+                        session_id: s.id,
+                        name: s.name,
+                        // The plugin's order is kept as-is; there is no mtime.
+                        modified: std::time::SystemTime::UNIX_EPOCH,
+                    })
+                    .collect();
+                picker.set_sessions(&sessions);
+            }
+            Err(e) => picker.set_notice(Some(format!("couldn't list sessions: {e:#}"))),
+        }
     }
 
     /// Open a markdown file as a new tab in the active project's primary pane.
@@ -1273,13 +1554,37 @@ impl App {
         if removed_claude && session.claude_tabs().count() <= 1 {
             return;
         }
+        // Capture the closing session's id (if any) before the tab is dropped so
+        // a plugin-backed project can be told it closed.
+        let closed_session_id = tab.as_claude().and_then(|t| t.session_id.clone());
         session.tabs.remove(session.active_tab);
         if session.active_tab >= session.tabs.len() {
             session.active_tab = session.tabs.len().saturating_sub(1);
         }
         if removed_claude {
             self.persist_claude_sessions(&project_name);
+            self.notify_plugin_close(&project_name, closed_session_id);
         }
+    }
+
+    /// Best-effort notice to a plugin that a tab hosting one of its sessions
+    /// closed. No-op for internal projects or a tab with no session id; it runs
+    /// off the UI thread and never launches the plugin just to say goodbye.
+    fn notify_plugin_close(&mut self, project_name: &str, session_id: Option<String>) {
+        let Some(session_id) = session_id else {
+            return;
+        };
+        let Some(project) = self.store.find(project_name) else {
+            return;
+        };
+        let Some(plugin) = project.plugin.clone() else {
+            return;
+        };
+        let job = plugin::Job::Close {
+            project: plugin::payload(project),
+            session_id,
+        };
+        self.plugins.submit(&plugin, job);
     }
 
     /// Unload a project's running session: tear down its Claude tabs and shell
@@ -1637,6 +1942,7 @@ fn run_tui() -> Result<()> {
         }
     };
     app.socket_path = socket_path.clone();
+    app.plugins.set_wrk_sock(socket_path.as_deref());
 
     enable_raw_mode().context("enabling raw mode")?;
     let mut stdout = io::stdout();
@@ -1784,6 +2090,11 @@ fn event_loop(
             while let Ok(req) = rx.try_recv() {
                 app.handle_request(req);
             }
+        }
+
+        // Drain finished session-plugin jobs (attach / shell / list run off-thread).
+        while let Some(event) = app.plugins.try_recv() {
+            app.handle_plugin_event(event, body);
         }
 
         if event::poll(Duration::from_millis(33))? {
@@ -2273,15 +2584,29 @@ fn dispatch_global_action(app: &mut App, action: GlobalAction, body: Rect) -> bo
                 return false;
             }
             let _ = body;
-            let discovered = app
+            // A plugin project's sessions load off the UI thread into the open
+            // picker (`show_plugin_sessions`); an internal one's come from disk.
+            let plugin_list = app
                 .active_project()
-                .map(|p| session::discover_sessions_named(&p.path, &p.session_names))
-                .unwrap_or_default();
-            app.modal = Some(ModalState::ClaudeTabPicker(ClaudeTabPickerModal::new(
-                &discovered,
-                app.settings.enabled_harnesses(),
-                app.settings.default_harness(),
-            )));
+                .and_then(|p| Some((p.plugin.clone()?, plugin::payload(p))));
+            let modal = match plugin_list {
+                Some((plugin, project)) => {
+                    app.plugins.submit(&plugin, plugin::Job::List { project });
+                    ClaudeTabPickerModal::new_for_plugin(plugin)
+                }
+                None => {
+                    let discovered = app
+                        .active_project()
+                        .map(|p| session::discover_sessions_named(&p.path, &p.session_names))
+                        .unwrap_or_default();
+                    ClaudeTabPickerModal::new(
+                        &discovered,
+                        app.settings.enabled_harnesses(),
+                        app.settings.default_harness(),
+                    )
+                }
+            };
+            app.modal = Some(ModalState::ClaudeTabPicker(modal));
         }
         GlobalAction::CloseClaudeTab => {
             app.close_active_tab();
@@ -2396,7 +2721,11 @@ fn handle_paste(app: &mut App, content: String, body: Rect) {
 
     if let Some(modal) = app.modal.as_mut() {
         match modal {
-            ModalState::Add(m) => m.current_input_mut().push_str(&payload),
+            ModalState::Add(m) => {
+                if let Some(input) = m.current_input_mut() {
+                    input.push_str(&payload);
+                }
+            }
             ModalState::OpenMarkdown(m) => m.path_input.push_str(&payload),
             ModalState::ClaudeTabPicker(m) if m.name_focused => m.tab_name.push_str(&payload),
             ModalState::UrlPicker(m) => {
@@ -2502,7 +2831,9 @@ fn handle_projects_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
             app.open_selected(body);
         }
         KeyCode::Char('+') => {
-            app.modal = Some(ModalState::Add(AddProjectModal::default()));
+            app.modal = Some(ModalState::Add(AddProjectModal::new(
+                app.settings.plugin_names(),
+            )));
         }
         KeyCode::Char('d') => {
             if let Some(idx) = app.sidebar.selected_store_index()
@@ -2577,15 +2908,27 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                 consumed_modal = Some(());
             }
             KeyCode::Tab => m.toggle_focus(),
+            // ←/→ cycle the provider when its row is focused.
+            KeyCode::Left if m.focus == AddField::Provider => {
+                m.cycle_provider(-1);
+            }
+            KeyCode::Right if m.focus == AddField::Provider => {
+                m.cycle_provider(1);
+            }
             KeyCode::Backspace => {
-                m.current_input_mut().pop();
+                if let Some(input) = m.current_input_mut() {
+                    input.pop();
+                }
             }
             KeyCode::Char(c) => {
-                m.current_input_mut().push(c);
+                if let Some(input) = m.current_input_mut() {
+                    input.push(c);
+                }
             }
             KeyCode::Enter => {
                 let path = expand_tilde(m.path_input.trim());
                 let name_input = m.name_input.trim().to_string();
+                let provider = m.selected_provider();
                 let result = (|| -> Result<()> {
                     let abs = path.canonicalize()?;
                     if !abs.is_dir() {
@@ -2608,6 +2951,8 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                         shell_passthrough: None,
                         claude_sessions: vec![],
                         session_names: BTreeMap::new(),
+                        plugin: provider,
+                        plugin_config: BTreeMap::new(),
                     })?;
                     store::save(&store)?;
                     Ok(())
@@ -3353,9 +3698,9 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, ClaudeTab, Focus, HarnessKind, MarkdownTab, ModalState, Project, ProjectSession,
-        ProjectStore, Settings, Tab, continue_agent_command, expand_tilde, new_agent_command,
-        new_session_id, normalize_paste, resume_agent_command,
+        App, ClaudeTab, Focus, HarnessKind, MarkdownTab, ModalState, PluginAttach, Project,
+        ProjectSession, ProjectStore, Settings, Tab, continue_agent_command, expand_tilde,
+        new_agent_command, new_session_id, normalize_paste, resume_agent_command,
     };
     use crate::settings::HarnessConfig;
     use std::collections::BTreeMap;
@@ -3502,6 +3847,7 @@ mod tests {
             status_id: String::new(),
             status: crate::status::TabStatus::default(),
             pane: None,
+            plugin_attach: PluginAttach::Idle,
         };
         let cmd = super::spawn_command_for_tab(&s, &mut t, &mut assigned);
         assert!(assigned && t.session_id.is_some());
@@ -3518,6 +3864,7 @@ mod tests {
             status_id: String::new(),
             status: crate::status::TabStatus::default(),
             pane: None,
+            plugin_attach: PluginAttach::Idle,
         };
         assert_eq!(
             super::spawn_command_for_tab(&s, &mut t, &mut assigned),
@@ -3540,6 +3887,7 @@ mod tests {
             status_id: String::new(),
             status: crate::status::TabStatus::default(),
             pane: None,
+            plugin_attach: PluginAttach::Idle,
         };
         assert_eq!(
             super::spawn_command_for_tab(&s, &mut t, &mut assigned),
@@ -3567,6 +3915,7 @@ mod tests {
             status_id: String::new(),
             status: crate::status::TabStatus::default(),
             pane: None,
+            plugin_attach: PluginAttach::Idle,
         })
     }
 
@@ -3834,6 +4183,8 @@ mod tests {
             shell_passthrough: None,
             claude_sessions: vec![],
             session_names: BTreeMap::new(),
+            plugin: None,
+            plugin_config: BTreeMap::new(),
         });
         app.active_project_name = Some(name.clone());
         let session = ProjectSession {

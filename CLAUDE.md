@@ -24,6 +24,17 @@ root `CHANGELOG.md` keep working); the other members live under `crates/`:
   `NullBackend` shows the fence source with a hint.
 - `crates/viewer` — `wrk-md` binary: a standalone markdown pager over
   `wrk-markdown`, usable in any shell (`--print` for a plain stdout dump).
+- `crates/plugin` — `wrk-plugin` library: the session-plugin protocol. `proto`
+  holds the wire types and reply envelope (`ok_reply`/`error_reply`/
+  `parse_reply`), shared by wrk and Rust plugins; `client` is wrk's side —
+  `is_live`, `call` (request/reply with a timeout), and `launch` (start a daemon
+  with fail-fast startup; see Session plugins). Its `README.md` is the plugin
+  author's guide (for humans and agents); its Rust blocks compile as doctests
+  via `ReadmeDoctests` in `lib.rs`, so keep them in step with `proto`/`client`
+  and update the guide's tables when wire behavior changes.
+- `crates/claude-plugin` — `wrk-claude-plugin` binary: the reference plugin,
+  externalizing wrk's built-in Claude support; `tests/e2e.rs` launches it via
+  `wrk_plugin::client::launch` exactly as wrk does.
 
 Shared deps that cross crate boundaries (notably `ratatui`) live in
 `[workspace.dependencies]` so the types stay identical across crates.
@@ -76,6 +87,8 @@ A custom `PtyPaneWidget` reads the alacritty grid each frame and emits styled `r
 
 When the file changes externally and we reload, sessions whose project was removed are dropped from `App.sessions`.
 
+`Project.plugin` (`Option<String>`, TOML key `plugin`) and `Project.plugin_config` (string→string, `[project.plugin_config]`) bind a project to a **session plugin** instead of local harness PTYs (see Session plugins below). Both are omitted from TOML when unset, so pre-plugin configs are byte-identical; `Project::is_internal()` is the `plugin.is_none()` common case. `plugin_config` is `BTreeMap<String,String>` (not `toml::Table`) so `Project` stays `Eq`.
+
 ### Settings (`src/settings.rs`)
 
 Optional `~/.config/wrk/settings.toml`. Key fields: `claude_command` (defaults to `["claude"]`) and `shell_command` (falls back to `$SHELL`, then `/bin/bash`). Used to support quirky setups like `["steam-run", "claude"]` on NixOS. `claude_base()` strips a trailing `--continue` for backwards compat with older configs. `confirm_quit` (default true) gates app exit behind a confirmation modal — both quit paths (`GlobalAction::Quit` and `q` in the projects pane) route through `App::request_quit`, which opens `ModalState::ConfirmQuit` or sets `should_quit` directly.
@@ -106,6 +119,18 @@ The sidebar shows green ● (stopped/idle), yellow · (busy), red ● (waiting o
 `install_hooks` merges entries into the user's existing `settings.json` and re-running it refreshes the command (so fixes propagate) and **upgrades legacy file-polling installs in place**. Entries are detected by marker substring (`command_is_ours` matches the current `WRK_SOCK` commands and the legacy `WRK_STATUS_FILE` ones), not by exact-match — preserve a marker when editing; the same marker identifies our Kimi `[[hooks]]` entries for refresh/removal. `uninstall_hooks` removes any marked entry (current or legacy) across all hook events. There are no status files to create or clean up.
 
 The `install-hooks` subcommands also write/remove wrk's **skills**, one dir per entry of `skill_specs()`/`kimi_skill_specs()` (shared writer `write_skills_in`): `wrk-view` (open a file), `start-local-review` and `end-local-review` (the code-review commands, below). Each SKILL.md carries a marker comment so uninstall never deletes a user's own same-named skill. A skill's directory name is its command name (`start-local-review` → `/start-local-review` for Claude, `/skill:start-local-review` for Kimi).
+
+### Session plugins (`src/plugin.rs`, `crates/plugin`)
+
+A project can be backed by an external **session plugin** instead of local harness PTYs: wrk asks the plugin what command to spawn for each pane and runs that in the ordinary `PtyPane`, so the command *is* the transport (ssh to an EC2 box, a custom client, …) and the whole terminal stack is reused unchanged. wrk is the client; the plugin is a server on a Unix socket, one line of JSON each way per connection. The wire types live in `wrk_plugin::proto` (`Request` = `Hello`/`ListSessions`/`Attach`/`Close`; replies are the body plus an `ok` envelope, `{ok:false,error}` → `Err` via `parse_reply`). Only `Attach` (→ `AttachResponse{command, env?, cwd?, session_id?}`) is required; `Hello` advertises optional `Capabilities` (`list`/`shell`/`status`/`close`). Plugins are registered as `[plugin.<name>]` (`PluginConfig{socket?, command?, startup_timeout?, request_timeout?}`, `Settings::plugin_names`/`plugin_config`) and bound per project via `Project.plugin`.
+
+**Never on the UI thread.** `App.plugins` is a `plugin::PluginHost`: the app `submit`s a `Job` (`Attach`/`Shell`/`List`/`Close`), a worker thread runs it, and the result comes back as a `PluginEvent` that `event_loop` drains each tick into `App::handle_plugin_event`. Each plugin's `PluginState` (socket, caps from `hello`, the launched `Child`, last launch failure) sits behind a mutex shared by its workers, so launches are serialized and reused; a dead daemon is relaunched on the next job (self-heal — `connect` re-probes with `client::is_live` every time and reaps an exited `Child`); and within `RETRY_BACKOFF` of a failed launch, jobs fail fast with the cached error (one project open queues a job per tab plus one for the shell). `Close` never launches a plugin. `client::launch` runs the command in its own process group with `WRK_PLUGIN_SOCK` set and stdout/stderr appended to `<runtime>/wrk/plugin/<name>.log`, removes a stale socket file first (only an unconnectable *socket*), and fails fast — a child that exits before listening yields its exit status plus the last log line; one that neither listens nor exits within `startup_timeout` is killed.
+
+**Flow.** `open_selected` keeps the internal path byte-for-byte (gated on `is_internal()`) and, for a plugin project, calls `request_plugin_panes`, which marks each pane-less tab `ClaudeTab.plugin_attach = PluginAttach::Pending` (and `ProjectSession.shell_pending`) and submits jobs — `Pending` is what prevents a duplicate attach while one is in flight. `add_claude_tab` hands plugin projects to `add_plugin_tab`, which adds the tab immediately as `Pending`. `finish_plugin_attach` spawns the pane with env `base_pty_env + WRK_TAB + plugin env` (plugin wins), adopts and persists a returned `session_id`, or records `PluginAttach::Failed(reason)` for the placeholder (`ui::agent_placeholder`); a result for a tab closed mid-attach submits a `Close` for any session the plugin started. `finish_plugin_shell` spawns the plugin's shell, or a local one when it declines / lacks `caps.shell` / failed. The new-tab picker opens at once via `ClaudeTabPickerModal::new_for_plugin` (harness selector hidden, "loading sessions…" notice) and `show_plugin_sessions` fills it. `close_active_tab` → `notify_plugin_close`.
+
+**Status.** Agents that can reach wrk report through their own hooks — wrk already exports `WRK_SOCK`/`WRK_TAB`/`WRK_BIN` into plugin commands. For agents that can't (remote boxes), a plugin with `caps.status` receives `wrk_sock` + `wrk_tab` on each agent `AttachRequest` and sends the same `ipc::Request::Status` line `wrk hook` does; `handle_status_update` folds it in by tab id, no new receive path. The reference plugin (`crates/claude-plugin`) passes the env through by default; `--relay-status` simulates a remote plugin by pointing the agent's `WRK_SOCK` at itself with `WRK_TAB=<tab>@<wrk_sock>`, so relaying is stateless (survives a plugin restart, serves several wrk instances) — at the cost of `wrk review end`, which derives its mirror key from `WRK_SOCK`'s pid.
+
+**Tests.** `src/plugin.rs` exercises the real launch path by launching the test binary itself running an `#[ignore]`d `fake_plugin_daemon` test (no external program needed); `crates/plugin` covers the fail-fast launch; `crates/claude-plugin/tests/e2e.rs` launches the real plugin binary. Tests asserting that a dropped listener is no longer live must tolerate a concurrent test's fork-to-exec window (the child briefly holds copies of every fd) — poll briefly rather than asserting immediately.
 
 ### `wrk view` and IPC (`src/ipc.rs`)
 

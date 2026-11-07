@@ -312,6 +312,13 @@ mod tests {
         // shutdown does) but nothing listens → connect refused → not live.
         drop(listener);
         assert!(path.exists());
+        // A child forked by a concurrently running test (e.g. `git`) holds
+        // copies of every open fd until its exec, which can briefly keep the
+        // dropped listener connectable; allow that moment to pass.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while socket_is_live(&path) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert!(!socket_is_live(&path));
     }
 

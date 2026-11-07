@@ -1,0 +1,20 @@
+[package]
+name = "wrk-claude-plugin"
+description = "Reference wrk session plugin: wrk's built-in Claude support, externalized over the plugin protocol."
+version = "0.1.16" # x-release-please-version
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wrk-claude-plugin"
+path = "src/main.rs"
+
+[dependencies]
+wrk-plugin = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
