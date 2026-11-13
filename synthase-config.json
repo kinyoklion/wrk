@@ -9,7 +9,9 @@
       "package-name": "wrk",
       "extra-files": [
         "crates/markdown/Cargo.toml",
-        "crates/viewer/Cargo.toml"
+        "crates/viewer/Cargo.toml",
+        "crates/plugin/Cargo.toml",
+        "crates/claude-plugin/Cargo.toml"
       ]
     }
   }

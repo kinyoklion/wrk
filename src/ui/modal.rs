@@ -66,6 +66,9 @@ impl OpenMarkdownModal {
 pub enum AddField {
     Path,
     Name,
+    /// The session-provider selector (only reachable when a plugin is
+    /// configured). Not a text field — cycled with ←/→.
+    Provider,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +77,10 @@ pub struct AddProjectModal {
     pub name_input: String,
     pub focus: AddField,
     pub error: Option<String>,
+    /// Selectable providers: `"internal"` first, then each configured plugin
+    /// name. `provider_idx` indexes it.
+    pub providers: Vec<String>,
+    pub provider_idx: usize,
 }
 
 impl Default for AddProjectModal {
@@ -83,22 +90,64 @@ impl Default for AddProjectModal {
             name_input: String::new(),
             focus: AddField::Path,
             error: None,
+            providers: vec!["internal".to_string()],
+            provider_idx: 0,
         }
     }
 }
 
 impl AddProjectModal {
+    /// Build the modal offering `plugin_names` as providers alongside the
+    /// built-in internal option. With no plugins configured the provider row is
+    /// hidden and the modal looks exactly as before.
+    pub fn new(plugin_names: Vec<String>) -> Self {
+        let mut providers = vec!["internal".to_string()];
+        providers.extend(plugin_names);
+        Self {
+            providers,
+            ..Self::default()
+        }
+    }
+
+    /// Whether the provider selector is shown / reachable (any plugin exists).
+    pub fn show_provider(&self) -> bool {
+        self.providers.len() > 1
+    }
+
+    /// The chosen provider as a plugin name, or `None` for the internal
+    /// (built-in) provider.
+    pub fn selected_provider(&self) -> Option<String> {
+        match self.providers.get(self.provider_idx) {
+            Some(p) if p != "internal" => Some(p.clone()),
+            _ => None,
+        }
+    }
+
+    /// Cycle the provider selection by `delta` (±1), wrapping.
+    pub fn cycle_provider(&mut self, delta: isize) {
+        let n = self.providers.len() as isize;
+        if n == 0 {
+            return;
+        }
+        self.provider_idx = ((self.provider_idx as isize + delta).rem_euclid(n)) as usize;
+    }
+
     pub fn toggle_focus(&mut self) {
         self.focus = match self.focus {
             AddField::Path => AddField::Name,
+            AddField::Name if self.show_provider() => AddField::Provider,
             AddField::Name => AddField::Path,
+            AddField::Provider => AddField::Path,
         };
     }
 
-    pub fn current_input_mut(&mut self) -> &mut String {
+    /// The text field under focus, or `None` when the non-text provider row is
+    /// focused (so key/paste handlers skip it).
+    pub fn current_input_mut(&mut self) -> Option<&mut String> {
         match self.focus {
-            AddField::Path => &mut self.path_input,
-            AddField::Name => &mut self.name_input,
+            AddField::Path => Some(&mut self.path_input),
+            AddField::Name => Some(&mut self.name_input),
+            AddField::Provider => None,
         }
     }
 
@@ -112,16 +161,22 @@ impl AddProjectModal {
         let inner = block.inner(popup);
         block.render(popup, buf);
 
+        // path label + input, name label + input, optional provider row, a
+        // flexible spacer, then the footer.
+        let mut constraints = vec![
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ];
+        if self.show_provider() {
+            constraints.push(Constraint::Length(1));
+        }
+        constraints.push(Constraint::Min(0));
+        constraints.push(Constraint::Length(1));
         let layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Min(0),
-                Constraint::Length(1),
-            ])
+            .constraints(constraints)
             .split(inner);
 
         let (path_row, name_row) = (layout[1], layout[3]);
@@ -135,25 +190,53 @@ impl AddProjectModal {
             .style(field_style(self.focus == AddField::Name, theme))
             .render(name_row, buf);
 
+        // Provider selector (only when a plugin is configured).
+        let provider_row = self.show_provider().then(|| layout[4]);
+        if let Some(row) = provider_row {
+            let names: Vec<String> = self
+                .providers
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    if i == self.provider_idx {
+                        format!("[{p}]")
+                    } else {
+                        format!(" {p} ")
+                    }
+                })
+                .collect();
+            let style = if self.focus == AddField::Provider {
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.accent)
+            };
+            Paragraph::new(format!("provider (←/→): {}", names.join(" ")))
+                .style(style)
+                .render(row, buf);
+        }
+
         let footer = if let Some(err) = &self.error {
             Line::from(vec![Span::styled(
                 err.clone(),
                 Style::default().fg(theme.error),
             )])
+        } else if self.focus == AddField::Provider {
+            Line::from("←/→: choose provider   Tab: switch field   Enter: add   Esc: cancel")
         } else {
             Line::from("Tab: switch field   Enter: add   Esc: cancel")
         };
+        let footer_idx = layout.len() - 1;
         Paragraph::new(footer)
             .style(Style::default().fg(theme.hint))
-            .render(layout[5], buf);
+            .render(layout[footer_idx], buf);
 
-        let cursor_row = match self.focus {
-            AddField::Path => path_row,
-            AddField::Name => name_row,
-        };
-        let len = match self.focus {
-            AddField::Path => self.path_input.chars().count() as u16,
-            AddField::Name => self.name_input.chars().count() as u16,
+        let (cursor_row, len) = match self.focus {
+            AddField::Path => (path_row, self.path_input.chars().count() as u16),
+            AddField::Name => (name_row, self.name_input.chars().count() as u16),
+            // Non-text field: park the cursor at the start of the provider row.
+            AddField::Provider => (provider_row.unwrap_or(name_row), 0),
         };
         Position {
             x: cursor_row.x + len.min(cursor_row.width.saturating_sub(1)),
@@ -285,6 +368,14 @@ pub struct ClaudeTabPickerModal {
     /// Discovered Claude sessions, kept so the list can be restored when the
     /// harness cycles back to Claude.
     discovered: Vec<DiscoveredSession>,
+    /// When `Some(name)`, this project is backed by the plugin `name`: the
+    /// session list comes from the plugin (not `~/.claude`), the harness
+    /// selector is hidden (the plugin decides what runs), and the title names
+    /// the plugin.
+    plugin_label: Option<String>,
+    /// A status line under the list — e.g. while a plugin's sessions load, or
+    /// why they couldn't be listed.
+    notice: Option<String>,
 }
 
 impl ClaudeTabPickerModal {
@@ -312,14 +403,46 @@ impl ClaudeTabPickerModal {
             harness,
             harnesses,
             discovered: discovered.to_vec(),
+            plugin_label: None,
+            notice: None,
         };
         m.rebuild_sessions();
         m
     }
 
-    /// Whether the harness selector row/cycle is shown (more than one enabled).
+    /// Like [`Self::new`] but for a project backed by plugin `label`: it opens
+    /// at once offering just "New session" while the plugin's sessions load
+    /// (see [`Self::set_sessions`]), with the harness selector hidden.
+    pub fn new_for_plugin(label: String) -> Self {
+        let mut m = Self::new(&[], vec![HarnessKind::Claude], HarnessKind::Claude);
+        m.notice = Some(format!("loading sessions from {label}…"));
+        m.plugin_label = Some(label);
+        m
+    }
+
+    /// The plugin this picker lists sessions for, if any.
+    pub fn plugin_label(&self) -> Option<&str> {
+        self.plugin_label.as_deref()
+    }
+
+    /// Replace the listed sessions (a plugin's, once loaded), keeping "New
+    /// session" first and clearing the notice.
+    pub fn set_sessions(&mut self, sessions: &[DiscoveredSession]) {
+        let selected = self.selected_idx;
+        self.discovered = sessions.to_vec();
+        self.rebuild_sessions();
+        self.selected_idx = selected.min(self.sessions.len().saturating_sub(1));
+        self.notice = None;
+    }
+
+    pub fn set_notice(&mut self, notice: Option<String>) {
+        self.notice = notice;
+    }
+
+    /// Whether the harness selector row/cycle is shown (more than one enabled,
+    /// and not a plugin project — the plugin owns what runs).
     pub fn show_harness(&self) -> bool {
-        self.harnesses.len() > 1
+        self.harnesses.len() > 1 && self.plugin_label.is_none()
     }
 
     /// Cycle the selected harness by `delta` (±1), wrapping, and rebuild the
@@ -339,11 +462,13 @@ impl ClaudeTabPickerModal {
         self.rebuild_sessions();
     }
 
-    /// Rebuild the session list for the current harness: Claude offers its
-    /// discovered on-disk sessions; other harnesses offer only "New session".
+    /// Rebuild the session list for the current harness. A plugin project always
+    /// offers its listed sessions (the harness is irrelevant). Otherwise Claude
+    /// offers its discovered on-disk sessions and other harnesses offer only
+    /// "New session". The leading `None` is always "New session".
     fn rebuild_sessions(&mut self) {
         let mut sessions: Vec<Option<DiscoveredSession>> = vec![None];
-        if self.harness == HarnessKind::Claude {
+        if self.plugin_label.is_some() || self.harness == HarnessKind::Claude {
             for s in &self.discovered {
                 sessions.push(Some(s.clone()));
             }
@@ -389,10 +514,12 @@ impl ClaudeTabPickerModal {
     pub fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) -> Position {
         let popup = centered_rect(60, 70, area);
         Clear.render(popup, buf);
-        let title = if self.show_harness() {
-            " add agent session "
+        let title = if let Some(label) = &self.plugin_label {
+            format!(" add {label} session ")
+        } else if self.show_harness() {
+            " add agent session ".to_string()
         } else {
-            " add claude session "
+            " add claude session ".to_string()
         };
         let block = Block::default()
             .title(title)
@@ -503,6 +630,19 @@ impl ClaudeTabPickerModal {
                 Style::default()
             };
             Paragraph::new(label).style(style).render(row, buf);
+        }
+        if let Some(notice) = &self.notice {
+            let shown = self.sessions.len().saturating_sub(start).min(visible) as u16;
+            if shown < list_area.height {
+                let row = Rect {
+                    y: list_area.y + shown,
+                    height: 1,
+                    ..list_area
+                };
+                Paragraph::new(format!("  {notice}"))
+                    .style(Style::default().fg(theme.hint))
+                    .render(row, buf);
+            }
         }
 
         let footer = if self.name_focused {

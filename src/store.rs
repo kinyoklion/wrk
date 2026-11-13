@@ -68,6 +68,20 @@ pub struct Project {
     /// label past sessions. Backfilled from `claude_sessions` on load.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub session_names: BTreeMap<String, String>,
+    /// Session provider. `None` (the default, and the only value for configs
+    /// written before plugins existed) means wrk's built-in local session
+    /// management — a harness PTY per tab. `Some(name)` routes every session
+    /// through the external plugin registered as `[plugin.<name>]` in
+    /// settings.toml: wrk asks that plugin what command to spawn for each tab
+    /// instead of building a harness command. See `src/plugin.rs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
+    /// Opaque per-project configuration handed to the plugin on every call
+    /// (e.g. a box id or region). Values are strings so the whole `Project`
+    /// stays `Eq` and the table is comfortable to hand-edit. Ignored entirely
+    /// for internal projects.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub plugin_config: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,6 +91,12 @@ pub struct ProjectStore {
 }
 
 impl Project {
+    /// True when this project uses wrk's built-in local session management
+    /// (no plugin). The common case; the inverse of "plugin-backed".
+    pub fn is_internal(&self) -> bool {
+        self.plugin.is_none()
+    }
+
     /// Record the name of every live tab's session in `session_names`. A live
     /// tab's current name wins over an older recorded one.
     pub fn remember_live_session_names(&mut self) {
@@ -185,6 +205,8 @@ mod tests {
                 shell_passthrough: None,
                 claude_sessions: vec![],
                 session_names: BTreeMap::new(),
+                plugin: None,
+                plugin_config: BTreeMap::new(),
             })
             .unwrap();
         store
@@ -196,6 +218,8 @@ mod tests {
                 shell_passthrough: Some(true),
                 claude_sessions: vec![],
                 session_names: BTreeMap::new(),
+                plugin: None,
+                plugin_config: BTreeMap::new(),
             })
             .unwrap();
         save_to(&store, &path).unwrap();
@@ -214,6 +238,8 @@ mod tests {
             shell_passthrough: None,
             claude_sessions: vec![],
             session_names: BTreeMap::new(),
+            plugin: None,
+            plugin_config: BTreeMap::new(),
         };
         store.add(p.clone()).unwrap();
         assert!(store.add(p).is_err());
@@ -247,6 +273,8 @@ mod tests {
                     harness: HarnessKind::Claude,
                 }],
                 session_names: BTreeMap::new(),
+                plugin: None,
+                plugin_config: BTreeMap::new(),
             })
             .unwrap();
         save_to(&store, &path).unwrap();
@@ -286,6 +314,8 @@ mod tests {
                     ("uuid-1".into(), "c".into()),
                     ("session_abc".into(), "k".into()),
                 ]),
+                plugin: None,
+                plugin_config: BTreeMap::new(),
             })
             .unwrap();
         save_to(&store, &path).unwrap();
@@ -330,5 +360,45 @@ mod tests {
         let loaded = load_from(&path).unwrap();
         assert_eq!(loaded, store);
         assert_eq!(loaded.projects[0].session_names.len(), 2);
+    }
+
+    /// A plugin-backed project round-trips its `plugin` name and `plugin_config`
+    /// table; an entry with neither key loads as internal (the default), so
+    /// configs written before plugins existed are unchanged.
+    #[test]
+    fn plugin_fields_round_trip_and_default_internal() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("projects.toml");
+        fs::write(
+            &path,
+            "[[project]]\nname = \"boxed\"\npath = \"/tmp/boxed\"\nplugin = \"boxes\"\n\n\
+             [project.plugin_config]\nbox = \"i-0abc123\"\nregion = \"us-east-1\"\n\n\
+             [[project]]\nname = \"local\"\npath = \"/tmp/local\"\n",
+        )
+        .unwrap();
+        let store = load_from(&path).unwrap();
+
+        let boxed = &store.projects[0];
+        assert!(!boxed.is_internal());
+        assert_eq!(boxed.plugin.as_deref(), Some("boxes"));
+        assert_eq!(
+            boxed.plugin_config.get("box").map(String::as_str),
+            Some("i-0abc123")
+        );
+        assert_eq!(
+            boxed.plugin_config.get("region").map(String::as_str),
+            Some("us-east-1")
+        );
+        // A project with no plugin key is internal, with an empty config table.
+        assert!(store.projects[1].is_internal());
+        assert!(store.projects[1].plugin_config.is_empty());
+
+        // Round-trips byte-for-byte through a save/load.
+        save_to(&store, &path).unwrap();
+        let loaded = load_from(&path).unwrap();
+        assert_eq!(loaded, store);
+        // The internal project never grows a `plugin` key on save.
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("plugin").count(), 2); // `plugin =` + `[project.plugin_config]`
     }
 }

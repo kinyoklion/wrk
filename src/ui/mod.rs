@@ -17,7 +17,7 @@ use crate::settings::Theme;
 use crate::status::HookEvent;
 use crate::store::LayoutMode;
 use crate::ui::projects::ProjectStatus;
-use crate::{App, ClaudeTab, ProjectSession, Tab, claude_pane_split, compute_layout};
+use crate::{App, ClaudeTab, PluginAttach, ProjectSession, Tab, claude_pane_split, compute_layout};
 use wrk_markdown::MarkdownView;
 
 const WAITING_THRESHOLD: Duration = Duration::from_millis(500);
@@ -110,7 +110,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
     }
 
-    const SHELL_PLACEHOLDER: &str = "no project selected — press Enter on a project";
+    let shell_placeholder = shell_placeholder(app);
 
     match app.layout_mode {
         LayoutMode::Split => {
@@ -124,7 +124,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 " shell ",
                 shell_focused,
                 shell_pane,
-                SHELL_PLACEHOLDER,
+                &shell_placeholder,
                 &theme,
             );
         }
@@ -141,7 +141,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                         " shell ",
                         true,
                         shell_pane,
-                        SHELL_PLACEHOLDER,
+                        &shell_placeholder,
                         &theme,
                     );
                 }
@@ -317,18 +317,11 @@ fn draw_primary_pane(frame: &mut Frame, area: Rect, focused: bool, app: &mut App
             // process exited — e.g. a bad launch command). Say so, rather than the
             // misleading "no project selected".
             None => {
+                let plugin = app.active_project().and_then(|p| p.plugin.as_deref());
                 let msg = app
                     .active_session()
                     .and_then(|s| s.active_claude_tab())
-                    .map(|t| {
-                        format!(
-                            "{} ({}) is not running — its process exited. Check the \
-                             harness command in settings.toml, then reopen the project \
-                             (Enter in the sidebar) to restart it.",
-                            t.name,
-                            t.harness.id()
-                        )
-                    })
+                    .map(|t| agent_placeholder(t, plugin))
                     .unwrap_or_else(|| "session not running".to_string());
                 let para = Paragraph::new(msg)
                     .style(Style::default().fg(theme.hint))
@@ -444,6 +437,43 @@ fn tab_label(label: &str, active: bool, theme: &Theme) -> Paragraph<'static> {
     Paragraph::new(format!(" {label} "))
         .style(style)
         .alignment(ratatui::layout::Alignment::Center)
+}
+
+/// What an agent tab without a running PTY shows: for a plugin tab, where its
+/// attach stands; otherwise that the process exited.
+fn agent_placeholder(tab: &ClaudeTab, plugin: Option<&str>) -> String {
+    let Some(plugin) = plugin else {
+        return format!(
+            "{} ({}) is not running — its process exited. Check the harness command in \
+             settings.toml, then reopen the project (Enter in the sidebar) to restart it.",
+            tab.name,
+            tab.harness.id()
+        );
+    };
+    match &tab.plugin_attach {
+        PluginAttach::Pending => format!("connecting to plugin '{plugin}' for '{}'…", tab.name),
+        PluginAttach::Failed(reason) => format!(
+            "plugin '{plugin}' failed to attach '{}':\n\n{reason}\n\nReopen the project \
+             (Enter in the sidebar) to retry.",
+            tab.name
+        ),
+        PluginAttach::Idle => format!(
+            "'{}' (plugin '{plugin}') is not running — its session ended. Reopen the \
+             project (Enter in the sidebar) to reattach.",
+            tab.name
+        ),
+    }
+}
+
+/// What the shell pane shows when it has no PTY.
+fn shell_placeholder(app: &App) -> String {
+    match (app.active_session(), app.active_project()) {
+        (Some(session), Some(project)) if session.shell_pending => format!(
+            "starting the shell via plugin '{}'…",
+            project.plugin.as_deref().unwrap_or_default()
+        ),
+        _ => "no project selected — press Enter on a project".to_string(),
+    }
 }
 
 fn draw_terminal_pane(

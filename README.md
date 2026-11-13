@@ -276,6 +276,13 @@ claude_sessions = [
 name = "notes-app"
 path = "/home/rlamb/projects/notes-app"
 tags = ["personal"]
+
+[[project]]
+name = "my-box"
+path = "/home/rlamb/work/my-box"   # local project dir (shell pane, wrk view, review)
+plugin = "boxes"                   # sessions come from the "boxes" plugin, not local
+[project.plugin_config]            # opaque strings handed to the plugin on every call
+box = "i-0abc123"
 ```
 
 Multiple projects can share the same `path` — they are differentiated by name
@@ -320,6 +327,16 @@ claude_command = ["steam-run", "claude"]
 # via `kimi --continue` (its directory's latest session) and the sidebar
 # status uses the idle-time heuristic. Point Kimi at your model in
 # ~/.kimi-code/config.toml; wrk exports KIMI_DISABLE_TELEMETRY=1 to Kimi panes.
+
+# --- Session plugins -------------------------------------------------------
+# Back a project with an external session provider instead of local PTYs (see
+# "Session plugins" below). Register one per [plugin.<name>]; projects opt in
+# via `plugin = "<name>"`, selectable in the add-project dialog.
+# [plugin.boxes]
+# command = ["boxctl", "wrk-plugin", "--serve"]   # launched if nothing listens
+# # socket = "/run/user/1000/boxes/control.sock"  # default: <runtime>/wrk/plugin/<name>.sock
+# startup_timeout = 10   # seconds for a launched daemon to start listening
+# request_timeout = 30   # seconds to wait for any reply
 
 # Ask for confirmation before quitting the app. Defaults to true; set
 # false to quit immediately.
@@ -408,6 +425,100 @@ future Kimi build honors them.
 `install-hooks` also installs three **skills** into `~/.claude/skills/`:
 `wrk-view` (open a file), and `start-local-review` / `end-local-review` (the code
 review below).
+
+### Session plugins
+
+By default a project's tabs are local processes wrk spawns itself (the harness
+PTYs above). A project can instead be backed by a **session plugin**: an external
+process you write that tells wrk what command to run for each session. The
+command is the transport — `ssh -t <box> …`, your own client, a container exec —
+so wrk reuses its whole terminal stack (grid, resize, scrollback, status) over
+whatever the plugin returns. This is how you map a wrk project onto, say, an
+EC2 "box" that your own service provisions; wrk never needs to know how the box
+is made.
+
+Register a plugin in `settings.toml` and pick it in the **add-project** dialog
+(a `provider` row appears with ←/→ once at least one plugin is configured), or
+set `plugin = "<name>"` on a project in `projects.toml` by hand:
+
+```toml
+[plugin.boxes]
+# Command that starts the plugin daemon, run only if nothing is already
+# listening. wrk exports WRK_PLUGIN_SOCK=<socket> into it. Optional — omit it
+# if you start the daemon yourself.
+command = ["boxctl", "wrk-plugin", "--serve"]
+# Explicit control socket. Optional; defaults to
+# $XDG_RUNTIME_DIR/wrk/plugin/<name>.sock (the path exported as WRK_PLUGIN_SOCK).
+# socket = "/run/user/1000/boxes/control.sock"
+startup_timeout = 10   # seconds for a launched daemon to start listening
+request_timeout = 30   # seconds to wait for any reply
+```
+
+**wrk never waits on a plugin.** Every plugin request runs off the UI thread: a
+plugin tab shows *connecting…* and its pane appears when the plugin answers. If
+the plugin can't be reached, the pane says why — e.g. *the process exited (exit
+status: 127) before listening: env: 'python3': No such file or directory*. A
+launch that dies is reported at once (not after `startup_timeout`), and the
+daemon's stdout/stderr are kept in `$XDG_RUNTIME_DIR/wrk/plugin/<name>.log`. wrk
+launches a plugin it finds down, **relaunches one that dies** on the next action
+that needs it, and never stops a daemon on exit (it may be a shared service).
+
+**Protocol.** wrk is the client; the plugin listens on the socket. Each request
+is one line of JSON in, one line out, then the connection closes. Methods:
+
+| method          | request fields                                                                  | reply |
+|-----------------|---------------------------------------------------------------------------------|-------|
+| `hello`         | —                                                                               | `{name, version, capabilities:{list,shell,status,close}}` |
+| `list_sessions` | `project`                                                                       | `{sessions:[{id, name?, state?}]}` (needs `list` cap) |
+| `attach`        | `project, session_id?, kind:"agent"\|"shell", fresh, name, wrk_sock?, wrk_tab?` | `{command:[…], env?:{…}, cwd?, session_id?}` |
+| `close`         | `project, session_id`                                                           | ignored (needs `close` cap, best-effort) |
+
+`project` is `{name, path, config}` (config = the project's `plugin_config`).
+Replies carry `"ok": true`; reply `{"ok": false, "error": "…"}` to report a
+failure, which wrk shows in the tab. Only `attach` is required: a plugin that
+implements nothing else still works, offering just "New session", an agent
+command, and a local shell. `attach` with `session_id: null` + `fresh: true` means
+"create"; return the id you assigned as `session_id` and wrk records it and sends
+it back next time, so reopening the project resumes it. A `shell` attach may
+return an empty `command` to let wrk fall back to the local shell.
+
+The wire types (and wrk's client/launcher) are the `wrk-plugin` crate
+(`crates/plugin`), so a plugin written in Rust can depend on it and agree with
+wrk on the schema by construction.
+
+**Writing a plugin?** Read the author's guide,
+[`crates/plugin/README.md`](crates/plugin/README.md). It is written so a coding
+agent can follow it too, and covers the full request and reply reference, what
+wrk sends for each user action, a complete compiled skeleton, status pushing,
+pitfalls, and how to test a plugin the way wrk launches it.
+
+**Status.** wrk exports `WRK_SOCK`, `WRK_TAB` and `WRK_BIN` into every command a
+plugin returns, so an agent that can reach wrk (one running on this machine)
+reports status through its own wrk hooks exactly as in an internal project —
+the plugin needn't do anything. For agents that *can't* reach wrk (a remote box),
+the plugin pushes status itself: declare the `status` capability and each agent
+`attach` carries `wrk_sock` (wrk's socket) and `wrk_tab` (the tab's id); connect
+to `wrk_sock` and send the same line `wrk hook` sends —
+`{"cmd":"status","tab":"<wrk_tab>","kind":"busy"|"stopped"|"waiting"}`. Omit
+`session_id` from these unless the session really changed. If your daemon can
+restart while wrk runs, keep each session's `wrk_sock`/`wrk_tab` somewhere that
+survives it. Without either path a tab falls back to the idle-time heuristic.
+
+**Reference plugin.** `wrk-claude-plugin` (`crates/claude-plugin`, built with the
+workspace) externalizes wrk's own Claude support: it lists the project's on-disk
+Claude sessions, starts `claude --session-id <uuid> --name <tab>` or reopens with
+`claude --resume <id>`, and serves your `$SHELL`. Its arguments are the Claude
+command:
+
+```toml
+[plugin.claude-ext]
+command = ["/path/to/wrk/target/release/wrk-claude-plugin", "claude"]
+```
+
+With `--relay-status` first it instead simulates a remote box: it advertises
+`status`, routes the agent's hooks through itself, and pushes them to wrk — an
+end-to-end exercise of plugin-pushed status. (As on a real remote box, `wrk
+review end` isn't available to agents in that mode.)
 
 ### Code review
 

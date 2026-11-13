@@ -28,26 +28,28 @@ directories = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 base64 = "0.22"
-uuid = { version = "1", features = ["v4"] }
+uuid = { workspace = true }
 # Pure-Rust line/word diffing for the in-TUI code review (no C deps).
 similar = "2"
 wrk-markdown = { workspace = true, features = ["highlight", "images", "mermaid"] }
+# Session-plugin wire types + client/launcher (shared with plugins).
+wrk-plugin = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 
 # wrk keeps its package manifest at the repo root (rather than moving under
 # crates/) so the synthase release tooling — which is configured against path
 # "." and writes CHANGELOG.md here — keeps working unchanged. The rendering
 # library and standalone viewer live as additional workspace members.
 [workspace]
-members = ["crates/markdown", "crates/viewer"]
+members = ["crates/markdown", "crates/viewer", "crates/plugin", "crates/claude-plugin"]
 # wrk is the root package, so bare `cargo build`/`test`/`clippy` (no --workspace)
 # would otherwise touch only wrk and silently skip the new crates — including in
 # CI, which runs those bare commands. Listing every member as a default keeps the
 # whole workspace built, tested, and linted. (The release build still finds
 # target/release/wrk for its tarball.)
-default-members = [".", "crates/markdown", "crates/viewer"]
+default-members = [".", "crates/markdown", "crates/viewer", "crates/plugin", "crates/claude-plugin"]
 
 [workspace.package]
 edition = "2024"
@@ -73,3 +75,6 @@ directories = "6"
 # features are off here so each member opts into `highlight` explicitly
 # (workspace inheritance can add features but cannot disable defaults).
 wrk-markdown = { path = "crates/markdown", default-features = false }
+wrk-plugin = { path = "crates/plugin" }
+uuid = { version = "1", features = ["v4"] }
+tempfile = "3"

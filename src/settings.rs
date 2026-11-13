@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -56,6 +57,13 @@ pub struct Settings {
     /// [`Settings::harness_enabled`]).
     #[serde(default)]
     pub harness: HarnessTable,
+
+    /// Session-plugin registry (`[plugin.<name>]`). Each entry describes how wrk
+    /// reaches — and, when needed, launches — an external process that provides
+    /// sessions for the projects bound to it (`Project.plugin`). Empty by
+    /// default, so wrk with no `[plugin.*]` tables behaves exactly as before.
+    #[serde(default)]
+    pub plugin: BTreeMap<String, PluginConfig>,
 }
 
 fn default_true() -> bool {
@@ -73,6 +81,7 @@ impl Default for Settings {
             confirm_quit: true,
             default_harness: HarnessKind::default(),
             harness: HarnessTable::default(),
+            plugin: BTreeMap::new(),
         }
     }
 }
@@ -143,6 +152,41 @@ pub struct HarnessConfig {
     /// Full launch command + wrapper args, e.g. `["steam-run", "kimi"]`. Unset →
     /// the harness's built-in default command.
     pub command: Option<Vec<String>>,
+}
+
+/// One `[plugin.<name>]` table: how wrk reaches an external session plugin, and
+/// how to launch it if it isn't already running. The plugin itself is an opaque
+/// process the user develops separately (see `src/plugin.rs` for the wire
+/// protocol); wrk only needs to find its control socket.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PluginConfig {
+    /// Explicit control-socket path (a leading `~` is expanded). When unset, wrk
+    /// derives `<runtime>/wrk/plugin/<name>.sock` and exports it to the launched
+    /// command as `WRK_PLUGIN_SOCK`, so a plugin wrk starts need not hard-code a
+    /// path.
+    pub socket: Option<String>,
+    /// Command (+ args) that starts the plugin daemon. Run only when nothing is
+    /// already listening on the socket. Unset ⇒ wrk never launches the plugin
+    /// and reports an error when the socket is dead.
+    pub command: Option<Vec<String>>,
+    /// Seconds to wait for the socket to come up after launching `command`
+    /// (default 10). A launch that exits early fails at once regardless.
+    pub startup_timeout: Option<u64>,
+    /// Seconds to wait for the plugin to answer a request (default 30).
+    /// Requests run off the UI thread, so this can be generous enough for a
+    /// plugin that does real work — e.g. provisioning a box — before replying.
+    pub request_timeout: Option<u64>,
+}
+
+impl PluginConfig {
+    pub fn startup_timeout_secs(&self) -> u64 {
+        self.startup_timeout.unwrap_or(10)
+    }
+
+    pub fn request_timeout_secs(&self) -> u64 {
+        self.request_timeout.unwrap_or(30)
+    }
 }
 
 impl Settings {
@@ -245,6 +289,17 @@ impl Settings {
             HarnessKind::Claude => Vec::new(),
             HarnessKind::Kimi => vec![("KIMI_DISABLE_TELEMETRY".to_string(), "1".to_string())],
         }
+    }
+
+    /// Names of every registered session plugin, in sorted (BTreeMap) order.
+    /// Used to populate the provider selector when creating a project.
+    pub fn plugin_names(&self) -> Vec<String> {
+        self.plugin.keys().cloned().collect()
+    }
+
+    /// The `[plugin.<name>]` config, if one is registered under `name`.
+    pub fn plugin_config(&self, name: &str) -> Option<&PluginConfig> {
+        self.plugin.get(name)
     }
 }
 
@@ -729,5 +784,49 @@ mod tests {
             assert_eq!(HarnessKind::from_id(h.id()), Some(h));
         }
         assert_eq!(HarnessKind::from_id("nope"), None);
+    }
+
+    // --- Session plugins ---
+
+    #[test]
+    fn plugin_registry_defaults_empty() {
+        let s = Settings::default();
+        assert!(s.plugin_names().is_empty());
+        assert!(s.plugin_config("boxes").is_none());
+    }
+
+    #[test]
+    fn plugin_registry_parses_table() {
+        let s: Settings = toml::from_str(
+            "[plugin.boxes]\n\
+             command = [\"boxctl\", \"wrk-plugin\", \"--serve\"]\n\
+             startup_timeout = 20\n\
+             [plugin.local]\n\
+             socket = \"~/.run/local.sock\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            s.plugin_names(),
+            vec!["boxes".to_string(), "local".to_string()]
+        );
+        let boxes = s.plugin_config("boxes").unwrap();
+        assert_eq!(
+            boxes.command.as_deref(),
+            Some(
+                [
+                    "boxctl".to_string(),
+                    "wrk-plugin".to_string(),
+                    "--serve".to_string()
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(boxes.startup_timeout_secs(), 20);
+        assert_eq!(boxes.request_timeout_secs(), 30);
+        // A plugin with no command/timeout keeps the socket and the default wait.
+        let local = s.plugin_config("local").unwrap();
+        assert_eq!(local.socket.as_deref(), Some("~/.run/local.sock"));
+        assert!(local.command.is_none());
+        assert_eq!(local.startup_timeout_secs(), 10);
     }
 }

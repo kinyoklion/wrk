@@ -3543,6 +3543,18 @@ dependencies = [
  "uuid",
  "vte",
  "wrk-markdown",
+ "wrk-plugin",
+]
+
+[[package]]
+name = "wrk-claude-plugin"
+version = "0.1.16"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "tempfile",
+ "uuid",
+ "wrk-plugin",
 ]
 
 [[package]]
@@ -3568,6 +3580,16 @@ dependencies = [
  "crossterm",
  "ratatui",
  "wrk-markdown",
+]
+
+[[package]]
+name = "wrk-plugin"
+version = "0.1.16"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
