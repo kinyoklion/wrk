@@ -15,8 +15,8 @@ use crate::pane::Focus;
 use crate::pane::terminal::PtyPaneWidget;
 use crate::settings::Theme;
 use crate::status::HookEvent;
-use crate::store::LayoutMode;
-use crate::ui::projects::ProjectStatus;
+use crate::store::{LayoutMode, Project};
+use crate::ui::projects::{ProjectStatus, ProjectView, SessionInfo, SessionKind};
 use crate::{App, ClaudeTab, PluginAttach, ProjectSession, Tab, claude_pane_split, compute_layout};
 use wrk_markdown::MarkdownView;
 
@@ -45,30 +45,45 @@ fn tab_status(tab: &ClaudeTab) -> ProjectStatus {
     ProjectStatus::None
 }
 
-fn project_status_for(sessions: &HashMap<String, ProjectSession>, name: &str) -> ProjectStatus {
-    let Some(session) = sessions.get(name) else {
-        return ProjectStatus::None;
-    };
-    if session.claude_tabs().next().is_none() {
-        return ProjectStatus::None;
+/// What the sidebar lists under `project`: its live tabs (each agent with its
+/// status) when loaded, else its persisted session list — so a project's
+/// sessions are listed, and searchable, before it is opened. `is_active` marks
+/// the active project, whose shown tab is highlighted.
+pub(crate) fn project_view(
+    sessions: &HashMap<String, ProjectSession>,
+    project: &Project,
+    is_active: bool,
+) -> ProjectView {
+    match sessions.get(&project.name) {
+        Some(session) => ProjectView {
+            loaded: true,
+            sessions: session
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(i, tab)| SessionInfo {
+                    name: tab.name().to_string(),
+                    kind: match tab {
+                        Tab::Claude(c) => SessionKind::Agent(tab_status(c)),
+                        Tab::Markdown(_) => SessionKind::Markdown,
+                    },
+                    active: is_active && i == session.active_tab,
+                })
+                .collect(),
+        },
+        None => ProjectView {
+            loaded: false,
+            sessions: project
+                .claude_sessions
+                .iter()
+                .map(|sr| SessionInfo {
+                    name: sr.name.clone(),
+                    kind: SessionKind::Agent(ProjectStatus::None),
+                    active: false,
+                })
+                .collect(),
+        },
     }
-    // Worst-case across all tabs: Attention > Busy > Waiting > None.
-    let mut result = ProjectStatus::None;
-    for tab in session.claude_tabs() {
-        let s = tab_status(tab);
-        result = match (result, s) {
-            (_, ProjectStatus::Attention) => ProjectStatus::Attention,
-            (ProjectStatus::Attention, _) => ProjectStatus::Attention,
-            (_, ProjectStatus::Busy) => ProjectStatus::Busy,
-            (ProjectStatus::Busy, _) => ProjectStatus::Busy,
-            (_, ProjectStatus::Waiting) => ProjectStatus::Waiting,
-            _ => result,
-        };
-        if result == ProjectStatus::Attention {
-            break;
-        }
-    }
-    result
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -97,17 +112,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     let layout = compute_layout(body, app);
 
+    // The sidebar's rows were rebuilt for this frame by the event loop.
+    let mut filter_cursor = None;
     if let Some(sidebar_area) = layout.sidebar {
         app.sidebar.focused = app.focus == Focus::Projects;
-        let sessions = &app.sessions;
-        app.sidebar.render(
-            sidebar_area,
-            frame.buffer_mut(),
-            &app.store,
-            &theme,
-            |name| project_status_for(sessions, name),
-            |name| sessions.contains_key(name),
-        );
+        filter_cursor = app.sidebar.render(sidebar_area, frame.buffer_mut(), &theme);
     }
 
     let shell_placeholder = shell_placeholder(app);
@@ -185,16 +194,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         return;
     }
 
-    // Position the cursor inside the focused terminal pane.
-    // For the primary pane we must account for the 1-row tab strip. When the
-    // active primary tab is a markdown viewer there's no PTY (and no cursor):
-    // `active_claude()` returns `None` in that case, so the cursor is left alone.
+    // Position the cursor inside the focused terminal pane (or the sidebar's
+    // filter input). For the primary pane we must account for the tab strip
+    // when it shows (sidebar hidden). When the active primary tab is a markdown
+    // viewer there's no PTY (and no cursor): `active_claude()` returns `None` in
+    // that case, so the cursor is left alone.
     let primary_content_area = {
         let inner = inner_area(layout.claude);
-        let count = app.active_session().map(|s| s.tabs.len()).unwrap_or(0);
-        claude_pane_split(inner, count).1
+        app.active_primary_split(inner).1
     };
     match app.focus {
+        Focus::Projects => {
+            if let Some(pos) = filter_cursor {
+                frame.set_cursor_position(pos);
+            }
+        }
         Focus::Claude => {
             if let Some(pane) = app.active_claude() {
                 if let Some(pos) =
@@ -212,7 +226,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 }
             }
         }
-        _ => {}
     }
 }
 
@@ -270,7 +283,7 @@ fn draw_primary_pane(frame: &mut Frame, area: Rect, focused: bool, app: &mut App
         ),
         None => (0, 0, false, false),
     };
-    let (tab_strip_area, content_area) = claude_pane_split(inner, tab_count);
+    let (tab_strip_area, content_area) = claude_pane_split(inner, app.tab_strip_shown(tab_count));
 
     if let Some(strip_area) = tab_strip_area {
         if let Some(s) = app.active_session() {
@@ -332,7 +345,8 @@ fn draw_primary_pane(frame: &mut Frame, area: Rect, focused: bool, app: &mut App
     }
 }
 
-/// Tab strip for a project's primary pane: Claude tabs show a status dot, a
+/// Tab strip for a project's primary pane, drawn only while the sidebar (which
+/// otherwise lists the sessions) is hidden: Claude tabs show a status dot, a
 /// markdown tab shows a document glyph and its filename.
 fn draw_primary_tab_strip(
     frame: &mut Frame,
@@ -735,7 +749,7 @@ fn hint_tiers(app: &App) -> Vec<String> {
             let grow = km.display(A::GrowClaude);
             vec![
                 format!(
-                    "↑/↓ Enter/dbl-click  +/d/u/r  /  {sidebar} sidebar  \
+                    "↑/↓ Enter/dbl-click  +/d/u/r  / filter  {sidebar} sidebar  \
                      {layout} layout  {shrink}/{grow} resize  {quit} quit"
                 ),
                 format!("↑/↓ Enter  +/d/u/r  {sidebar} sidebar  {layout} layout  {quit} quit"),

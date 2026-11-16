@@ -23,7 +23,8 @@ project. Linux-only, native rendering (via your terminal), built on
   Switching projects keeps every prior session alive in the background;
   switching back resumes the existing grid + scrollback, no respawn.
 - **Multiple Claude sessions per project**: each project can hold any number of
-  named Claude tabs. Switch with `Alt+<` / `Alt+>`, open a new one with
+  named Claude tabs, listed in the sidebar nested (indented) under their
+  project — `Enter` on one opens it. Switch with `Alt+<` / `Alt+>`, open a new one with
   `Alt+n` (session picker shows sessions discovered on disk), close the active
   tab with `Alt+w`. Resumption is **deterministic**: every tab is tied to a
   specific Claude session ID, persisted to `projects.toml`, and restored via
@@ -42,13 +43,26 @@ project. Linux-only, native rendering (via your terminal), built on
 - **Two layouts per project, persisted**: split (claude | shell side-by-side,
   resizable) or tabbed (one content area, claude/shell as tabs). Stored in
   `projects.toml` as `layout = "split" | "tabbed"`.
-- **Status indicators** in the sidebar — green ● when claude has stopped
-  (finished its turn), yellow · while busy, red ● when it is waiting on you
-  (a permission prompt or other Notification). Driven by Claude Code hooks when
-  installed (precise — the hooks push state over a socket, no polling), with a
-  time-since-output heuristic as fallback. A trailing `*` marks a project with
-  a live session — bright on the active project, dim on ones loaded in the
-  background. Press `u` on the projects pane to unload one.
+- **Status indicators** on each session in the sidebar — green ● when claude
+  has stopped (finished its turn), yellow · while busy, red ● when it is waiting
+  on you (a permission prompt or other Notification); markdown tabs show ▤.
+  Driven by Claude Code hooks when installed (precise — the hooks push state
+  over a socket, no polling), with a time-since-output heuristic as fallback.
+  A trailing `*` marks a project with a live session — bright on the active
+  project, dim on ones loaded in the background; a project that isn't loaded
+  lists its saved sessions dimmed, with no indicator. Press `u` on the projects
+  pane to unload one.
+
+  ```text
+  ┌ projects ────────────┐
+  │wrk *                 │
+  │  ● main              │
+  │  · handle issues     │
+  │  ● implement my cool…│
+  │notes                 │
+  │    ideas             │
+  └──────────────────────┘
+  ```
 - **In-TUI code review** — a GitHub-style side-by-side diff review, driven from
   Claude. `/start-local-review` opens a full-screen review (file list + side-by-side
   diff, unchanged sections collapsed); comment on any before/after line, then
@@ -228,11 +242,11 @@ by default; tmux needs `set -g allow-passthrough on`).
 | Key | Action |
 |---|---|
 | `↑` / `↓` (or `j` / `k`) | move selection |
-| `Enter` (or double-click) | open the selected project |
+| `Enter` (or double-click) | open the selected project, or the selected session (opening its project if needed) |
 | `+` | add a project (modal) |
-| `d` | delete the selected project (modal) |
-| `u` | unload the selected project — kill its claude + shell, free the session (modal) |
-| `/` | fuzzy filter |
+| `d` | delete the selected (or selected session's) project (modal) |
+| `u` | unload the selected (or selected session's) project — kill its claude + shell, free the session (modal) |
+| `/` | fuzzy filter over projects **and** sessions — a query matches `"<project> <session>"`, so `wrk issues` narrows to one session; `↑`/`↓` move, `Enter` opens, `Esc` clears |
 | `r` | reload `projects.toml` from disk |
 | `q` | quit |
 
@@ -245,6 +259,10 @@ by default; tmux needs `set -g allow-passthrough on`).
 | `Alt+w` | close active tab (Claude or markdown; keeps ≥1 Claude tab) |
 | `Alt+<` | previous tab |
 | `Alt+>` | next tab |
+
+The sidebar lists every tab under its project, so the primary pane shows no tab
+strip while the sidebar is visible; hide the sidebar (`Alt+0`) and the strip
+returns along the top of the pane.
 
 A markdown tab renders the file with the bundled `wrk-markdown` engine
 (headings, lists, tables, syntax-highlighted code, inline images incl. SVG, and
