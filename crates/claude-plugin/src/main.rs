@@ -150,6 +150,7 @@ impl Plugin {
                     shell: true,
                     status: self.relay_status,
                     close: true,
+                    ..Default::default()
                 },
             }),
             Request::ListSessions { project } => proto::ok_reply(&ListResponse {
@@ -158,6 +159,10 @@ impl Plugin {
             Request::Attach(request) => proto::ok_reply(&self.attach(request)),
             // Claude sessions live on disk; a closed tab leaves nothing to tear down.
             Request::Close { .. } => proto::ok_reply(&serde_json::json!({})),
+            // Not advertised: this plugin's projects are projects.toml's.
+            Request::ListProjects | Request::CreateForm { .. } | Request::Create { .. } => {
+                Ok(proto::error_reply("not supported by this plugin"))
+            }
         }
     }
 
@@ -246,6 +251,7 @@ impl Plugin {
                 id,
                 name: None,
                 state: SessionState::Unknown,
+                status: None,
             })
             .collect()
     }

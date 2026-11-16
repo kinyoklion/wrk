@@ -816,7 +816,7 @@ impl UrlPickerModal {
     }
 }
 
-fn field_style(focused: bool, theme: &Theme) -> Style {
+pub(crate) fn field_style(focused: bool, theme: &Theme) -> Style {
     if focused {
         // A subtle "this field is being edited" treatment: light text on a
         // darker bg so it pops against the modal interior. Defaults match the
@@ -830,7 +830,7 @@ fn field_style(focused: bool, theme: &Theme) -> Style {
     }
 }
 
-fn centered_rect(width_pct: u16, height_pct: u16, area: Rect) -> Rect {
+pub(crate) fn centered_rect(width_pct: u16, height_pct: u16, area: Rect) -> Rect {
     let v = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

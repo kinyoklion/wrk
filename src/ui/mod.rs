@@ -1,3 +1,4 @@
+pub mod form;
 pub mod modal;
 pub mod projects;
 pub mod review;
@@ -45,6 +46,27 @@ fn tab_status(tab: &ClaudeTab) -> ProjectStatus {
     ProjectStatus::None
 }
 
+/// The sidebar status a plugin's listing reports for a session.
+fn listed_status(status: wrk_plugin::proto::AgentStatus) -> ProjectStatus {
+    use wrk_plugin::proto::AgentStatus;
+    match status {
+        AgentStatus::Busy => ProjectStatus::Busy,
+        AgentStatus::Waiting => ProjectStatus::Attention,
+        AgentStatus::Idle => ProjectStatus::Waiting,
+        AgentStatus::Unknown => ProjectStatus::None,
+    }
+}
+
+/// A tab's status, falling back for a plugin-listed project's tab without a
+/// live pane to what the plugin's listing says.
+fn agent_status(project: &Project, tab: &ClaudeTab) -> ProjectStatus {
+    match tab_status(tab) {
+        ProjectStatus::None => crate::remote::listed_status(project, tab.session_id.as_deref())
+            .map_or(ProjectStatus::None, listed_status),
+        status => status,
+    }
+}
+
 /// What the sidebar lists under `project`: its live tabs (each agent with its
 /// status) when loaded, else its persisted session list — so a project's
 /// sessions are listed, and searchable, before it is opened. `is_active` marks
@@ -64,7 +86,7 @@ pub(crate) fn project_view(
                 .map(|(i, tab)| SessionInfo {
                     name: tab.name().to_string(),
                     kind: match tab {
-                        Tab::Claude(c) => SessionKind::Agent(tab_status(c)),
+                        Tab::Claude(c) => SessionKind::Agent(agent_status(project, c)),
                         Tab::Markdown(_) => SessionKind::Markdown,
                     },
                     active: is_active && i == session.active_tab,
@@ -78,7 +100,10 @@ pub(crate) fn project_view(
                 .iter()
                 .map(|sr| SessionInfo {
                     name: sr.name.clone(),
-                    kind: SessionKind::Agent(ProjectStatus::None),
+                    kind: SessionKind::Agent(
+                        crate::remote::listed_status(project, sr.session_id.as_deref())
+                            .map_or(ProjectStatus::None, listed_status),
+                    ),
                     active: false,
                 })
                 .collect(),
@@ -187,6 +212,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 }
             }
             ModalState::UrlPicker(m) => {
+                let cursor = m.render(area, frame.buffer_mut(), &theme);
+                frame.set_cursor_position(cursor);
+            }
+            ModalState::PluginForm(m) => {
                 let cursor = m.render(area, frame.buffer_mut(), &theme);
                 frame.set_cursor_position(cursor);
             }
@@ -330,12 +359,21 @@ fn draw_primary_pane(frame: &mut Frame, area: Rect, focused: bool, app: &mut App
             // process exited — e.g. a bad launch command). Say so, rather than the
             // misleading "no project selected".
             None => {
-                let plugin = app.active_project().and_then(|p| p.plugin.as_deref());
+                let project = app.active_project();
+                let plugin = project.and_then(|p| p.plugin.as_deref());
+                let remote = project.is_some_and(Project::is_remote);
                 let msg = app
                     .active_session()
                     .and_then(|s| s.active_claude_tab())
-                    .map(|t| agent_placeholder(t, plugin))
-                    .unwrap_or_else(|| "session not running".to_string());
+                    .map(|t| agent_placeholder(t, plugin, remote))
+                    .unwrap_or_else(|| match project.filter(|p| p.is_remote()) {
+                        Some(p) => format!(
+                            "{} has no sessions yet. Press Alt+n (or + in the sidebar) to \
+                             create one.",
+                            p.display_name()
+                        ),
+                        None => "session not running".to_string(),
+                    });
                 let para = Paragraph::new(msg)
                     .style(Style::default().fg(theme.hint))
                     .wrap(ratatui::widgets::Wrap { trim: true });
@@ -455,7 +493,7 @@ fn tab_label(label: &str, active: bool, theme: &Theme) -> Paragraph<'static> {
 
 /// What an agent tab without a running PTY shows: for a plugin tab, where its
 /// attach stands; otherwise that the process exited.
-fn agent_placeholder(tab: &ClaudeTab, plugin: Option<&str>) -> String {
+fn agent_placeholder(tab: &ClaudeTab, plugin: Option<&str>, remote: bool) -> String {
     let Some(plugin) = plugin else {
         return format!(
             "{} ({}) is not running — its process exited. Check the harness command in \
@@ -469,6 +507,13 @@ fn agent_placeholder(tab: &ClaudeTab, plugin: Option<&str>) -> String {
         PluginAttach::Failed(reason) => format!(
             "plugin '{plugin}' failed to attach '{}':\n\n{reason}\n\nReopen the project \
              (Enter in the sidebar) to retry.",
+            tab.name
+        ),
+        // A listed session keeps running where it lives; the pane just isn't
+        // attached (detached with Alt+w, or the attach ended).
+        PluginAttach::Idle if remote => format!(
+            "'{}' isn't attached. It keeps running on {plugin}; press Enter on it in the \
+             sidebar to attach.",
             tab.name
         ),
         PluginAttach::Idle => format!(
@@ -486,6 +531,10 @@ fn shell_placeholder(app: &App) -> String {
             "starting the shell via plugin '{}'…",
             project.plugin.as_deref().unwrap_or_default()
         ),
+        // A listed project's shell is the shown session's own.
+        (Some(_), Some(project)) if project.is_remote() => {
+            "the shell opens with the session on screen".to_string()
+        }
         _ => "no project selected — press Enter on a project".to_string(),
     }
 }
@@ -548,7 +597,10 @@ struct StatusView<'a> {
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
-    let project = app.active_project().map(|p| p.name.as_str()).unwrap_or("—");
+    let project = app
+        .active_project()
+        .map(Project::display_name)
+        .unwrap_or("—");
     let focus_label = match app.focus {
         Focus::Projects => "projects",
         Focus::Claude => "claude",
@@ -791,6 +843,7 @@ pub enum ModalState {
     ConfirmQuit(modal::ConfirmQuitModal),
     ClaudeTabPicker(modal::ClaudeTabPickerModal),
     UrlPicker(modal::UrlPickerModal),
+    PluginForm(form::PluginFormModal),
 }
 
 #[cfg(test)]

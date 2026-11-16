@@ -28,7 +28,9 @@ use wrk_plugin::client;
 use wrk_plugin::proto::{
     AttachKind, AttachRequest, Capabilities, HelloResponse, ListResponse, ProjectPayload, Request,
 };
-pub use wrk_plugin::proto::{AttachResponse, PluginSession};
+pub use wrk_plugin::proto::{
+    AttachResponse, CreateResponse, FormResponse, PluginSession, ProjectsResponse,
+};
 
 use crate::settings::PluginConfig;
 use crate::store::Project;
@@ -63,7 +65,12 @@ pub enum Job {
         name: String,
     },
     /// Resolve the project's shell pane (`None` result ⇒ use a local shell).
-    Shell { project: ProjectPayload },
+    /// `session_id` is the shown tab's session, for a plugin-listed project
+    /// whose shell follows the tab.
+    Shell {
+        project: ProjectPayload,
+        session_id: Option<String>,
+    },
     /// List the project's sessions for the new-tab picker.
     List { project: ProjectPayload },
     /// Tell the plugin a tab closed. Fire-and-forget, and never launches it.
@@ -71,6 +78,24 @@ pub enum Job {
         project: ProjectPayload,
         session_id: String,
     },
+    /// List the plugin's own projects for its sidebar group. Launches the
+    /// plugin (that's how wrk learns whether it lists any).
+    ListProjects,
+    /// Fetch the plugin's creation form.
+    CreateForm { project: Option<ProjectPayload> },
+    /// Create what a filled-in form describes.
+    Create {
+        project: Option<ProjectPayload>,
+        values: BTreeMap<String, String>,
+    },
+}
+
+/// A plugin's answer to [`Job::ListProjects`].
+#[derive(Debug)]
+pub struct Listing {
+    pub projects: ProjectsResponse,
+    /// The plugin advertises `create`: its group offers a creation form.
+    pub can_create: bool,
 }
 
 /// The outcome of a [`Job`], for the event loop. Errors are for display (the
@@ -86,12 +111,27 @@ pub enum PluginEvent {
     Shell {
         plugin: String,
         project: String,
+        /// The session the shell was asked for (see [`Job::Shell`]).
+        session_id: Option<String>,
         result: Result<Option<AttachResponse>>,
     },
     Sessions {
         plugin: String,
         project: String,
         result: Result<Vec<PluginSession>>,
+    },
+    /// `Ok(None)`: the plugin lists no projects of its own.
+    Projects {
+        plugin: String,
+        result: Result<Option<Listing>>,
+    },
+    Form {
+        plugin: String,
+        result: Result<FormResponse>,
+    },
+    Created {
+        plugin: String,
+        result: Result<CreateResponse>,
     },
 }
 
@@ -253,15 +293,19 @@ impl Worker {
                     result,
                 }
             }
-            Job::Shell { project } => {
+            Job::Shell {
+                project,
+                session_id,
+            } => {
                 let project_name = project.name.clone();
+                let asked = session_id.clone();
                 let result = self.connect(true).and_then(|conn| {
                     if !conn.caps.shell {
                         return Ok(None);
                     }
                     let request = Request::Attach(AttachRequest {
                         project,
-                        session_id: None,
+                        session_id,
                         kind: AttachKind::Shell,
                         fresh: false,
                         name: "shell".into(),
@@ -274,6 +318,7 @@ impl Worker {
                 PluginEvent::Shell {
                     plugin,
                     project: project_name,
+                    session_id: asked,
                     result,
                 }
             }
@@ -307,6 +352,36 @@ impl Worker {
                     let _ = client::call::<IgnoredAny>(&conn.socket, &request, conn.timeout);
                 }
                 return None;
+            }
+            Job::ListProjects => {
+                let result = self.connect(true).and_then(|conn| {
+                    if !conn.caps.projects {
+                        return Ok(None);
+                    }
+                    let projects: ProjectsResponse =
+                        client::call(&conn.socket, &Request::ListProjects, conn.timeout)?;
+                    Ok(Some(Listing {
+                        projects,
+                        can_create: conn.caps.create,
+                    }))
+                });
+                PluginEvent::Projects { plugin, result }
+            }
+            Job::CreateForm { project } => {
+                let result = self.connect(true).and_then(|conn| {
+                    if !conn.caps.create {
+                        return Err(anyhow!("it can't create projects or sessions"));
+                    }
+                    client::call(&conn.socket, &Request::CreateForm { project }, conn.timeout)
+                });
+                PluginEvent::Form { plugin, result }
+            }
+            Job::Create { project, values } => {
+                let result = self.connect(true).and_then(|conn| {
+                    let request = Request::Create { project, values };
+                    client::call(&conn.socket, &request, conn.timeout)
+                });
+                PluginEvent::Created { plugin, result }
             }
         })
     }
@@ -460,9 +535,36 @@ mod tests {
                         id: "s1".into(),
                         name: Some("one".into()),
                         state: Default::default(),
+                        status: None,
                     }],
                 }),
                 Request::Close { .. } => proto::ok_reply(&serde_json::json!({})),
+                Request::ListProjects => proto::ok_reply(&ProjectsResponse {
+                    group: Some("fakes".into()),
+                    projects: vec![wrk_plugin::proto::RemoteProject {
+                        id: "b1".into(),
+                        name: "box-1".into(),
+                        sessions: vec![PluginSession {
+                            id: "p/main".into(),
+                            name: Some("svc-main".into()),
+                            state: Default::default(),
+                            status: Some(wrk_plugin::proto::AgentStatus::Busy),
+                        }],
+                        ..Default::default()
+                    }],
+                }),
+                Request::CreateForm { .. } => proto::ok_reply(&FormResponse {
+                    title: "New".into(),
+                    ..Default::default()
+                }),
+                Request::Create { values, .. } => match values.get("name") {
+                    Some(name) => proto::ok_reply(&CreateResponse {
+                        project: Some("b1".into()),
+                        session: Some(format!("{name}/main")),
+                        message: None,
+                    }),
+                    None => Ok(proto::error_reply("name is required")),
+                },
             };
             let _ = (&stream).write_all(format!("{}\n", reply.unwrap()).as_bytes());
         }
@@ -491,6 +593,8 @@ mod tests {
             shell: true,
             status: true,
             close: true,
+            projects: true,
+            create: true,
         };
         serve_fake(UnixListener::bind(socket).unwrap(), all, None);
     }
@@ -621,12 +725,74 @@ mod tests {
         let _seen = spawn_fake(&socket, Capabilities::default());
         let mut host = host(dir.path(), config(None, Some(&socket)));
         // No `shell` cap ⇒ a local shell; no `list` cap ⇒ no sessions to offer.
-        match host.worker("p").run(Job::Shell { project: project() }) {
+        let shell = Job::Shell {
+            project: project(),
+            session_id: None,
+        };
+        match host.worker("p").run(shell) {
             Some(PluginEvent::Shell { result, .. }) => assert!(result.unwrap().is_none()),
             other => panic!("{other:?}"),
         }
         match host.worker("p").run(Job::List { project: project() }) {
             Some(PluginEvent::Sessions { result, .. }) => assert!(result.unwrap().is_empty()),
+            other => panic!("{other:?}"),
+        }
+        // No `projects` cap ⇒ no sidebar group; no `create` cap ⇒ no form.
+        match host.worker("p").run(Job::ListProjects) {
+            Some(PluginEvent::Projects { result, .. }) => assert!(result.unwrap().is_none()),
+            other => panic!("{other:?}"),
+        }
+        match host.worker("p").run(Job::CreateForm { project: None }) {
+            Some(PluginEvent::Form { result, .. }) => {
+                assert!(result.unwrap_err().to_string().contains("can't create"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_listing_plugin_lists_projects_and_creates_from_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let _seen = spawn_fake(
+            &socket,
+            Capabilities {
+                projects: true,
+                create: true,
+                ..Default::default()
+            },
+        );
+        let mut host = host(dir.path(), config(None, Some(&socket)));
+        match host.worker("p").run(Job::ListProjects) {
+            Some(PluginEvent::Projects { result, .. }) => {
+                let listing = result.unwrap().expect("it lists projects");
+                assert!(listing.can_create);
+                assert_eq!(listing.projects.group.as_deref(), Some("fakes"));
+                assert_eq!(listing.projects.projects[0].sessions[0].id, "p/main");
+            }
+            other => panic!("{other:?}"),
+        }
+        match host.worker("p").run(Job::CreateForm { project: None }) {
+            Some(PluginEvent::Form { result, .. }) => assert_eq!(result.unwrap().title, "New"),
+            other => panic!("{other:?}"),
+        }
+        let create = |values: &[(&str, &str)]| Job::Create {
+            project: None,
+            values: values
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        };
+        match host.worker("p").run(create(&[("name", "svc")])) {
+            Some(PluginEvent::Created { result, .. }) => {
+                assert_eq!(result.unwrap().session.as_deref(), Some("svc/main"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match host.worker("p").run(create(&[])) {
+            Some(PluginEvent::Created { result, .. }) => {
+                assert_eq!(result.unwrap_err().to_string(), "name is required");
+            }
             other => panic!("{other:?}"),
         }
     }

@@ -37,6 +37,26 @@ pub enum Request {
         project: ProjectPayload,
         session_id: String,
     },
+    /// List the projects the plugin provides itself, for its own group in
+    /// wrk's sidebar ([`ProjectsResponse`]). Only sent when the plugin
+    /// advertises `projects`. These projects are not in `projects.toml`: wrk
+    /// shows exactly what the latest listing says, and asks again periodically.
+    ListProjects,
+    /// Describe the form for creating a project or session ([`FormResponse`]).
+    /// `project` is the listed project the person was in, when there was one,
+    /// so the form can preselect it. Only sent with the `create` capability.
+    CreateForm {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<ProjectPayload>,
+    },
+    /// Create what the filled-in form describes ([`CreateResponse`]): `values`
+    /// maps each visible field's `id` to its value. Only sent with `create`.
+    Create {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<ProjectPayload>,
+        #[serde(default)]
+        values: BTreeMap<String, String>,
+    },
 }
 
 /// The project a request is about: its name, its local directory, and the
@@ -66,6 +86,8 @@ pub enum AttachKind {
 pub struct AttachRequest {
     pub project: ProjectPayload,
     /// The session to re-attach, or `None` to let the plugin pick or create one.
+    /// On a shell attach for a project the plugin listed (`projects`), it is
+    /// the session of the tab on screen, so the shell can follow the tab.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     pub kind: AttachKind,
@@ -107,6 +129,12 @@ pub struct Capabilities {
     pub status: bool,
     /// `close` notices are wanted.
     pub close: bool,
+    /// `list_projects` is supported: the plugin lists its own projects, which
+    /// wrk shows as a sidebar group of their own.
+    pub projects: bool,
+    /// `create_form` and `create` are supported: wrk can create projects and
+    /// sessions with a form the plugin describes.
+    pub create: bool,
 }
 
 /// Reply to [`Request::Hello`].
@@ -128,6 +156,22 @@ pub enum SessionState {
     Unknown,
 }
 
+/// What a session's agent is doing, as a listing reports it. wrk shows it on
+/// tabs that have no live pane (a live pane's own status reports win).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentStatus {
+    /// Working on a turn.
+    Busy,
+    /// Blocked on the person (a permission prompt, a question).
+    Waiting,
+    /// Done with its turn, or not running.
+    Idle,
+    /// A status this version of the protocol doesn't know.
+    #[serde(other)]
+    Unknown,
+}
+
 /// One session the plugin offers for a project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginSession {
@@ -136,6 +180,9 @@ pub struct PluginSession {
     pub name: Option<String>,
     #[serde(default)]
     pub state: SessionState,
+    /// The agent's activity, when the plugin knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<AgentStatus>,
 }
 
 /// Reply to [`Request::ListSessions`].
@@ -143,6 +190,135 @@ pub struct PluginSession {
 #[serde(default)]
 pub struct ListResponse {
     pub sessions: Vec<PluginSession>,
+}
+
+/// One project a plugin lists for its sidebar group ([`Request::ListProjects`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RemoteProject {
+    /// Stable across listings: wrk keys the project (and its live panes) by it.
+    pub id: String,
+    /// Shown in the sidebar.
+    pub name: String,
+    /// A word or two shown dimmed beside the name ("stopped", "starting"), or
+    /// nothing for the ordinary state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// Sent back as [`ProjectPayload::config`] on every request about this
+    /// project, so the plugin can tell what it is (a box id, say).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, String>,
+    /// The project's sessions, in the order wrk lists them as tabs. Attaching
+    /// one sends its `id` as the attach's `session_id`.
+    pub sessions: Vec<PluginSession>,
+}
+
+/// Reply to [`Request::ListProjects`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProjectsResponse {
+    /// The sidebar group's heading; `None` ⇒ the plugin's name in settings.toml.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    pub projects: Vec<RemoteProject>,
+}
+
+/// How a [`FormField`] is edited.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FieldKind {
+    /// One of `options`, cycled with ←/→.
+    Select,
+    /// A line of text. (Also what an unknown kind falls back to.)
+    #[default]
+    #[serde(other)]
+    Text,
+}
+
+/// One choice of a select field.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FormOption {
+    /// What `create` receives.
+    pub value: String,
+    /// What the person sees; empty ⇒ `value`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub label: String,
+}
+
+/// Show a field only while another field has one of some values.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShowIf {
+    pub field: String,
+    pub equals: Vec<String>,
+}
+
+/// One input of a [`FormResponse`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FormField {
+    /// The key of this field's value in [`Request::Create`]'s `values`.
+    pub id: String,
+    pub label: String,
+    pub kind: FieldKind,
+    /// wrk refuses to submit while a visible required field is empty.
+    pub required: bool,
+    /// The initial value (for a select, an option's `value`; else its first).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// Shown dimmed in an empty text field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    /// A line of guidance shown while the field has focus.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub help: Option<String>,
+    /// A select's choices.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<FormOption>,
+    /// When set, the field is shown (and sent) only while it holds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub show_if: Option<ShowIf>,
+}
+
+impl FormField {
+    /// Whether the field is shown, given the form's current values.
+    pub fn visible(&self, values: &BTreeMap<String, String>) -> bool {
+        self.show_if.as_ref().is_none_or(|cond| {
+            values
+                .get(&cond.field)
+                .is_some_and(|v| cond.equals.iter().any(|e| e == v))
+        })
+    }
+}
+
+/// Reply to [`Request::CreateForm`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FormResponse {
+    /// The dialog's title.
+    pub title: String,
+    pub fields: Vec<FormField>,
+    /// The submit action's label; `None` ⇒ "Create".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submit: Option<String>,
+}
+
+/// Reply to [`Request::Create`]. wrk lists the plugin's projects again, then
+/// opens `project` (and its tab `session`) once a listing includes them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CreateResponse {
+    /// The listed project's `id` to open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// The session (tab) to show in it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// A line for the status bar ("starting box-3; the session appears once
+    /// it's up").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// Reply to [`Request::Attach`]: the process wrk should spawn in the pane.
@@ -307,6 +483,54 @@ mod tests {
             ..Default::default()
         };
         assert!(!real.is_declined());
+    }
+
+    #[test]
+    fn project_listings_and_forms_round_trip_and_tolerate_the_unknown() {
+        assert_eq!(
+            serde_json::to_string(&Request::ListProjects).unwrap(),
+            r#"{"method":"list_projects"}"#
+        );
+        let create = Request::Create {
+            project: Some(project()),
+            values: BTreeMap::from([("box".to_string(), "new".to_string())]),
+        };
+        let json = serde_json::to_string(&create).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), create);
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"method":"create_form"}"#).unwrap(),
+            Request::CreateForm { project: None }
+        );
+
+        let listing: ProjectsResponse = parse_reply(
+            r#"{"ok":true,"group":"boxes","projects":[{"id":"b1","name":"box-1","state":"stopped",
+                "config":{"box":"b1"},"sessions":[{"id":"p/main","name":"svc-main","status":"thinking"},
+                {"id":"p/x","status":"busy","extra":1}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(listing.group.as_deref(), Some("boxes"));
+        let sessions = &listing.projects[0].sessions;
+        assert_eq!(sessions[0].status, Some(AgentStatus::Unknown));
+        assert_eq!(sessions[1].status, Some(AgentStatus::Busy));
+
+        let form: FormResponse = parse_reply(
+            r#"{"ok":true,"title":"New session","fields":[
+                {"id":"box","label":"Box","kind":"select","options":[{"value":"b1","label":"box-1"},{"value":"new"}]},
+                {"id":"box_name","label":"Name","required":true,"show_if":{"field":"box","equals":["new"]}},
+                {"id":"when","label":"When","kind":"calendar"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(form.fields[0].kind, FieldKind::Select);
+        assert_eq!(
+            form.fields[2].kind,
+            FieldKind::Text,
+            "unknown kinds read as text"
+        );
+        let mut values = BTreeMap::from([("box".to_string(), "b1".to_string())]);
+        assert!(!form.fields[1].visible(&values));
+        values.insert("box".into(), "new".into());
+        assert!(form.fields[1].visible(&values));
+        assert!(form.fields[0].visible(&values));
     }
 
     #[test]

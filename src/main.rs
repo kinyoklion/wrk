@@ -3,6 +3,7 @@ mod keymap;
 mod pane;
 mod plugin;
 mod proc;
+mod remote;
 mod review;
 mod session;
 mod settings;
@@ -38,11 +39,12 @@ use crate::pane::terminal::PtyPane;
 use crate::settings::{HarnessKind, Settings, Theme};
 use crate::store::{LayoutMode, Project, ProjectStore, SessionRef};
 use crate::ui::ModalState;
+use crate::ui::form::PluginFormModal;
 use crate::ui::modal::{
     AddField, AddProjectModal, ClaudeTabPickerModal, ConfirmDeleteModal, ConfirmQuitModal,
     ConfirmUnloadModal, OpenMarkdownModal, UrlPickerModal,
 };
-use crate::ui::projects::RowKey;
+use crate::ui::projects::{RowKey, SidebarGroup};
 
 #[derive(Parser)]
 #[command(
@@ -472,6 +474,7 @@ fn cmd_add(path: &Path, name: Option<String>) -> Result<()> {
         session_names: BTreeMap::new(),
         plugin: None,
         plugin_config: BTreeMap::new(),
+        remote: None,
     })?;
     store::save(&store)?;
     println!("added '{resolved_name}'");
@@ -522,6 +525,10 @@ pub struct ClaudeTab {
     /// while the command is resolved off the UI thread, and stops a second
     /// attach being queued while one is in flight.
     pub plugin_attach: PluginAttach,
+    /// Transient: attach this tab when it is first shown, rather than when its
+    /// project opens. Set on a plugin-listed project's tabs (a box may hold
+    /// many sessions; only those looked at get a pane), cleared once asked.
+    pub attach_when_shown: bool,
 }
 
 /// Progress of a plugin tab's attach (see [`ClaudeTab::plugin_attach`]).
@@ -654,6 +661,9 @@ pub struct ProjectSession {
     pub shell: Option<PtyPane>,
     /// Transient: a plugin shell attach is in flight (plugin projects only).
     pub shell_pending: bool,
+    /// The session the shell was last asked for. A plugin-listed project's
+    /// shell follows the shown tab, so a different shown session re-asks.
+    pub shell_for: Option<String>,
 }
 
 impl ProjectSession {
@@ -747,6 +757,10 @@ pub struct App {
     /// Session plugins: runs attach/list/close jobs off the UI thread and
     /// hands back results, drained each tick by the event loop.
     pub plugins: plugin::PluginHost,
+    /// The registered plugins' names (settings are fixed for the run).
+    pub plugin_names: Vec<String>,
+    /// Projects plugins list themselves, each plugin's a sidebar group.
+    pub remote: remote::Remote,
 }
 
 impl App {
@@ -792,7 +806,10 @@ impl App {
             image_viewer: None,
             review: None,
             plugins,
+            plugin_names: Vec::new(),
+            remote: remote::Remote::default(),
         };
+        app.plugin_names = app.settings.plugin_names();
         app.refresh_sidebar();
         app
     }
@@ -804,7 +821,31 @@ impl App {
     /// follows the session on screen, so jumping to the sidebar lands on it.
     pub fn refresh_sidebar(&mut self) {
         let active = self.active_project_name.as_deref();
-        self.sidebar.rebuild(&self.store, |p| {
+        let mut groups = vec![SidebarGroup {
+            id: SidebarGroup::LOCAL.into(),
+            // The local heading only shows beside plugin groups.
+            label: (!self.remote.groups.is_empty()).then(|| "local".into()),
+            note: None,
+            projects: self.store.projects.iter().collect(),
+        }];
+        for group in &self.remote.groups {
+            let note = if group.error.is_some() {
+                Some("⚠ unavailable".to_string())
+            } else if !group.listed {
+                Some("loading…".to_string())
+            } else if group.projects.is_empty() {
+                Some("none yet: +".to_string())
+            } else {
+                None
+            };
+            groups.push(SidebarGroup {
+                id: group.plugin.clone(),
+                label: Some(group.label.clone()),
+                note,
+                projects: group.projects.iter().collect(),
+            });
+        }
+        self.sidebar.rebuild(&groups, |p| {
             ui::project_view(&self.sessions, p, active == Some(p.name.as_str()))
         });
         if self.focus != Focus::Projects
@@ -831,8 +872,12 @@ impl App {
     }
 
     pub fn active_project(&self) -> Option<&Project> {
-        let name = self.active_project_name.as_ref()?;
-        self.store.projects.iter().find(|p| &p.name == name)
+        self.project(self.active_project_name.as_ref()?)
+    }
+
+    /// The project keyed `name`: one from projects.toml, or one a plugin listed.
+    pub fn project(&self, name: &str) -> Option<&Project> {
+        self.store.find(name).or_else(|| self.remote.find(name))
     }
 
     pub fn active_session(&self) -> Option<&ProjectSession> {
@@ -888,10 +933,22 @@ impl App {
     /// Open the sidebar's selection: its project (spawning whatever isn't
     /// running) and, for a session row, that tab.
     fn open_selected(&mut self, body: Rect) {
-        let Some((idx, tab)) = self.sidebar.selected_target() else {
+        let Some((name, tab)) = self.sidebar.selected_target() else {
+            // A plugin group's heading: what it offers is creating something.
+            if let Some(group) = self.sidebar.selected_group().map(str::to_string)
+                && group != SidebarGroup::LOCAL
+            {
+                self.open_plugin_form(&group, None);
+            }
             return;
         };
-        let Some(project) = self.store.projects.get(idx).cloned() else {
+        self.open_project(&name, tab, body);
+    }
+
+    /// Open project `name` (spawning whatever isn't running) and, when `tab` is
+    /// given, show that tab.
+    fn open_project(&mut self, name: &str, tab: Option<usize>, body: Rect) {
+        let Some(project) = self.project(name).cloned() else {
             return;
         };
         self.active_project_name = Some(project.name.clone());
@@ -914,7 +971,10 @@ impl App {
         // gets a fresh UUID assigned at spawn time and is persisted, so every
         // later open resumes deterministically via `--resume <id>`.
         if session.tabs.is_empty() {
-            if project.claude_sessions.is_empty() {
+            if project.claude_sessions.is_empty() && project.is_remote() {
+                // A listed project shows only the sessions its plugin lists;
+                // an empty one waits for Alt+n.
+            } else if project.claude_sessions.is_empty() {
                 // Empty project: one auto-tab. Not marked `fresh` — a Kimi auto-tab
                 // `--continue`s (resumes the dir's latest session, or starts fresh
                 // if none); Claude still mints a new session at spawn.
@@ -928,6 +988,7 @@ impl App {
                     status: status::TabStatus::default(),
                     pane: None,
                     plugin_attach: PluginAttach::Idle,
+                    attach_when_shown: false,
                 }));
             } else {
                 // Reopening persisted tabs — resume, never restart.
@@ -942,6 +1003,7 @@ impl App {
                         status: status::TabStatus::default(),
                         pane: None,
                         plugin_attach: PluginAttach::Idle,
+                        attach_when_shown: project.is_remote(),
                     }));
                 }
             }
@@ -1015,17 +1077,220 @@ impl App {
             self.persist_claude_sessions(&project.name);
         }
 
-        if let Some(plugin) = &project.plugin {
-            self.request_plugin_panes(&project, plugin);
-        }
-
         if let Some(tab) = tab
             && let Some(session) = self.sessions.get_mut(&project.name)
             && tab < session.tabs.len()
         {
             session.active_tab = tab;
         }
+
+        if project.is_remote() {
+            self.request_shown_remote_pane(&project);
+        } else if let Some(plugin) = &project.plugin {
+            self.request_plugin_panes(&project, plugin);
+        }
         self.focus = Focus::Claude;
+    }
+
+    /// Opening a listed project attaches only the tab on screen (re-attaching
+    /// it after a failure or a detach), and lets the shell be asked again; the
+    /// rest attach when shown ([`App::ensure_remote_panes`]).
+    fn request_shown_remote_pane(&mut self, project: &Project) {
+        let Some(plugin) = project.plugin.clone() else {
+            return;
+        };
+        let payload = plugin::payload(project);
+        let Some(session) = self.sessions.get_mut(&project.name) else {
+            return;
+        };
+        if session.shell.is_none() && !session.shell_pending {
+            session.shell_for = None;
+        }
+        let Some(tab) = session.active_claude_tab_mut() else {
+            return;
+        };
+        if tab.pane.as_mut().is_some_and(|p| p.child_finished()) {
+            tab.pane = None;
+        }
+        if tab.pane.is_none() && tab.plugin_attach != PluginAttach::Pending {
+            tab.plugin_attach = PluginAttach::Pending;
+            tab.attach_when_shown = false;
+            let job = plugin::Job::Attach {
+                project: payload,
+                tab: tab.status_id.clone(),
+                session_id: tab.session_id.clone(),
+                fresh: false,
+                name: tab.name.clone(),
+            };
+            self.plugins.submit(&plugin, job);
+        }
+    }
+
+    /// Each tick, for a listed project on screen: attach the shown tab the
+    /// first time it is shown, and point the shell at the shown tab's session
+    /// (while the shell is visible). Plugin jobs run off the UI thread.
+    fn ensure_remote_panes(&mut self) {
+        let Some(name) = self.active_project_name.as_deref() else {
+            return;
+        };
+        let Some(project) = self.remote.find(name) else {
+            return;
+        };
+        let Some(plugin) = project.plugin.clone() else {
+            return;
+        };
+        let payload = plugin::payload(project);
+        let shell_shown = self.layout_mode == LayoutMode::Split || self.focus == Focus::Shell;
+        let Some(session) = self.sessions.get_mut(name) else {
+            return;
+        };
+        let mut jobs = Vec::new();
+        if let Some(tab) = session.active_claude_tab_mut()
+            && tab.attach_when_shown
+            && tab.pane.is_none()
+            && tab.plugin_attach == PluginAttach::Idle
+        {
+            tab.attach_when_shown = false;
+            tab.plugin_attach = PluginAttach::Pending;
+            jobs.push(plugin::Job::Attach {
+                project: payload.clone(),
+                tab: tab.status_id.clone(),
+                session_id: tab.session_id.clone(),
+                fresh: false,
+                name: tab.name.clone(),
+            });
+        }
+        let want = session
+            .active_claude_tab()
+            .and_then(|t| t.session_id.clone());
+        if shell_shown && want.is_some() && want != session.shell_for && !session.shell_pending {
+            session.shell = None;
+            session.shell_pending = true;
+            session.shell_for = want.clone();
+            jobs.push(plugin::Job::Shell {
+                project: payload,
+                session_id: want,
+            });
+        }
+        for job in jobs {
+            self.plugins.submit(&plugin, job);
+        }
+    }
+
+    /// Ask the plugins whose listing is due for their projects.
+    fn poll_remote(&mut self) {
+        for plugin in self.remote.due(&self.plugin_names, Instant::now()) {
+            self.plugins.submit(&plugin, plugin::Job::ListProjects);
+        }
+    }
+
+    /// Fold in a plugin's listing: its sidebar group, the tabs of its projects
+    /// that are open, and any just-created project waiting to be opened.
+    fn apply_listing(&mut self, plugin: &str, result: Result<Option<plugin::Listing>>, body: Rect) {
+        let error_before = self.remote.group(plugin).and_then(|g| g.error.clone());
+        let vanished = self.remote.apply(
+            plugin,
+            result.map_err(|e| format!("{e:#}")),
+            &remote::home_dir(),
+        );
+        if let Some(error) = self.remote.group(plugin).and_then(|g| g.error.clone())
+            && Some(&error) != error_before.as_ref()
+        {
+            push_error(&mut self.error, format!("plugin '{plugin}': {error}"));
+        }
+        for name in vanished {
+            self.unload_project(&name);
+        }
+        if let Some(group) = self.remote.group(plugin) {
+            for project in &group.projects {
+                if let Some(session) = self.sessions.get_mut(&project.name) {
+                    reconcile_remote_tabs(session, &project.claude_sessions);
+                }
+            }
+        }
+        if let Some((name, tab)) = self.remote.take_ready_open(Instant::now()) {
+            let row = match tab {
+                Some(tab) => RowKey::Session(name.clone(), tab),
+                None => RowKey::Project(name.clone()),
+            };
+            self.refresh_sidebar();
+            self.sidebar.select_key(&row);
+            self.open_project(&name, tab, body);
+        }
+    }
+
+    /// Open plugin `plugin`'s creation form (fetched off the UI thread), from
+    /// listed project `context` when there is one, so it can be preselected.
+    fn open_plugin_form(&mut self, plugin: &str, context: Option<String>) {
+        let Some(group) = self.remote.group(plugin) else {
+            return;
+        };
+        if !group.can_create {
+            self.info = Some(format!("{} can't create projects or sessions", group.label));
+            return;
+        }
+        let payload = context
+            .as_deref()
+            .and_then(|key| self.remote.find(key))
+            .map(plugin::payload);
+        self.modal = Some(ModalState::PluginForm(PluginFormModal::loading(
+            plugin.to_string(),
+            group.label.clone(),
+            context,
+        )));
+        self.plugins
+            .submit(plugin, plugin::Job::CreateForm { project: payload });
+    }
+
+    /// The plugin's form description arrived: fill the open form with it.
+    fn show_plugin_form(&mut self, plugin: &str, result: Result<plugin::FormResponse>) {
+        let Some(ModalState::PluginForm(m)) = self.modal.as_mut() else {
+            return;
+        };
+        if m.plugin != plugin || m.form.is_some() {
+            return;
+        }
+        match result {
+            Ok(form) => m.set_form(form),
+            Err(e) => m.error = Some(format!("couldn't load the form: {e:#}")),
+        }
+    }
+
+    /// A `create` finished: close its form (or say why it failed in it), list
+    /// the plugin's projects again, and open what it made once it's listed.
+    fn finish_plugin_create(&mut self, plugin: &str, result: Result<plugin::CreateResponse>) {
+        let form = match self.modal.as_mut() {
+            Some(ModalState::PluginForm(m)) if m.plugin == plugin && m.submitting => Some(m),
+            _ => None,
+        };
+        match result {
+            Err(e) => match form {
+                Some(m) => {
+                    m.submitting = false;
+                    m.error = Some(format!("{e:#}"));
+                }
+                None => push_error(&mut self.error, format!("plugin '{plugin}': {e:#}")),
+            },
+            Ok(created) => {
+                if form.is_some() {
+                    self.modal = None;
+                }
+                self.info = Some(
+                    created
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "created; it opens once it's listed".into()),
+                );
+                if let Some(project) = created.project {
+                    self.remote.open_when_listed(
+                        remote::key(plugin, &project),
+                        created.session,
+                        Instant::now(),
+                    );
+                }
+                self.remote.refresh_soon(plugin);
+            }
+        }
     }
 
     fn reload_store(&mut self) -> Result<()> {
@@ -1038,11 +1303,13 @@ impl App {
             .iter()
             .map(|p| p.name.as_str())
             .collect();
+        let remote = &self.remote;
         self.sessions
-            .retain(|name, _| known.contains(name.as_str()));
+            .retain(|name, _| known.contains(name.as_str()) || remote.contains(name));
 
         if let Some(name) = &self.active_project_name
             && !known.contains(name.as_str())
+            && !self.remote.contains(name)
         {
             self.active_project_name = None;
             self.sidebar.active = None;
@@ -1142,6 +1409,7 @@ impl App {
             status: status::TabStatus::default(),
             pane,
             plugin_attach: PluginAttach::Idle,
+            attach_when_shown: false,
         }));
         let new_idx = session.tabs.len() - 1;
         session.active_tab = new_idx;
@@ -1178,6 +1446,7 @@ impl App {
             status: status::TabStatus::default(),
             pane: None,
             plugin_attach: PluginAttach::Pending,
+            attach_when_shown: false,
         }));
         session.active_tab = session.tabs.len() - 1;
         self.persist_claude_sessions(&project.name);
@@ -1214,7 +1483,10 @@ impl App {
         }
         if session.shell.is_none() && !session.shell_pending {
             session.shell_pending = true;
-            jobs.push(plugin::Job::Shell { project: payload });
+            jobs.push(plugin::Job::Shell {
+                project: payload,
+                session_id: None,
+            });
         }
         for job in jobs {
             self.plugins.submit(plugin, job);
@@ -1233,13 +1505,21 @@ impl App {
             plugin::PluginEvent::Shell {
                 plugin,
                 project,
+                session_id,
                 result,
-            } => self.finish_plugin_shell(&plugin, &project, result, body),
+            } => self.finish_plugin_shell(&plugin, &project, session_id, result, body),
             plugin::PluginEvent::Sessions {
                 plugin,
                 project,
                 result,
             } => self.show_plugin_sessions(&plugin, &project, result),
+            plugin::PluginEvent::Projects { plugin, result } => {
+                self.apply_listing(&plugin, result, body);
+            }
+            plugin::PluginEvent::Form { plugin, result } => self.show_plugin_form(&plugin, result),
+            plugin::PluginEvent::Created { plugin, result } => {
+                self.finish_plugin_create(&plugin, result);
+            }
         }
     }
 
@@ -1253,7 +1533,7 @@ impl App {
         result: Result<plugin::AttachResponse>,
         body: Rect,
     ) {
-        let Some(project) = self.store.find(project_name).cloned() else {
+        let Some(project) = self.project(project_name).cloned() else {
             return;
         };
         let Some(tab_count) = self.sessions.get(project_name).map(|s| s.tabs.len()) else {
@@ -1315,10 +1595,11 @@ impl App {
         &mut self,
         plugin: &str,
         project_name: &str,
+        session_id: Option<String>,
         result: Result<Option<plugin::AttachResponse>>,
         body: Rect,
     ) {
-        let Some(project) = self.store.find(project_name).cloned() else {
+        let Some(project) = self.project(project_name).cloned() else {
             return;
         };
         let shell_inner = compute_layout(body, self).shell_inner();
@@ -1342,6 +1623,7 @@ impl App {
             return;
         };
         session.shell_pending = false;
+        session.shell_for = session_id;
         session.shell =
             match PtyPane::spawn(&command, &cwd, shell_inner.height, shell_inner.width, &env) {
                 Ok(pane) => Some(pane),
@@ -1483,7 +1765,7 @@ impl App {
                     push_error(&mut self.error, "wrk review: no active project".into());
                     return;
                 };
-                let Some(path) = self.store.find(&project).map(|p| p.path.clone()) else {
+                let Some(path) = self.project(&project).map(|p| p.path.clone()) else {
                     push_error(
                         &mut self.error,
                         format!("wrk review: unknown project '{project}'"),
@@ -1593,9 +1875,19 @@ impl App {
         let Some(project_name) = self.active_project_name.clone() else {
             return;
         };
+        let remote = self.project(&project_name).is_some_and(Project::is_remote);
         let Some(session) = self.sessions.get_mut(&project_name) else {
             return;
         };
+        // A listed project's tab mirrors a session that lives on with its
+        // plugin: closing it only detaches the pane. The tab stays listed.
+        if remote && let Some(Tab::Claude(tab)) = session.current_mut() {
+            tab.pane = None;
+            tab.plugin_attach = PluginAttach::Idle;
+            tab.attach_when_shown = false;
+            self.info = Some(format!("detached '{}'; it keeps running", tab.name));
+            return;
+        }
         let Some(tab) = session.current() else {
             return;
         };
@@ -1623,7 +1915,7 @@ impl App {
         let Some(session_id) = session_id else {
             return;
         };
-        let Some(project) = self.store.find(project_name) else {
+        let Some(project) = self.project(project_name) else {
             return;
         };
         let Some(plugin) = project.plugin.clone() else {
@@ -1753,6 +2045,9 @@ impl App {
                 p.layout_mode = Some(mode);
                 changed = true;
             }
+        } else if let Some(p) = self.remote.find_mut(&name) {
+            // A listed project's choice lasts the run; it is never saved.
+            p.layout_mode = Some(mode);
         }
         if changed && let Err(e) = store::save(&self.store) {
             push_error(&mut self.error, format!("save failed: {e}"));
@@ -1777,11 +2072,69 @@ impl App {
         {
             p.shell_passthrough = to_store;
             changed = true;
+        } else if let Some(p) = self.remote.find_mut(&name) {
+            p.shell_passthrough = to_store;
         }
         if changed && let Err(e) = store::save(&self.store) {
             push_error(&mut self.error, format!("save failed: {e}"));
         }
     }
+}
+
+/// Make a listed project's open tabs match its latest listing: the listed
+/// sessions in listing order — keeping each one's tab (and live pane), with
+/// the listed name — plus new tabs (unattached until shown) for new sessions.
+/// A tab whose session is no longer listed is dropped, unless its pane is
+/// still running or attaching. Markdown tabs follow, as they were. The shown
+/// tab stays shown when it survives.
+fn reconcile_remote_tabs(session: &mut ProjectSession, listed: &[SessionRef]) {
+    fn identity(tab: &Tab) -> String {
+        match tab {
+            Tab::Claude(t) => format!("c:{}", t.status_id),
+            Tab::Markdown(m) => format!("m:{}", m.path.display()),
+        }
+    }
+    let shown = session.current().map(identity);
+    let mut claude = Vec::new();
+    let mut markdown = Vec::new();
+    for tab in std::mem::take(&mut session.tabs) {
+        match tab {
+            Tab::Claude(t) => claude.push(t),
+            Tab::Markdown(m) => markdown.push(m),
+        }
+    }
+    let mut tabs = Vec::new();
+    for sr in listed {
+        let tab = match claude.iter().position(|t| t.session_id == sr.session_id) {
+            Some(i) => {
+                let mut tab = claude.remove(i);
+                tab.name = sr.name.clone();
+                tab
+            }
+            None => ClaudeTab {
+                name: sr.name.clone(),
+                harness: sr.harness,
+                session_id: sr.session_id.clone(),
+                fresh: false,
+                id_reported: false,
+                status_id: new_status_id(),
+                status: status::TabStatus::default(),
+                pane: None,
+                plugin_attach: PluginAttach::Idle,
+                attach_when_shown: true,
+            },
+        };
+        tabs.push(Tab::Claude(tab));
+    }
+    for tab in claude {
+        if tab.pane.is_some() || tab.plugin_attach == PluginAttach::Pending {
+            tabs.push(Tab::Claude(tab));
+        }
+    }
+    tabs.extend(markdown.into_iter().map(Tab::Markdown));
+    let at = shown.and_then(|id| tabs.iter().position(|t| identity(t) == id));
+    session.active_tab = at.unwrap_or(session.active_tab.min(tabs.len().saturating_sub(1)));
+    session.tabs = tabs;
 }
 
 /// The new name for a tab whose session id just changed to `new_id`, or `None`
@@ -2103,6 +2456,8 @@ fn event_loop(
     ipc_rx: Option<Receiver<ipc::Request>>,
 ) -> Result<()> {
     while !app.should_quit {
+        app.poll_remote();
+        app.ensure_remote_panes();
         app.refresh_sidebar();
         terminal.draw(|frame| ui::draw(frame, app))?;
 
@@ -2634,6 +2989,14 @@ fn dispatch_global_action(app: &mut App, action: GlobalAction, body: Rect) -> bo
                 return false;
             }
             let _ = body;
+            // A listed project's new sessions are made with its plugin's form.
+            if let Some((plugin, key)) = app
+                .active_project()
+                .and_then(|p| Some((p.remote.as_ref()?.plugin.clone(), p.name.clone())))
+            {
+                app.open_plugin_form(&plugin, Some(key));
+                return true;
+            }
             // A plugin project's sessions load off the UI thread into the open
             // picker (`show_plugin_sessions`); an internal one's come from disk.
             let plugin_list = app
@@ -2778,6 +3141,12 @@ fn handle_paste(app: &mut App, content: String, body: Rect) {
             }
             ModalState::OpenMarkdown(m) => m.path_input.push_str(&payload),
             ModalState::ClaudeTabPicker(m) if m.name_focused => m.tab_name.push_str(&payload),
+            ModalState::PluginForm(m) => {
+                if let Some(input) = m.input_mut() {
+                    // One line: an Enter in the paste isn't a submit.
+                    input.push_str(payload.trim_end_matches('\r').replace('\r', " ").as_str());
+                }
+            }
             ModalState::UrlPicker(m) => {
                 for c in payload.chars() {
                     m.push_char(c);
@@ -2880,23 +3249,39 @@ fn handle_projects_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
         KeyCode::Enter => {
             app.open_selected(body);
         }
-        KeyCode::Char('+') => {
-            app.modal = Some(ModalState::Add(AddProjectModal::new(
-                app.settings.plugin_names(),
-            )));
-        }
+        KeyCode::Char('+') => match app.sidebar.selected_group().map(str::to_string) {
+            // In a plugin's group: create with its form, from the selected project.
+            Some(group) if group != SidebarGroup::LOCAL => {
+                let context = app.sidebar.selected_project().map(str::to_string);
+                app.open_plugin_form(&group, context);
+            }
+            _ => {
+                app.modal = Some(ModalState::Add(AddProjectModal::new(
+                    app.settings.plugin_names(),
+                )));
+            }
+        },
         KeyCode::Char('d') => {
-            if let Some(idx) = app.sidebar.selected_store_index()
-                && let Some(p) = app.store.projects.get(idx)
+            if let Some(name) = app.sidebar.selected_project()
+                && let Some(p) = app.project(name)
             {
-                app.modal = Some(ModalState::ConfirmDelete(ConfirmDeleteModal {
-                    project_name: p.name.clone(),
-                }));
+                app.modal = match &p.remote {
+                    Some(r) => {
+                        app.info = Some(format!(
+                            "'{}' is listed by plugin '{}'; remove it there",
+                            r.label, r.plugin
+                        ));
+                        None
+                    }
+                    None => Some(ModalState::ConfirmDelete(ConfirmDeleteModal {
+                        project_name: p.name.clone(),
+                    })),
+                };
             }
         }
         KeyCode::Char('u') => {
-            if let Some(idx) = app.sidebar.selected_store_index()
-                && let Some(p) = app.store.projects.get(idx)
+            if let Some(name) = app.sidebar.selected_project()
+                && let Some(p) = app.project(name)
             {
                 let name = p.name.clone();
                 if app.sessions.contains_key(&name) {
@@ -2914,6 +3299,7 @@ fn handle_projects_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
         }
         KeyCode::Char('r') => {
             app.reload_store()?;
+            app.remote.refresh_all();
         }
         _ => {}
     }
@@ -2952,6 +3338,8 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
     // Deferred so the markdown file is opened after `m`'s borrow of `app.modal`
     // ends (opening needs `&mut app`).
     let mut open_md_input: Option<String> = None;
+    // Deferred like `open_md_input`: (plugin, the form's project, values).
+    let mut create: Option<(String, Option<String>, BTreeMap<String, String>)> = None;
     match app.modal.as_mut().unwrap() {
         ModalState::Add(m) => match key.code {
             KeyCode::Esc => {
@@ -3003,6 +3391,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                         session_names: BTreeMap::new(),
                         plugin: provider,
                         plugin_config: BTreeMap::new(),
+                        remote: None,
                     })?;
                     store::save(&store)?;
                     Ok(())
@@ -3094,6 +3483,34 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                 }
             }
         }
+        ModalState::PluginForm(m) => match key.code {
+            // Closing while a create runs leaves it running; its result still
+            // refreshes the listing and opens what it made.
+            KeyCode::Esc => consumed_modal = Some(()),
+            KeyCode::Tab | KeyCode::Down => m.focus_step(1),
+            KeyCode::BackTab | KeyCode::Up => m.focus_step(-1),
+            KeyCode::Left => m.cycle(-1),
+            KeyCode::Right => m.cycle(1),
+            KeyCode::Backspace => {
+                if let Some(input) = m.input_mut() {
+                    input.pop();
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(input) = m.input_mut() {
+                    input.push(c);
+                }
+            }
+            KeyCode::Enter if !m.submitting && m.form.is_some() => match m.submission() {
+                Ok(values) => {
+                    m.submitting = true;
+                    m.error = None;
+                    create = Some((m.plugin.clone(), m.context.clone(), values));
+                }
+                Err(e) => m.error = Some(e),
+            },
+            _ => {}
+        },
         ModalState::UrlPicker(m) => match key.code {
             KeyCode::Esc => consumed_modal = Some(()),
             KeyCode::Up => m.select_prev(),
@@ -3140,6 +3557,14 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
             }
             _ => {}
         }
+    }
+    if let Some((plugin, context, values)) = create {
+        let project = context
+            .as_deref()
+            .and_then(|key| app.remote.find(key))
+            .map(plugin::payload);
+        app.plugins
+            .submit(&plugin, plugin::Job::Create { project, values });
     }
     // Deferred markdown open: succeed → close the modal; fail → keep it open and
     // show the error inline.
@@ -3745,7 +4170,9 @@ mod tests {
         ProjectSession, ProjectStore, Settings, Tab, continue_agent_command, expand_tilde,
         new_agent_command, new_session_id, normalize_paste, resume_agent_command,
     };
+    use crate::plugin;
     use crate::settings::HarnessConfig;
+    use ratatui::layout::Rect;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -3891,6 +4318,7 @@ mod tests {
             status: crate::status::TabStatus::default(),
             pane: None,
             plugin_attach: PluginAttach::Idle,
+            attach_when_shown: false,
         };
         let cmd = super::spawn_command_for_tab(&s, &mut t, &mut assigned);
         assert!(assigned && t.session_id.is_some());
@@ -3908,6 +4336,7 @@ mod tests {
             status: crate::status::TabStatus::default(),
             pane: None,
             plugin_attach: PluginAttach::Idle,
+            attach_when_shown: false,
         };
         assert_eq!(
             super::spawn_command_for_tab(&s, &mut t, &mut assigned),
@@ -3931,6 +4360,7 @@ mod tests {
             status: crate::status::TabStatus::default(),
             pane: None,
             plugin_attach: PluginAttach::Idle,
+            attach_when_shown: false,
         };
         assert_eq!(
             super::spawn_command_for_tab(&s, &mut t, &mut assigned),
@@ -3959,6 +4389,7 @@ mod tests {
             status: crate::status::TabStatus::default(),
             pane: None,
             plugin_attach: PluginAttach::Idle,
+            attach_when_shown: false,
         })
     }
 
@@ -4230,7 +4661,170 @@ mod tests {
             session_names: BTreeMap::new(),
             plugin: None,
             plugin_config: BTreeMap::new(),
+            remote: None,
         }
+    }
+
+    /// `boxes` lists box `dev-box` with sessions `ids`.
+    fn listed(app: &mut App, ids: &[&str]) {
+        use wrk_plugin::proto::{PluginSession, ProjectsResponse, RemoteProject};
+        let sessions = ids
+            .iter()
+            .map(|id| PluginSession {
+                id: id.to_string(),
+                name: Some(id.replace('/', "-")),
+                state: Default::default(),
+                status: None,
+            })
+            .collect();
+        let listing = plugin::Listing {
+            projects: ProjectsResponse {
+                group: Some("boxes".into()),
+                projects: vec![RemoteProject {
+                    id: "i-1".into(),
+                    name: "dev-box".into(),
+                    sessions,
+                    ..Default::default()
+                }],
+            },
+            can_create: true,
+        };
+        app.apply_listing("boxes", Ok(Some(listing)), Rect::new(0, 0, 120, 40));
+    }
+
+    fn tab_names(app: &App, project: &str) -> Vec<String> {
+        app.sessions[project]
+            .tabs
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_plugin_listing_shows_as_its_own_sidebar_group() {
+        use crate::ui::projects::{RowKey, SidebarRow};
+        let mut app = empty_app();
+        app.store.projects.push(bare_project("wrk", &[]));
+        app.refresh_sidebar();
+        assert_eq!(
+            app.sidebar
+                .rows
+                .iter()
+                .map(SidebarRow::key)
+                .collect::<Vec<_>>(),
+            vec![RowKey::Project("wrk".into())],
+            "no headings without plugin groups"
+        );
+        listed(&mut app, &["web/main", "web/fix"]);
+        app.refresh_sidebar();
+        assert_eq!(
+            app.sidebar
+                .rows
+                .iter()
+                .map(SidebarRow::key)
+                .collect::<Vec<_>>(),
+            vec![
+                RowKey::Group("".into()),
+                RowKey::Project("wrk".into()),
+                RowKey::Group("boxes".into()),
+                RowKey::Project("boxes/i-1".into()),
+                RowKey::Session("boxes/i-1".into(), 0),
+                RowKey::Session("boxes/i-1".into(), 1),
+            ]
+        );
+        assert_eq!(app.sidebar.rows[3].label, "dev-box");
+        // Never in projects.toml's store.
+        assert!(app.store.find("boxes/i-1").is_none());
+        assert_eq!(app.project("boxes/i-1").unwrap().display_name(), "dev-box");
+    }
+
+    #[test]
+    fn opening_a_listed_project_mirrors_its_sessions_and_attaches_only_the_shown_one() {
+        let mut app = empty_app();
+        listed(&mut app, &["web/main", "web/fix", "api/main"]);
+        app.open_project("boxes/i-1", Some(1), Rect::new(0, 0, 120, 40));
+        assert_eq!(
+            tab_names(&app, "boxes/i-1"),
+            ["web-main", "web-fix", "api-main"]
+        );
+        let session = &app.sessions["boxes/i-1"];
+        assert_eq!(session.active_tab, 1);
+        let states: Vec<(PluginAttach, bool)> = session
+            .claude_tabs()
+            .map(|t| (t.plugin_attach.clone(), t.attach_when_shown))
+            .collect();
+        assert_eq!(
+            states,
+            [
+                (PluginAttach::Idle, true),
+                (PluginAttach::Pending, false),
+                (PluginAttach::Idle, true)
+            ]
+        );
+    }
+
+    #[test]
+    fn relisting_reconciles_open_tabs_and_keeps_the_shown_one() {
+        let mut app = empty_app();
+        listed(&mut app, &["web/main", "web/fix"]);
+        app.open_project("boxes/i-1", Some(1), Rect::new(0, 0, 120, 40));
+        let shown = app.sessions["boxes/i-1"]
+            .active_claude_tab()
+            .unwrap()
+            .status_id
+            .clone();
+        // A session was made before `fix`, and `main` went away.
+        listed(&mut app, &["web/new", "web/fix"]);
+        assert_eq!(tab_names(&app, "boxes/i-1"), ["web-new", "web-fix"]);
+        let session = &app.sessions["boxes/i-1"];
+        assert_eq!(session.active_tab, 1);
+        assert_eq!(
+            session.active_claude_tab().unwrap().status_id,
+            shown,
+            "same tab"
+        );
+        // The box itself goes: its session goes with it.
+        app.apply_listing(
+            "boxes",
+            Ok(Some(plugin::Listing {
+                projects: Default::default(),
+                can_create: true,
+            })),
+            Rect::new(0, 0, 120, 40),
+        );
+        assert!(!app.sessions.contains_key("boxes/i-1"));
+        assert_eq!(app.active_project_name, None);
+    }
+
+    #[test]
+    fn closing_a_listed_tab_only_detaches_it() {
+        let mut app = empty_app();
+        listed(&mut app, &["web/main", "web/fix"]);
+        app.open_project("boxes/i-1", Some(0), Rect::new(0, 0, 120, 40));
+        app.close_active_tab();
+        assert_eq!(tab_names(&app, "boxes/i-1"), ["web-main", "web-fix"]);
+        let tab = app.sessions["boxes/i-1"].active_claude_tab().unwrap();
+        assert!(tab.pane.is_none() && !tab.attach_when_shown);
+        assert_eq!(tab.plugin_attach, PluginAttach::Idle);
+    }
+
+    #[test]
+    fn a_create_opens_what_it_made_once_listed() {
+        let mut app = empty_app();
+        listed(&mut app, &["web/main"]);
+        app.finish_plugin_create(
+            "boxes",
+            Ok(plugin::CreateResponse {
+                project: Some("i-1".into()),
+                session: Some("api/main".into()),
+                message: Some("creating api".into()),
+            }),
+        );
+        assert_eq!(app.info.as_deref(), Some("creating api"));
+        assert!(!app.sessions.contains_key("boxes/i-1"), "not listed yet");
+        listed(&mut app, &["web/main", "api/main"]);
+        assert_eq!(app.active_project_name.as_deref(), Some("boxes/i-1"));
+        assert_eq!(app.sessions["boxes/i-1"].active_tab, 1);
     }
 
     #[test]
@@ -4261,7 +4855,7 @@ mod tests {
         assert_eq!(md.kind, SessionKind::Markdown);
         assert!(!app.sidebar.rows[5].loaded);
         // Outside the sidebar the cursor tracks the shown tab…
-        assert_eq!(app.sidebar.selected_target(), Some((0, Some(2))));
+        assert_eq!(app.sidebar.selected_target(), Some(("p".into(), Some(2))));
 
         // …but while navigating the sidebar it stays where the user put it.
         app.focus = Focus::Projects;
@@ -4298,6 +4892,7 @@ mod tests {
             session_names: BTreeMap::new(),
             plugin: None,
             plugin_config: BTreeMap::new(),
+            remote: None,
         });
         app.active_project_name = Some(name.clone());
         let session = ProjectSession {

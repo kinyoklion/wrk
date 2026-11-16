@@ -113,6 +113,8 @@ capabilities you advertise in `hello`.
 | `shell` | asks you for the shell pane (`attach` with `kind: "shell"`) | runs a local `$SHELL` in the project directory |
 | `status` | adds `wrk_sock` / `wrk_tab` to agent `attach`es, so you can push status | status comes from the agent's own hooks or an idle-time heuristic |
 | `close` | sends `close` when a tab hosting one of your sessions is closed | sends nothing |
+| `projects` | sends `list_projects` and shows your projects as a sidebar group of their own | only projects in `projects.toml` name your plugin |
+| `create` | offers a creation form in your group (`create_form`, then `create`) | your group offers no way to create |
 
 wrk asks **once per daemon**: it caches the answer until the socket stops
 answering (a restarted daemon is asked again). **A `hello` reply wrk can't parse
@@ -209,6 +211,79 @@ Whether closing a tab should end the session is your decision. wrk's own
 behaviour for local tabs is to stop the process but keep the session
 resumable.
 
+### `list_projects` — projects you list yourself (`projects` capability)
+
+Some plugins know their own projects (remote boxes, say) rather than being
+pointed at them from `projects.toml`. With `projects`, wrk shows them as a
+sidebar group of their own beneath the local projects, headed with your
+`group` (default: your `[plugin.<name>]` name), and keeps it current: it asks
+at startup (launching your daemon, which is how it learns you list projects),
+every 20 s, after a `create`, and when the person presses `r`.
+
+```json
+{"method":"list_projects"}
+```
+```json
+{"ok":true,"group":"boxes","projects":[{"id":"i-0abc","name":"dev-box","state":"stopped","config":{"box":"i-0abc"},"sessions":[{"id":"p1/main","name":"web-main","status":"busy"},{"id":"p1/fix","name":"web-fix"}]}]}
+```
+
+| field | meaning |
+|---|---|
+| `id` | Stable across listings; wrk keys the project (and its live panes) by it. |
+| `name` | Shown in the sidebar. |
+| `state` | Optional, a word or two shown dimmed beside the name (`stopped`). Leave it out for the ordinary state. |
+| `config` | Sent back as `project.config` on every request about this project, so you can tell what it is. |
+| `sessions` | Its tabs, in order. `status` (`busy` / `waiting` / `idle`) is shown on tabs without a live pane. |
+
+A listed project is **never written to `projects.toml`**: wrk shows what the
+latest listing says. Its tabs mirror `sessions`: a new session becomes a tab,
+and a session that's no longer listed loses its tab (unless its pane is still
+running). Only the tab on screen is attached, the first time it is shown, so a
+project with many sessions costs one pane until the person looks at more. The
+`attach` for a listed session sends its `id` as `session_id` and its project's
+`path` is the home directory (panes run locally). Closing such a tab
+(`Alt+w`) only detaches it, so wrk sends no `close`. A failed listing keeps
+the last good one and shows `⚠ unavailable` on the group, with your error in
+the status bar.
+
+**The shell follows the tab.** For a listed project, a shell `attach` carries
+the `session_id` of the tab on screen, and wrk asks again when the person
+shows a different one, so you can return that session's own shell.
+
+### `create_form` and `create` — making projects (`create` capability)
+
+`+` in your group (or `Enter` on its heading, or `Alt+n` in one of your
+projects) asks you for a form, which wrk renders generically:
+
+```json
+{"method":"create_form","project":{"name":"boxes/i-0abc","path":"/home/me","config":{"box":"i-0abc"}}}
+```
+```json
+{"ok":true,"title":"New session","submit":"Create","fields":[
+  {"id":"box","label":"Box","kind":"select","default":"i-0abc","options":[{"value":"i-0abc","label":"dev-box"},{"value":"new","label":"New box…"}]},
+  {"id":"box_name","label":"Box name","required":true,"show_if":{"field":"box","equals":["new"]}},
+  {"id":"name","label":"Name","required":true,"placeholder":"my-project","help":"letters, digits, - and _"}]}
+```
+
+`project` is the listed project the person was in, if any, so you can
+preselect it. A field is a `text` line (the default `kind`, and what an
+unknown kind falls back to) or a `select` cycled with ←/→. `show_if` shows a
+field only while another holds one of the given values. wrk refuses to submit
+while a visible `required` field is empty, then sends the visible fields:
+
+```json
+{"method":"create","project":{"name":"boxes/i-0abc","path":"/home/me","config":{"box":"i-0abc"}},"values":{"box":"i-0abc","name":"web"}}
+```
+```json
+{"ok":true,"project":"i-0abc","session":"p9/main","message":"creating web on dev-box"}
+```
+
+An error reply is shown in the form, which stays open to be fixed. On success
+wrk shows `message`, lists your projects again, and opens `project` (on tab
+`session`) once a listing includes it — within ten minutes, so a `create` may
+return before what it makes exists (a box that is still launching, say). Keep
+`create` within `request_timeout`, as any request.
+
 ## How wrk drives a plugin
 
 | the user… | wrk sends |
@@ -219,6 +294,9 @@ resumable.
 | closes a tab (`Alt+w`) | `close` (with `close`) |
 | lets a pane's process exit | nothing. The tab shows "not running", and the next project open re-attaches it. |
 | restarts wrk | on project open, an `attach` per saved tab with its recorded `session_id`, a **new** `wrk_tab`, and a **new** `wrk_sock` |
+| starts wrk, waits 20 s, presses `r` (with `projects`) | `list_projects` |
+| opens one of your listed projects, or shows another of its tabs | an agent `attach` for the tab on screen only, and a shell `attach` with that tab's `session_id` while the shell is visible |
+| presses `+` in your group, or `Alt+n` in your project (with `create`) | `create_form`, then `create` with the values |
 
 Before every request except `close`, wrk probes the socket. If nothing is
 listening and `command` is set, it **launches** the daemon:
@@ -323,8 +401,11 @@ fn handle(request: Request) -> Result<String> {
             sessions: list(&project)?,
         }),
         Request::Attach(request) => proto::ok_reply(&attach(request)?),
-        // Not advertised, so wrk never sends it, but answer anyway.
+        // Not advertised, so wrk never sends these, but answer anyway.
         Request::Close { .. } => proto::ok_reply(&serde_json::json!({})),
+        Request::ListProjects | Request::CreateForm { .. } | Request::Create { .. } => {
+            Ok(proto::error_reply("not supported"))
+        }
     }
 }
 
@@ -387,6 +468,7 @@ fn list(project: &ProjectPayload) -> Result<Vec<PluginSession>> {
             id: name.to_string(),
             name: None,
             state: SessionState::Running,
+            status: None,
         })
         .collect())
 }
