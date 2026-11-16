@@ -481,15 +481,30 @@ daemon's stdout/stderr are kept in `$XDG_RUNTIME_DIR/wrk/plugin/<name>.log`. wrk
 launches a plugin it finds down, **relaunches one that dies** on the next action
 that needs it, and never stops a daemon on exit (it may be a shared service).
 
+**Plugins that list their own projects.** A plugin with the `projects`
+capability gets a group of its own in the sidebar, beneath a `local` heading
+for the projects in `projects.toml`. Its projects (remote boxes, say) and their
+sessions come from its listing (`list_projects`, asked at startup, every 20 s,
+and on `r`), not from `projects.toml`, and are never written there. Opening one
+attaches only the tab on screen (others attach when you show them), and its
+shell follows the shown tab. `Alt+w` on such a tab only detaches it: the session
+keeps running wherever the plugin keeps it. With `create`, `+` in the group (or
+`Enter` on its heading, or `Alt+n` in one of its projects) opens a form the
+plugin describes (text and select fields, some shown only for certain choices),
+and what it creates opens once a listing includes it.
+
 **Protocol.** wrk is the client; the plugin listens on the socket. Each request
 is one line of JSON in, one line out, then the connection closes. Methods:
 
 | method          | request fields                                                                  | reply |
 |-----------------|---------------------------------------------------------------------------------|-------|
-| `hello`         | —                                                                               | `{name, version, capabilities:{list,shell,status,close}}` |
+| `hello`         | —                                                                               | `{name, version, capabilities:{list,shell,status,close,projects,create}}` |
 | `list_sessions` | `project`                                                                       | `{sessions:[{id, name?, state?}]}` (needs `list` cap) |
 | `attach`        | `project, session_id?, kind:"agent"\|"shell", fresh, name, wrk_sock?, wrk_tab?` | `{command:[…], env?:{…}, cwd?, session_id?}` |
 | `close`         | `project, session_id`                                                           | ignored (needs `close` cap, best-effort) |
+| `list_projects` | —                                                                               | `{group?, projects:[{id, name, state?, config?, sessions:[{id, name?, status?}]}]}` (needs `projects` cap) |
+| `create_form`   | `project?`                                                                      | `{title, fields:[{id, label, kind:"text"\|"select", options?, default?, required?, show_if?}], submit?}` (needs `create` cap) |
+| `create`        | `project?, values:{field id: value}`                                            | `{project?, session?, message?}` (needs `create` cap) |
 
 `project` is `{name, path, config}` (config = the project's `plugin_config`).
 Replies carry `"ok": true`; reply `{"ok": false, "error": "…"}` to report a

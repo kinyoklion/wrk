@@ -1,16 +1,24 @@
 //! The projects sidebar: a tree of projects, each with its sessions nested
 //! (indented) beneath it, plus a fuzzy filter over project and session names.
+//! Projects come in groups: the local ones from `projects.toml`, then one
+//! group per session plugin that lists its own (`src/remote.rs`), each under
+//! a heading row. The local group's heading only shows once a plugin group
+//! exists, so a plugin-free sidebar looks as it always has.
 //!
 //! ```text
+//! local
 //! wrk *
 //!   ● main
 //!   · handle issues
 //!   ▤ README.md
 //! notes
 //!     ideas            (not loaded: no indicator, dimmed)
+//! boxes
+//! dev-box
+//!   ● web-main
 //! ```
 //!
-//! Rows are rebuilt from the store and the live sessions every frame
+//! Rows are rebuilt from the groups and the live sessions every frame
 //! ([`ProjectSidebar::rebuild`]); the selection is tracked by [`RowKey`] so it
 //! stays on the same project/session while rows come and go around it.
 
@@ -27,7 +35,23 @@ use ratatui::widgets::{
 };
 
 use super::{cell_width, truncate_to_width};
-use crate::store::{Project, ProjectStore};
+use crate::store::Project;
+
+/// One section of the sidebar: the local projects, or one plugin's.
+pub struct SidebarGroup<'a> {
+    /// `""` for the local group, else the plugin's name.
+    pub id: String,
+    /// The heading row's text; `None` draws no heading.
+    pub label: Option<String>,
+    /// Shown dimmed after the heading ("loading…", why a listing failed).
+    pub note: Option<String>,
+    pub projects: Vec<&'a Project>,
+}
+
+impl SidebarGroup<'_> {
+    /// The id of the local group.
+    pub const LOCAL: &'static str = "";
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectStatus {
@@ -75,17 +99,27 @@ pub struct ProjectView {
 /// Identity of a sidebar row that survives rebuilds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowKey {
-    /// A project header row.
+    /// A group's heading row, by group id.
+    Group(String),
+    /// A project header row, by project key (`Project.name`).
     Project(String),
-    /// A session row: project name + tab index.
+    /// A session row: project key + tab index.
     Session(String, usize),
 }
 
 #[derive(Debug, Clone)]
 pub struct SidebarRow {
-    /// Store index of the row's project.
-    pub project: usize,
+    /// The id of the row's group ([`SidebarGroup::id`]).
+    pub group: String,
+    /// The row's project key (`Project.name`); empty on a group heading.
     pub project_name: String,
+    /// What a heading or project row shows: the group's heading or the
+    /// project's display name.
+    pub label: String,
+    /// Shown dimmed after the label: a group's note, a listed project's state.
+    pub note: Option<String>,
+    /// A group heading rather than a project or session.
+    pub heading: bool,
     /// The project has a live session in memory.
     pub loaded: bool,
     /// `Some((tab index, session))` for a session row; `None` for the header.
@@ -97,6 +131,9 @@ pub struct SidebarRow {
 
 impl SidebarRow {
     pub fn key(&self) -> RowKey {
+        if self.heading {
+            return RowKey::Group(self.group.clone());
+        }
         match &self.session {
             None => RowKey::Project(self.project_name.clone()),
             Some((tab, _)) => RowKey::Session(self.project_name.clone(), *tab),
@@ -135,12 +172,12 @@ impl Default for ProjectSidebar {
 }
 
 impl ProjectSidebar {
-    /// Rebuild the rows from `store`, asking `view_for` what each project lists.
-    /// Keeps the selection on the same row (by [`RowKey`]) where it still
-    /// exists — falling back to its project's header, then the nearest index —
-    /// except when the filter query just changed, which selects the first row
-    /// that actually matched.
-    pub fn rebuild<F>(&mut self, store: &ProjectStore, view_for: F)
+    /// Rebuild the rows from `groups`, asking `view_for` what each project
+    /// lists. Keeps the selection on the same row (by [`RowKey`]) where it
+    /// still exists — falling back to its project's header, then the nearest
+    /// index — except when the filter query just changed, which selects the
+    /// first row that actually matched.
+    pub fn rebuild<F>(&mut self, groups: &[SidebarGroup<'_>], view_for: F)
     where
         F: Fn(&Project) -> ProjectView,
     {
@@ -148,7 +185,7 @@ impl ProjectSidebar {
         let old_idx = self.state.selected();
         let query = self.filter.clone().unwrap_or_default();
         let query_changed = query != self.built_query;
-        self.rows = build_rows(store, &view_for, &query);
+        self.rows = build_rows(groups, &view_for, &query);
         self.built_query = query;
 
         if self.rows.is_empty() {
@@ -161,7 +198,7 @@ impl ProjectSidebar {
             old_key.and_then(|key| {
                 self.index_of(&key).or_else(|| match key {
                     RowKey::Session(project, _) => self.index_of(&RowKey::Project(project)),
-                    RowKey::Project(_) => None,
+                    RowKey::Project(_) | RowKey::Group(_) => None,
                 })
             })
         };
@@ -188,16 +225,27 @@ impl ProjectSidebar {
         self.state.selected().and_then(|i| self.rows.get(i))
     }
 
-    /// Store index of the selected row's project (header or session row).
-    pub fn selected_store_index(&self) -> Option<usize> {
-        self.selected_row().map(|r| r.project)
+    /// The selected row's project key (header or session row; not a heading).
+    pub fn selected_project(&self) -> Option<&str> {
+        self.selected_row()
+            .filter(|r| !r.heading)
+            .map(|r| r.project_name.as_str())
     }
 
-    /// What opening the selection opens: the project's store index, plus the tab
-    /// to show when a session row is selected.
-    pub fn selected_target(&self) -> Option<(usize, Option<usize>)> {
-        self.selected_row()
-            .map(|r| (r.project, r.session.as_ref().map(|(tab, _)| *tab)))
+    /// The group of the selected row, whatever its kind.
+    pub fn selected_group(&self) -> Option<&str> {
+        self.selected_row().map(|r| r.group.as_str())
+    }
+
+    /// What opening the selection opens: the project's key, plus the tab to
+    /// show when a session row is selected. `None` on a group heading.
+    pub fn selected_target(&self) -> Option<(String, Option<usize>)> {
+        self.selected_row().filter(|r| !r.heading).map(|r| {
+            (
+                r.project_name.clone(),
+                r.session.as_ref().map(|(tab, _)| *tab),
+            )
+        })
     }
 
     pub fn select_next(&mut self) {
@@ -314,6 +362,28 @@ impl ProjectSidebar {
         width: usize,
         theme: &crate::settings::Theme,
     ) -> Line<'static> {
+        if row.heading {
+            // A group heading: its name, set apart in the accent color.
+            let note = row
+                .note
+                .as_deref()
+                .map(|n| format!(" {n}"))
+                .unwrap_or_default();
+            let name = truncate_to_width(&row.label, width);
+            let room = width.saturating_sub(cell_width(&name));
+            return Line::from(vec![
+                Span::styled(
+                    name,
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                ),
+                Span::styled(
+                    truncate_to_width(&note, room),
+                    Style::default().fg(theme.hint),
+                ),
+            ]);
+        }
         let Some((_, session)) = &row.session else {
             // Project header. `*` marks a project with a live session: accent on
             // the active (shown) project, dim on ones loaded in the background.
@@ -330,8 +400,21 @@ impl ProjectSidebar {
                 // Listed only as context for matching sessions.
                 style = style.fg(theme.hint);
             }
-            let name = truncate_to_width(&row.project_name, width.saturating_sub(marker.width()));
-            return Line::from(vec![Span::styled(name, style), marker]);
+            let note = row
+                .note
+                .as_deref()
+                .map(|n| format!(" {n}"))
+                .unwrap_or_default();
+            let name = truncate_to_width(&row.label, width.saturating_sub(marker.width()));
+            let room = width.saturating_sub(cell_width(&name) + marker.width());
+            return Line::from(vec![
+                Span::styled(name, style),
+                Span::styled(
+                    truncate_to_width(&note, room),
+                    Style::default().fg(theme.hint),
+                ),
+                marker,
+            ]);
         };
 
         let (glyph, color) = match session.kind {
@@ -364,8 +447,38 @@ impl ProjectSidebar {
 /// its name or any of its sessions match; under it go the matching sessions.
 /// A session is matched against `"<project> <session>"`, so a query naming the
 /// project lists all its sessions and `"wrk issues"` narrows to one. Filtered
-/// projects are ordered by their best match; sessions keep their tab order.
-fn build_rows<F>(store: &ProjectStore, view_for: &F, query: &str) -> Vec<SidebarRow>
+/// projects are ordered by their best match within their group (groups keep
+/// their order); sessions keep their tab order. A heading is listed while its
+/// group has rows to show, and always when unfiltered.
+fn build_rows<F>(groups: &[SidebarGroup<'_>], view_for: &F, query: &str) -> Vec<SidebarRow>
+where
+    F: Fn(&Project) -> ProjectView,
+{
+    let mut rows = Vec::new();
+    for group in groups {
+        let projects = group_rows(group, view_for, query);
+        if let Some(label) = &group.label
+            && (query.is_empty() || !projects.is_empty())
+        {
+            rows.push(SidebarRow {
+                group: group.id.clone(),
+                project_name: String::new(),
+                label: label.clone(),
+                note: group.note.clone(),
+                heading: true,
+                loaded: false,
+                session: None,
+                // Context while filtering, never a match of its own.
+                matched: query.is_empty(),
+            });
+        }
+        rows.extend(projects);
+    }
+    rows
+}
+
+/// One group's project and session rows for `query`.
+fn group_rows<F>(group: &SidebarGroup<'_>, view_for: &F, query: &str) -> Vec<SidebarRow>
 where
     F: Fn(&Project) -> ProjectView,
 {
@@ -381,13 +494,14 @@ where
     };
 
     let mut groups: Vec<(u32, Vec<SidebarRow>)> = Vec::new();
-    for (idx, project) in store.projects.iter().enumerate() {
+    for project in &group.projects {
         let view = view_for(project);
-        let header_score = score(&project.name);
+        let label = project.display_name();
+        let header_score = score(label);
         let mut best = header_score;
         let mut sessions = Vec::new();
         for (tab, info) in view.sessions.into_iter().enumerate() {
-            if let Some(s) = score(&format!("{} {}", project.name, info.name)) {
+            if let Some(s) = score(&format!("{label} {}", info.name)) {
                 best = best.max(Some(s));
                 sessions.push((tab, info));
             }
@@ -395,9 +509,13 @@ where
         let Some(best) = best else {
             continue;
         };
+        let note = project.remote.as_ref().and_then(|r| r.state.clone());
         let row = |session: Option<(usize, SessionInfo)>, matched: bool| SidebarRow {
-            project: idx,
+            group: group.id.clone(),
             project_name: project.name.clone(),
+            label: label.to_string(),
+            note: note.clone(),
+            heading: false,
             loaded: view.loaded,
             session,
             matched,
@@ -452,12 +570,35 @@ mod tests {
             session_names: BTreeMap::new(),
             plugin: None,
             plugin_config: BTreeMap::new(),
+            remote: None,
         }
     }
 
-    fn store(names: &[&str]) -> ProjectStore {
-        ProjectStore {
-            projects: names.iter().map(|n| project(n)).collect(),
+    /// The local group alone, as wrk builds it when no plugin lists projects.
+    fn local(projects: &[Project]) -> Vec<SidebarGroup<'_>> {
+        vec![SidebarGroup {
+            id: SidebarGroup::LOCAL.into(),
+            label: None,
+            note: None,
+            projects: projects.iter().collect(),
+        }]
+    }
+
+    fn store(names: &[&str]) -> Vec<Project> {
+        names.iter().map(|n| project(n)).collect()
+    }
+
+    fn remote(plugin: &str, id: &str, label: &str, state: Option<&str>) -> Project {
+        Project {
+            name: format!("{plugin}/{id}"),
+            remote: Some(crate::store::RemoteMeta {
+                plugin: plugin.into(),
+                id: id.into(),
+                label: label.into(),
+                state: state.map(str::to_string),
+                sessions: vec![],
+            }),
+            ..project(label)
         }
     }
 
@@ -504,7 +645,7 @@ mod tests {
     #[test]
     fn unfiltered_nests_sessions_under_their_project() {
         let mut sb = ProjectSidebar::default();
-        sb.rebuild(&store(&["wrk", "notes", "empty"]), view);
+        sb.rebuild(&local(&store(&["wrk", "notes", "empty"])), view);
         assert_eq!(
             keys(&sb),
             vec![
@@ -524,31 +665,31 @@ mod tests {
     #[test]
     fn filter_on_a_session_lists_its_project_as_context_and_selects_the_session() {
         let mut sb = filtered("issues");
-        sb.rebuild(&store(&["wrk", "notes"]), view);
+        sb.rebuild(&local(&store(&["wrk", "notes"])), view);
         assert_eq!(keys(&sb), vec![header("wrk"), session("wrk", 1)]);
         assert!(!sb.rows[0].matched, "header is context only");
-        assert_eq!(sb.selected_target(), Some((0, Some(1))));
+        assert_eq!(sb.selected_target(), Some(("wrk".into(), Some(1))));
     }
 
     #[test]
     fn filter_on_a_project_lists_all_its_sessions() {
         let mut sb = filtered("notes");
-        sb.rebuild(&store(&["wrk", "notes"]), view);
+        sb.rebuild(&local(&store(&["wrk", "notes"])), view);
         assert_eq!(keys(&sb), vec![header("notes"), session("notes", 0)]);
-        assert_eq!(sb.selected_target(), Some((1, None)));
+        assert_eq!(sb.selected_target(), Some(("notes".into(), None)));
     }
 
     #[test]
     fn project_and_session_terms_narrow_together() {
         let mut sb = filtered("wrk cool");
-        sb.rebuild(&store(&["wrk", "notes"]), view);
+        sb.rebuild(&local(&store(&["wrk", "notes"])), view);
         assert_eq!(keys(&sb), vec![header("wrk"), session("wrk", 2)]);
     }
 
     #[test]
     fn no_match_lists_nothing() {
         let mut sb = filtered("zzzz");
-        sb.rebuild(&store(&["wrk", "notes"]), view);
+        sb.rebuild(&local(&store(&["wrk", "notes"])), view);
         assert!(sb.rows.is_empty());
         assert_eq!(sb.state.selected(), None);
         assert_eq!(sb.selected_target(), None);
@@ -558,6 +699,7 @@ mod tests {
     fn selection_follows_its_row_when_rows_shift() {
         let mut sb = ProjectSidebar::default();
         let s = store(&["notes", "wrk"]);
+        let s = local(&s);
         sb.rebuild(&s, view);
         assert!(sb.select_key(&session("wrk", 1)));
         // `notes` gains a session above the selection.
@@ -578,6 +720,7 @@ mod tests {
     fn a_vanished_session_falls_back_to_its_project() {
         let mut sb = ProjectSidebar::default();
         let s = store(&["wrk", "notes"]);
+        let s = local(&s);
         sb.rebuild(&s, view);
         assert!(sb.select_key(&session("wrk", 2)));
         sb.rebuild(&s, |p| {
@@ -592,6 +735,7 @@ mod tests {
     fn clearing_the_filter_keeps_the_selected_row() {
         let mut sb = ProjectSidebar::default();
         let s = store(&["wrk", "notes"]);
+        let s = local(&s);
         sb.filter = Some("cool".into());
         sb.rebuild(&s, view);
         assert_eq!(
@@ -609,14 +753,14 @@ mod tests {
     #[test]
     fn row_at_accounts_for_border_and_filter_line() {
         let mut sb = ProjectSidebar::default();
-        sb.rebuild(&store(&["wrk", "notes"]), view);
+        sb.rebuild(&local(&store(&["wrk", "notes"])), view);
         let area = Rect::new(0, 0, 24, 20);
         assert_eq!(sb.row_at(area, 0), None, "top border");
         assert_eq!(sb.row_at(area, 1), Some(0));
         assert_eq!(sb.row_at(area, 3), Some(2));
         assert_eq!(sb.row_at(area, 7), None, "past the last row");
         sb.filter = Some(String::new());
-        sb.rebuild(&store(&["wrk", "notes"]), view);
+        sb.rebuild(&local(&store(&["wrk", "notes"])), view);
         assert_eq!(sb.row_at(area, 1), None, "filter input line");
         assert_eq!(sb.row_at(area, 2), Some(0));
     }
@@ -636,7 +780,7 @@ mod tests {
     #[test]
     fn renders_sessions_inset_with_indicators() {
         let mut sb = ProjectSidebar::default();
-        sb.rebuild(&store(&["wrk"]), |p| {
+        sb.rebuild(&local(&store(&["wrk"])), |p| {
             let mut v = view(p);
             v.sessions[1].kind = SessionKind::Agent(ProjectStatus::Busy);
             v.sessions[2].kind = SessionKind::Markdown;
@@ -652,7 +796,7 @@ mod tests {
     #[test]
     fn long_session_names_truncate_with_an_ellipsis() {
         let mut sb = ProjectSidebar::default();
-        sb.rebuild(&store(&["wrk"]), |_| ProjectView {
+        sb.rebuild(&local(&store(&["wrk"])), |_| ProjectView {
             loaded: false,
             sessions: vec![agent("implement my cool new feature")],
         });
@@ -661,9 +805,90 @@ mod tests {
     }
 
     #[test]
+    fn plugin_groups_get_headings_and_the_local_group_one_too() {
+        let locals = store(&["wrk"]);
+        let boxes = [
+            remote("boxes", "i-1", "dev-box", None),
+            remote("boxes", "i-2", "scratch", Some("stopped")),
+        ];
+        let groups = vec![
+            SidebarGroup {
+                id: SidebarGroup::LOCAL.into(),
+                label: Some("local".into()),
+                note: None,
+                projects: locals.iter().collect(),
+            },
+            SidebarGroup {
+                id: "boxes".into(),
+                label: Some("boxes".into()),
+                note: None,
+                projects: boxes.iter().collect(),
+            },
+        ];
+        let mut sb = ProjectSidebar::default();
+        sb.rebuild(&groups, |p| match p.display_name() {
+            "dev-box" => ProjectView {
+                loaded: false,
+                sessions: vec![agent("web-main"), agent("web-fix")],
+            },
+            _ => view(p),
+        });
+        assert_eq!(
+            keys(&sb),
+            vec![
+                RowKey::Group("".into()),
+                header("wrk"),
+                session("wrk", 0),
+                session("wrk", 1),
+                session("wrk", 2),
+                RowKey::Group("boxes".into()),
+                header("boxes/i-1"),
+                session("boxes/i-1", 0),
+                session("boxes/i-1", 1),
+                header("boxes/i-2"),
+            ]
+        );
+        // A heading opens nothing; a listed project opens by its key.
+        assert_eq!(sb.selected_target(), None);
+        assert_eq!(sb.selected_group(), Some(""));
+        assert!(sb.select_key(&session("boxes/i-1", 1)));
+        assert_eq!(sb.selected_target(), Some(("boxes/i-1".into(), Some(1))));
+        assert_eq!(sb.selected_project(), Some("boxes/i-1"));
+        assert_eq!(sb.selected_group(), Some("boxes"));
+
+        let lines = rendered(&mut sb, Rect::new(0, 0, 24, 12));
+        assert_eq!(lines[6], "│boxes                 │");
+        assert_eq!(lines[7], "│dev-box               │");
+        assert_eq!(lines[8], "│  ● web-main          │");
+        assert_eq!(lines[10], "│scratch stopped *     │");
+
+        // Filtering keeps groups apart and lists a heading only above matches.
+        let mut sb = filtered("fix");
+        sb.rebuild(&groups, |p| match p.display_name() {
+            "dev-box" => ProjectView {
+                loaded: false,
+                sessions: vec![agent("web-main"), agent("web-fix")],
+            },
+            _ => ProjectView::default(),
+        });
+        assert_eq!(
+            keys(&sb),
+            vec![
+                RowKey::Group("boxes".into()),
+                header("boxes/i-1"),
+                session("boxes/i-1", 1)
+            ]
+        );
+        assert_eq!(
+            sb.selected_row().map(SidebarRow::key),
+            Some(session("boxes/i-1", 1))
+        );
+    }
+
+    #[test]
     fn filter_line_shows_the_query_tail_and_places_the_cursor() {
         let mut sb = filtered("handle");
-        sb.rebuild(&store(&["wrk"]), view);
+        sb.rebuild(&local(&store(&["wrk"])), view);
         let area = Rect::new(0, 0, 24, 6);
         let mut buf = Buffer::empty(area);
         let cursor = sb.render(area, &mut buf, &crate::settings::Theme::default());

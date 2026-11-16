@@ -82,6 +82,26 @@ pub struct Project {
     /// for internal projects.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub plugin_config: BTreeMap<String, String>,
+    /// Set only on a project a plugin *listed* (a sidebar group of its own, see
+    /// `src/remote.rs`), never on one from projects.toml. Such a project lives
+    /// in memory, is rebuilt from each listing, and is never written to disk.
+    #[serde(skip)]
+    pub remote: Option<RemoteMeta>,
+}
+
+/// Where a plugin-listed project came from, and how the sidebar shows it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteMeta {
+    /// The plugin that listed it (its `[plugin.<name>]`).
+    pub plugin: String,
+    /// The plugin's id for it (`Project.name` is the unique key built from it).
+    pub id: String,
+    /// The name the plugin gave it, shown in the sidebar.
+    pub label: String,
+    /// A dimmed word beside the label ("stopped").
+    pub state: Option<String>,
+    /// The sessions as last listed, for the status of tabs without a live pane.
+    pub sessions: Vec<wrk_plugin::proto::PluginSession>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -95,6 +115,18 @@ impl Project {
     /// (no plugin). The common case; the inverse of "plugin-backed".
     pub fn is_internal(&self) -> bool {
         self.plugin.is_none()
+    }
+
+    /// A project a plugin listed, not one from projects.toml.
+    pub fn is_remote(&self) -> bool {
+        self.remote.is_some()
+    }
+
+    /// What the sidebar and status bar call it.
+    pub fn display_name(&self) -> &str {
+        self.remote
+            .as_ref()
+            .map_or(&self.name, |r| r.label.as_str())
     }
 
     /// Record the name of every live tab's session in `session_names`. A live
@@ -170,6 +202,21 @@ pub fn save_to(store: &ProjectStore, path: &Path) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating config dir {}", parent.display()))?;
     }
+    // A plugin-listed project is never saved, even if one strayed into the store.
+    let saved;
+    let store = if store.projects.iter().any(Project::is_remote) {
+        saved = ProjectStore {
+            projects: store
+                .projects
+                .iter()
+                .filter(|p| !p.is_remote())
+                .cloned()
+                .collect(),
+        };
+        &saved
+    } else {
+        store
+    };
     let text = toml::to_string_pretty(store).context("serializing project store")?;
     fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
@@ -207,6 +254,7 @@ mod tests {
                 session_names: BTreeMap::new(),
                 plugin: None,
                 plugin_config: BTreeMap::new(),
+                remote: None,
             })
             .unwrap();
         store
@@ -220,6 +268,7 @@ mod tests {
                 session_names: BTreeMap::new(),
                 plugin: None,
                 plugin_config: BTreeMap::new(),
+                remote: None,
             })
             .unwrap();
         save_to(&store, &path).unwrap();
@@ -240,6 +289,7 @@ mod tests {
             session_names: BTreeMap::new(),
             plugin: None,
             plugin_config: BTreeMap::new(),
+            remote: None,
         };
         store.add(p.clone()).unwrap();
         assert!(store.add(p).is_err());
@@ -275,6 +325,7 @@ mod tests {
                 session_names: BTreeMap::new(),
                 plugin: None,
                 plugin_config: BTreeMap::new(),
+                remote: None,
             })
             .unwrap();
         save_to(&store, &path).unwrap();
@@ -316,6 +367,7 @@ mod tests {
                 ]),
                 plugin: None,
                 plugin_config: BTreeMap::new(),
+                remote: None,
             })
             .unwrap();
         save_to(&store, &path).unwrap();
