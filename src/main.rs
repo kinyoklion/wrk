@@ -3172,11 +3172,18 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
         return;
     }
 
-    // The fullscreen review overlay captures the mouse (wheel scrolls the diff).
+    // The fullscreen review overlay captures the mouse: clicks select files /
+    // diff rows (hit-tested against the last render), the wheel scrolls
+    // whichever pane the pointer is over.
     if let Some(review) = app.review.as_mut() {
         match m.kind {
-            MouseEventKind::ScrollDown => review.move_cursor(3),
-            MouseEventKind::ScrollUp => review.move_cursor(-3),
+            MouseEventKind::Down(MouseButton::Left) => review.click(m.column, m.row),
+            MouseEventKind::ScrollDown => review.wheel(m.column, m.row, true),
+            MouseEventKind::ScrollUp => review.wheel(m.column, m.row, false),
+            // Horizontal wheel (or Shift+wheel in most terminals) pans long
+            // lines, like `<`/`>`.
+            MouseEventKind::ScrollLeft => review.scroll_h(-8),
+            MouseEventKind::ScrollRight => review.scroll_h(8),
             _ => {}
         }
         return;

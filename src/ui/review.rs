@@ -10,7 +10,9 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::App;
 use crate::review::diff::{DiffCell, FileStatus, RowKind};
-use crate::review::{FileState, ReviewFocus, ReviewSession, Side, VisualLine};
+use crate::review::{
+    DiffRowHit, FileState, ReviewFocus, ReviewHitMap, ReviewSession, Side, VisualLine,
+};
 use crate::settings::Theme;
 use crate::ui::{cell_width, truncate_to_width};
 
@@ -24,6 +26,8 @@ pub fn draw_review(frame: &mut Frame, app: &mut App, area: Rect) {
     let Some(review) = app.review.as_mut() else {
         return;
     };
+    // Re-recorded below by whatever this frame actually draws.
+    review.hits = ReviewHitMap::default();
 
     // The comment editor sits above the hint while typing, growing (up to a cap)
     // to keep the wrapped text and caret visible.
@@ -136,7 +140,7 @@ fn status_color(status: &FileStatus, theme: &Theme) -> Color {
     }
 }
 
-fn draw_file_list(frame: &mut Frame, area: Rect, review: &ReviewSession, theme: &Theme) {
+fn draw_file_list(frame: &mut Frame, area: Rect, review: &mut ReviewSession, theme: &Theme) {
     let focused = review.focus == ReviewFocus::Files;
     let block = Block::default()
         .title(" files ")
@@ -144,6 +148,8 @@ fn draw_file_list(frame: &mut Frame, area: Rect, review: &ReviewSession, theme: 
         .border_style(border(focused, theme));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    review.hits.files_pane = area;
+    review.hits.files_inner = inner;
 
     if review.files.is_empty() {
         frame.render_widget(
@@ -157,8 +163,17 @@ fn draw_file_list(frame: &mut Frame, area: Rect, review: &ReviewSession, theme: 
     }
 
     let h = inner.height as usize;
-    // Scroll the list to keep the selection visible.
-    let top = review.selected.saturating_sub(h.saturating_sub(1));
+    // Scroll the list only as far as needed to keep the selection visible, so a
+    // click on a row that's already in view doesn't shift the list under it.
+    if review.selected < review.file_scroll {
+        review.file_scroll = review.selected;
+    } else if h > 0 && review.selected >= review.file_scroll + h {
+        review.file_scroll = review.selected + 1 - h;
+    }
+    review.file_scroll = review
+        .file_scroll
+        .min(review.files.len().saturating_sub(h.max(1)));
+    let top = review.file_scroll;
     let lines: Vec<Line> = review
         .files
         .iter()
@@ -223,6 +238,7 @@ fn draw_diff(frame: &mut Frame, area: Rect, review: &mut ReviewSession, theme: &
         .border_style(border(focused, theme));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    review.hits.diff_pane = area;
 
     let (added, removed, binary) = match review.current() {
         Some(fs) => (fs.file.added, fs.file.removed, fs.file.binary),
@@ -261,7 +277,7 @@ fn draw_diff(frame: &mut Frame, area: Rect, review: &mut ReviewSession, theme: &
     let w = body.width as usize;
     let side = w.saturating_sub(1 + cell_width(SEP)) / 2;
     let text_w = side.saturating_sub(NUM_W + 1);
-    let (lines, cur_item) = build_diff_lines(review, focused, text_w, w, theme);
+    let (lines, mut row_hits, cur_item) = build_diff_lines(review, focused, text_w, w, theme);
 
     // Scroll (in display-line space, which includes interleaved comments) to keep
     // the cursor's row visible.
@@ -280,29 +296,41 @@ fn draw_diff(frame: &mut Frame, area: Rect, review: &mut ReviewSession, theme: &
     };
     let visible: Vec<Line> = lines.into_iter().skip(scroll).take(h).collect();
     frame.render_widget(Paragraph::new(visible), body);
+
+    // Record what each drawn row shows, and where the before/after `│` sits:
+    // past the marker column, the left cell (`cell_spans` is always gutter +
+    // `text_w` wide), and the separator's leading space.
+    row_hits.drain(..scroll.min(row_hits.len()));
+    row_hits.truncate(h);
+    review.hits.diff_body = body;
+    review.hits.diff_rows = row_hits;
+    let left_cell_w = NUM_W + 1 + text_w;
+    review.hits.side_split = body.x.saturating_add((1 + left_cell_w + 1) as u16);
 }
 
 /// Build the full display list for the current file: one line per visual row/gap
-/// plus a line for each attached comment. Returns the lines and the display
-/// index of the cursor's row (so the caller can keep it scrolled into view).
+/// plus a line for each attached comment. Returns the lines, a parallel list of
+/// what each line shows (for mouse hit-testing), and the display index of the
+/// cursor's row (so the caller can keep it scrolled into view).
 fn build_diff_lines(
     review: &ReviewSession,
     focused: bool,
     text_w: usize,
     width: usize,
     theme: &Theme,
-) -> (Vec<Line<'static>>, usize) {
+) -> (Vec<Line<'static>>, Vec<DiffRowHit>, usize) {
     let Some(fs) = review.current() else {
-        return (vec![], 0);
+        return (vec![], vec![], 0);
     };
     let vlines = fs.visual_lines();
     if vlines.is_empty() {
-        return (vec![], 0);
+        return (vec![], vec![], 0);
     }
     let cursor = fs.cursor.min(vlines.len() - 1);
     let active_side = focused.then_some(review.side);
 
     let mut lines = Vec::new();
+    let mut hits = Vec::new();
     let mut cur_item = 0;
     for (idx, vl) in vlines.iter().enumerate() {
         if idx == cursor {
@@ -316,22 +344,25 @@ fn build_diff_lines(
             text_w,
             theme,
         ));
+        hits.push(DiffRowHit::Line(idx));
         // Interleave any comments attached to this row's before/after lines.
         if let VisualLine::Row(r) = vl {
             let row = &fs.file.rows[*r];
-            if let Some(c) = row.left.as_ref()
-                && let Some(body) = review.comment_for(review.selected, Side::Before, c.line)
-            {
-                lines.extend(comment_lines(Side::Before, body, width, theme));
-            }
-            if let Some(c) = row.right.as_ref()
-                && let Some(body) = review.comment_for(review.selected, Side::After, c.line)
-            {
-                lines.extend(comment_lines(Side::After, body, width, theme));
+            for (side, cell) in [(Side::Before, &row.left), (Side::After, &row.right)] {
+                if let Some(c) = cell.as_ref()
+                    && let Some(body) = review.comment_for(review.selected, side, c.line)
+                {
+                    let comment = comment_lines(side, body, width, theme);
+                    hits.extend(std::iter::repeat_n(
+                        DiffRowHit::Comment { line: idx, side },
+                        comment.len(),
+                    ));
+                    lines.extend(comment);
+                }
             }
         }
     }
-    (lines, cur_item)
+    (lines, hits, cur_item)
 }
 
 fn render_line(
@@ -547,11 +578,12 @@ fn hint_line(review: &ReviewSession, theme: &Theme) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::review::diff::{DiffTarget, build_review_file};
+    use crate::review::diff::{DiffTarget, ReviewFile, build_review_file};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    fn app_with_review() -> App {
+    /// 61 lines with one replaced line in the middle (collapsed gaps either side).
+    fn long_file() -> ReviewFile {
         let mut before = String::new();
         for i in 0..30 {
             before.push_str(&format!("context line {i}\n"));
@@ -561,15 +593,22 @@ mod tests {
             before.push_str(&format!("tail line {i}\n"));
         }
         let after = before.replace("old middle", "new middle");
-        let file = build_review_file("src/thing.rs".into(), FileStatus::Modified, &before, &after);
+        build_review_file("src/thing.rs".into(), FileStatus::Modified, &before, &after)
+    }
+
+    fn app_with(files: Vec<ReviewFile>) -> App {
         let mut app = App::new(Default::default(), Default::default());
         app.review = Some(ReviewSession::new(
             "proj".into(),
             Some("tab0".into()),
             DiffTarget::WorkingVsHead,
-            vec![file],
+            files,
         ));
         app
+    }
+
+    fn app_with_review() -> App {
+        app_with(vec![long_file()])
     }
 
     fn buffer_text(term: &Terminal<TestBackend>) -> String {
@@ -708,6 +747,241 @@ mod tests {
             buffer_text(&term).contains("DONE"),
             "horizontal scroll should bring the tail into view"
         );
+    }
+
+    /// Buffer cell where `needle` first starts, scanning rows top to bottom.
+    fn find(term: &Terminal<TestBackend>, needle: &str) -> (u16, u16) {
+        let buf = term.backend().buffer();
+        for y in 0..buf.area.height {
+            let row: Vec<&str> = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            for x in 0..row.len() {
+                if row[x..].concat().starts_with(needle) {
+                    return (x as u16, y);
+                }
+            }
+        }
+        panic!("{needle:?} not on screen:\n{}", buffer_text(term));
+    }
+
+    /// A review of `n` small one-line-change files named `file00.rs`, ….
+    fn app_with_files(n: usize) -> App {
+        app_with(
+            (0..n)
+                .map(|i| {
+                    build_review_file(
+                        format!("file{i:02}.rs"),
+                        FileStatus::Modified,
+                        "a\nb\nc\nd\ne\nf\n",
+                        "a\nb\nC\nd\ne\nf\n",
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// The text of buffer row `y` within columns `[x0, x1)`.
+    fn row_text(term: &Terminal<TestBackend>, y: u16, x0: u16, x1: u16) -> String {
+        let buf = term.backend().buffer();
+        (x0..x1).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    fn draw(term: &mut Terminal<TestBackend>, app: &mut App) {
+        term.draw(|f| draw_review(f, app, f.area())).unwrap();
+    }
+
+    /// Visual-line index of the first row of `kind` in the current file.
+    fn first_row_of(review: &ReviewSession, kind: RowKind) -> usize {
+        let fs = review.current().unwrap();
+        fs.visual_lines()
+            .iter()
+            .position(|l| matches!(l, VisualLine::Row(r) if fs.file.rows[*r].kind == kind))
+            .unwrap()
+    }
+
+    #[test]
+    fn clicking_a_file_selects_and_focuses_it_then_the_diff_takes_focus_back() {
+        let mut app = app_with_files(3);
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        draw(&mut term, &mut app);
+        assert_eq!(app.review.as_ref().unwrap().focus, ReviewFocus::Diff);
+
+        let (x, y) = find(&term, "file02.rs");
+        app.review.as_mut().unwrap().click(x, y);
+        let review = app.review.as_ref().unwrap();
+        assert_eq!(review.selected, 2);
+        assert_eq!(review.focus, ReviewFocus::Files);
+
+        // A click anywhere in the diff pane (here its border) refocuses it.
+        draw(&mut term, &mut app);
+        let pane = app.review.as_ref().unwrap().hits.diff_pane;
+        app.review.as_mut().unwrap().click(pane.x, pane.y);
+        let review = app.review.as_ref().unwrap();
+        assert_eq!(review.focus, ReviewFocus::Diff);
+        assert_eq!(review.selected, 2, "a diff click doesn't change the file");
+    }
+
+    #[test]
+    fn clicking_a_diff_row_moves_the_cursor_and_picks_the_side_by_column() {
+        let mut app = app_with_review();
+        app.review.as_mut().unwrap().set_all_revealed(true);
+        let target = first_row_of(app.review.as_ref().unwrap(), RowKind::Replace);
+        let mut term = Terminal::new(TestBackend::new(100, 70)).unwrap();
+        draw(&mut term, &mut app);
+
+        let (x, y) = find(&term, "old middle");
+        // The recorded split is exactly the drawn before/after separator.
+        let split = app.review.as_ref().unwrap().hits.side_split;
+        assert_eq!(term.backend().buffer()[(split, y)].symbol(), "│");
+        app.review.as_mut().unwrap().click(x, y);
+        let review = app.review.as_ref().unwrap();
+        assert_eq!(review.current().unwrap().cursor, target);
+        assert_eq!(review.side, Side::Before);
+
+        draw(&mut term, &mut app);
+        let (x, y) = find(&term, "new middle");
+        app.review.as_mut().unwrap().click(x, y);
+        let review = app.review.as_ref().unwrap();
+        assert_eq!(review.current().unwrap().cursor, target);
+        assert_eq!(review.side, Side::After);
+
+        // Clicking the line number in the left gutter also counts as "before".
+        draw(&mut term, &mut app);
+        let (_, y) = find(&term, "context line 0");
+        let body = app.review.as_ref().unwrap().hits.diff_body;
+        app.review.as_mut().unwrap().click(body.x + 1, y);
+        let review = app.review.as_ref().unwrap();
+        assert_eq!(review.current().unwrap().cursor, 0);
+        assert_eq!(review.side, Side::Before);
+    }
+
+    #[test]
+    fn clicking_a_collapsed_gap_reveals_it() {
+        let mut app = app_with_review();
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        draw(&mut term, &mut app);
+        let collapsed = app
+            .review
+            .as_ref()
+            .unwrap()
+            .current()
+            .unwrap()
+            .visual_lines()
+            .len();
+
+        let (x, y) = find(&term, "unchanged line");
+        app.review.as_mut().unwrap().click(x, y);
+        let fs = app.review.as_ref().unwrap().current().unwrap();
+        assert!(
+            fs.visual_lines().len() > collapsed,
+            "the gap should be revealed"
+        );
+        assert!(
+            matches!(fs.visual_lines()[fs.cursor], VisualLine::Row(_)),
+            "the cursor lands on the first revealed row, as with Enter"
+        );
+    }
+
+    #[test]
+    fn clicking_an_inline_comment_selects_its_row_and_side() {
+        let mut app = app_with_review();
+        let target;
+        {
+            let review = app.review.as_mut().unwrap();
+            review.set_all_revealed(true);
+            target = first_row_of(review, RowKind::Replace);
+            review.current_mut().unwrap().cursor = target;
+            review.set_side(Side::Before);
+            review.begin_comment();
+            for ch in "check this".chars() {
+                review.editor_push_char(ch);
+            }
+            assert!(review.save_comment());
+            // Move away and flip the side so the click has something to restore.
+            review.current_mut().unwrap().cursor = 0;
+            review.set_side(Side::After);
+        }
+        let mut term = Terminal::new(TestBackend::new(100, 70)).unwrap();
+        draw(&mut term, &mut app);
+
+        // The comment spans the full width; click its right half to show the
+        // comment's own side wins over the column.
+        let (_, y) = find(&term, "check this");
+        let body = app.review.as_ref().unwrap().hits.diff_body;
+        app.review
+            .as_mut()
+            .unwrap()
+            .click(body.x + body.width - 2, y);
+        let review = app.review.as_ref().unwrap();
+        assert_eq!(review.current().unwrap().cursor, target);
+        assert_eq!(review.side, Side::Before);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_whatever_the_pointer_is_over() {
+        // A second file so the list has somewhere to go.
+        let extra = build_review_file("z.rs".into(), FileStatus::Added, "", "new\n");
+        let mut app = app_with(vec![long_file(), extra]);
+        app.review.as_mut().unwrap().set_all_revealed(true);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        draw(&mut term, &mut app);
+
+        // Over the diff: the cursor moves; the file and focus don't change.
+        let body = app.review.as_ref().unwrap().hits.diff_body;
+        app.review.as_mut().unwrap().wheel(body.x + 5, body.y, true);
+        let review = app.review.as_ref().unwrap();
+        assert_eq!(review.current().unwrap().cursor, 3);
+        assert_eq!((review.selected, review.focus), (0, ReviewFocus::Diff));
+
+        // Over the file list: the selection steps, focus still stays put.
+        let files = app.review.as_ref().unwrap().hits.files_inner;
+        app.review.as_mut().unwrap().wheel(files.x, files.y, true);
+        let review = app.review.as_ref().unwrap();
+        assert_eq!((review.selected, review.focus), (1, ReviewFocus::Diff));
+        app.review.as_mut().unwrap().wheel(files.x, files.y, false);
+        assert_eq!(app.review.as_ref().unwrap().selected, 0);
+
+        // Over neither (the hint row): the focused pane — the diff — scrolls.
+        draw(&mut term, &mut app);
+        app.review.as_mut().unwrap().wheel(50, 29, true);
+        assert_eq!(app.review.as_ref().unwrap().current().unwrap().cursor, 6);
+    }
+
+    #[test]
+    fn clicking_a_visible_file_does_not_shift_the_list() {
+        let mut app = app_with_files(30);
+        app.review.as_mut().unwrap().selected = 29;
+        let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        draw(&mut term, &mut app);
+        let scroll = app.review.as_ref().unwrap().file_scroll;
+        assert!(scroll > 0, "the list is scrolled to show the last file");
+
+        // Click the top visible row: it's selected, and the list stays put.
+        let files = app.review.as_ref().unwrap().hits.files_inner;
+        app.review.as_mut().unwrap().click(files.x + 2, files.y);
+        assert_eq!(app.review.as_ref().unwrap().selected, scroll);
+        draw(&mut term, &mut app);
+        assert_eq!(app.review.as_ref().unwrap().file_scroll, scroll);
+        let top_row = row_text(&term, files.y, files.x, files.x + files.width);
+        assert!(
+            top_row.contains(&format!("file{scroll:02}.rs")),
+            "the clicked file is still on the top row: {top_row:?}"
+        );
+    }
+
+    #[test]
+    fn clicks_are_ignored_while_a_comment_is_being_typed() {
+        let mut app = app_with_files(2);
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        app.review.as_mut().unwrap().begin_comment();
+        assert!(app.review.as_ref().unwrap().editing.is_some());
+        draw(&mut term, &mut app);
+
+        let (x, y) = find(&term, "file01.rs");
+        app.review.as_mut().unwrap().click(x, y);
+        app.review.as_mut().unwrap().wheel(x, y, true);
+        let review = app.review.as_ref().unwrap();
+        assert_eq!(review.selected, 0, "the draft's file stays selected");
+        assert_eq!(review.focus, ReviewFocus::Diff);
     }
 
     #[test]
