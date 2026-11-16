@@ -552,7 +552,11 @@ name), and opens a **full-screen review**:
 
 Navigate with `Tab` / arrows / `j`/`k`; press `c` on any line to **comment** on
 the before or after side (`h`/`l` picks the side), `D` to delete a comment, `q`
-to close. When you're done, run `/end-local-review` — your comments are handed
+to close. The mouse works too: click a file to select it, click a diff line to
+move there (the half you click picks the before/after side), click a
+`⋯ N unchanged lines ⋯` separator to reveal it, and the wheel scrolls whichever
+pane is under the pointer (Shift+wheel pans long lines). When you're done, run
+`/end-local-review` — your comments are handed
 back to the Claude session that opened the review (file, line, side, and the
 quoted line) for it to act on.
 

@@ -8,6 +8,7 @@ pub mod diff;
 use std::path::PathBuf;
 
 use diff::{DiffCell, DiffTarget, ReviewFile, Segment};
+use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
 
 /// Which pane of the review overlay has the keyboard.
@@ -143,6 +144,49 @@ impl FileState {
     }
 }
 
+/// What one drawn row of the diff body shows, for click hit-testing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffRowHit {
+    /// A visual line (diff row or collapsed gap), by index into
+    /// [`FileState::visual_lines`].
+    Line(usize),
+    /// An inline comment drawn under visual line `line`, on `side`.
+    Comment { line: usize, side: Side },
+}
+
+/// Screen geometry captured by the last render of the overlay, so mouse events
+/// can be mapped back to files and diff lines (the same record-at-render pattern
+/// as `MarkdownViewState::image_at`). Coordinates are absolute buffer cells;
+/// written by `crate::ui::review`, empty until the first draw.
+#[derive(Debug, Clone, Default)]
+pub struct ReviewHitMap {
+    /// The file-list pane, border included.
+    pub files_pane: Rect,
+    /// The file-list rows (inside the border).
+    pub files_inner: Rect,
+    /// The diff pane, border and `+N −M` header included.
+    pub diff_pane: Rect,
+    /// The diff rows; `diff_rows[i]` is what's drawn on row `diff_body.y + i`.
+    pub diff_body: Rect,
+    pub diff_rows: Vec<DiffRowHit>,
+    /// Column of the `│` between the before (left) and after (right) sides.
+    pub side_split: u16,
+}
+
+/// What a mouse position is over, per [`ReviewHitMap`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewHit {
+    /// The file list; `Some(i)` on the row showing file `i`.
+    Files(Option<usize>),
+    /// The diff pane; `Some(_)` on a drawn row, with the side under the pointer
+    /// (`None` on the separator itself).
+    Diff(Option<(DiffRowHit, Option<Side>)>),
+}
+
+fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
+    x >= r.x && x < r.x.saturating_add(r.width) && y >= r.y && y < r.y.saturating_add(r.height)
+}
+
 /// One active code review (one per wrk instance), bound to the Claude tab that
 /// started it for later reporting.
 pub struct ReviewSession {
@@ -153,13 +197,21 @@ pub struct ReviewSession {
     pub target: DiffTarget,
     pub files: Vec<FileState>,
     pub selected: usize,
+    /// Index of the file drawn on the list's top row (updated by the renderer
+    /// to keep the selection in view with minimal movement).
+    pub file_scroll: usize,
     pub focus: ReviewFocus,
     /// Which side new comments attach to when the cursor row has both.
     pub side: Side,
     pub comments: Vec<Comment>,
     /// The comment currently being typed, if any.
     pub editing: Option<CommentDraft>,
+    /// Geometry of the last render, for mouse hit-testing.
+    pub hits: ReviewHitMap,
 }
+
+/// Diff lines the cursor moves per mouse-wheel notch.
+const WHEEL_LINES: isize = 3;
 
 impl ReviewSession {
     pub fn new(
@@ -181,10 +233,103 @@ impl ReviewSession {
             target,
             files: files.into_iter().map(FileState::new).collect(),
             selected: 0,
+            file_scroll: 0,
             focus,
             side: Side::After,
             comments: Vec::new(),
             editing: None,
+            hits: ReviewHitMap::default(),
+        }
+    }
+
+    /// What buffer cell `(x, y)` is over, per the last render.
+    pub fn hit_test(&self, x: u16, y: u16) -> Option<ReviewHit> {
+        let h = &self.hits;
+        if rect_contains(h.files_pane, x, y) {
+            let file = rect_contains(h.files_inner, x, y)
+                .then(|| self.file_scroll + (y - h.files_inner.y) as usize)
+                .filter(|&i| i < self.files.len());
+            return Some(ReviewHit::Files(file));
+        }
+        if rect_contains(h.diff_pane, x, y) {
+            let row = rect_contains(h.diff_body, x, y)
+                .then(|| h.diff_rows.get((y - h.diff_body.y) as usize).copied())
+                .flatten()
+                .map(|row| {
+                    let side = match x.cmp(&h.side_split) {
+                        std::cmp::Ordering::Less => Some(Side::Before),
+                        std::cmp::Ordering::Greater => Some(Side::After),
+                        std::cmp::Ordering::Equal => None,
+                    };
+                    (row, side)
+                });
+            return Some(ReviewHit::Diff(row));
+        }
+        None
+    }
+
+    /// Left click at buffer cell `(x, y)`. Clicking a pane focuses it; a file
+    /// row selects that file; a diff row moves the cursor there and picks the
+    /// comment side by column (an inline comment picks its own side, so `c`/`D`
+    /// then act on it); a collapsed-gap separator is revealed, as `Enter` would.
+    /// Ignored while the comment editor is open — the keyboard owns it.
+    pub fn click(&mut self, x: u16, y: u16) {
+        if self.editing.is_some() {
+            return;
+        }
+        match self.hit_test(x, y) {
+            Some(ReviewHit::Files(file)) => {
+                self.focus = ReviewFocus::Files;
+                if let Some(i) = file {
+                    self.selected = i;
+                }
+            }
+            Some(ReviewHit::Diff(row)) => {
+                self.focus = ReviewFocus::Diff;
+                let Some((row, col_side)) = row else {
+                    return;
+                };
+                let (line, side) = match row {
+                    DiffRowHit::Line(line) => (line, col_side),
+                    DiffRowHit::Comment { line, side } => (line, Some(side)),
+                };
+                let Some(fs) = self.current_mut() else {
+                    return;
+                };
+                let Some(&vl) = fs.visual_lines().get(line) else {
+                    return;
+                };
+                fs.cursor = line;
+                match vl {
+                    VisualLine::Gap { .. } => self.reveal_at_cursor(),
+                    VisualLine::Row(_) => {
+                        if let Some(side) = side {
+                            self.side = side;
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// One mouse-wheel notch at buffer cell `(x, y)` (`down` = toward the end).
+    /// Scrolls whatever the pointer is over — over the file list it steps the
+    /// file selection, over the diff it moves the cursor — and the focused pane
+    /// when it's over neither (the hint row or comment editor). Doesn't change
+    /// focus. While a comment is being typed only the diff scrolls, so the file
+    /// it's anchored to stays on screen.
+    pub fn wheel(&mut self, x: u16, y: u16, down: bool) {
+        let over_files = match self.hit_test(x, y) {
+            Some(ReviewHit::Files(_)) => true,
+            Some(ReviewHit::Diff(_)) => false,
+            None => self.focus == ReviewFocus::Files,
+        };
+        let dir = if down { 1 } else { -1 };
+        if !over_files {
+            self.move_cursor(dir * WHEEL_LINES);
+        } else if self.editing.is_none() {
+            self.select_file(dir);
         }
     }
 
