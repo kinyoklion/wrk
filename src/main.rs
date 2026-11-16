@@ -42,6 +42,7 @@ use crate::ui::modal::{
     AddField, AddProjectModal, ClaudeTabPickerModal, ConfirmDeleteModal, ConfirmQuitModal,
     ConfirmUnloadModal, OpenMarkdownModal, UrlPickerModal,
 };
+use crate::ui::projects::RowKey;
 
 #[derive(Parser)]
 #[command(
@@ -750,8 +751,7 @@ pub struct App {
 
 impl App {
     fn new(store: ProjectStore, settings: Settings) -> Self {
-        let mut sidebar = ui::projects::ProjectSidebar::default();
-        sidebar.refresh(&store);
+        let sidebar = ui::projects::ProjectSidebar::default();
         let theme = settings.theme.resolve();
         let md_theme = settings.markdown.resolve();
         let heading_images = settings.markdown.heading_images.unwrap_or(true);
@@ -764,7 +764,7 @@ impl App {
         for w in keymap_warnings {
             push_error(&mut error, w);
         }
-        Self {
+        let mut app = Self {
             store,
             settings,
             theme,
@@ -792,7 +792,42 @@ impl App {
             image_viewer: None,
             review: None,
             plugins,
+        };
+        app.refresh_sidebar();
+        app
+    }
+
+    /// Rebuild the sidebar's project/session tree from the store and the live
+    /// sessions. The event loop runs this before every draw (so statuses and tab
+    /// lists stay current); handlers that change what it lists call it so their
+    /// follow-up input sees the new rows. While focus is elsewhere the cursor
+    /// follows the session on screen, so jumping to the sidebar lands on it.
+    pub fn refresh_sidebar(&mut self) {
+        let active = self.active_project_name.as_deref();
+        self.sidebar.rebuild(&self.store, |p| {
+            ui::project_view(&self.sessions, p, active == Some(p.name.as_str()))
+        });
+        if self.focus != Focus::Projects
+            && let Some(name) = active
+            && let Some(session) = self.sessions.get(name)
+        {
+            self.sidebar
+                .select_key(&RowKey::Session(name.to_string(), session.active_tab));
         }
+    }
+
+    /// Whether the primary pane draws its tab strip for a project with
+    /// `tab_count` tabs. The sidebar lists every session nested under its
+    /// project, so the strip only appears while the sidebar is hidden.
+    pub fn tab_strip_shown(&self, tab_count: usize) -> bool {
+        self.sidebar_hidden && tab_count > 0
+    }
+
+    /// [`claude_pane_split`] of the primary pane's `inner` rect for the active
+    /// project: the tab strip (when shown) and the content area below it.
+    pub fn active_primary_split(&self, inner: Rect) -> (Option<Rect>, Rect) {
+        let count = self.active_session().map(|s| s.tabs.len()).unwrap_or(0);
+        claude_pane_split(inner, self.tab_strip_shown(count))
     }
 
     pub fn active_project(&self) -> Option<&Project> {
@@ -850,11 +885,15 @@ impl App {
         env
     }
 
+    /// Open the sidebar's selection: its project (spawning whatever isn't
+    /// running) and, for a session row, that tab.
     fn open_selected(&mut self, body: Rect) {
-        let Some(idx) = self.sidebar.selected_store_index() else {
+        let Some((idx, tab)) = self.sidebar.selected_target() else {
             return;
         };
-        let project = self.store.projects[idx].clone();
+        let Some(project) = self.store.projects.get(idx).cloned() else {
+            return;
+        };
         self.active_project_name = Some(project.name.clone());
         self.sidebar.active = Some(project.name.clone());
         self.layout_mode = project.layout_mode.unwrap_or_default();
@@ -865,6 +904,7 @@ impl App {
         let claude_inner = layout.claude_inner();
         let shell_inner = layout.shell_inner();
         let base_env = self.base_pty_env(&project.name);
+        let sidebar_hidden = self.sidebar_hidden;
 
         let session = self.sessions.entry(project.name.clone()).or_default();
 
@@ -907,7 +947,9 @@ impl App {
             }
         }
 
-        let claude_content = claude_pane_split(claude_inner, session.tabs.len()).1;
+        // `self.tab_strip_shown`, inlined: `session` mutably borrows `self`.
+        let strip = sidebar_hidden && !session.tabs.is_empty();
+        let claude_content = claude_pane_split(claude_inner, strip).1;
         let mut assigned_new = false;
         // An internal project spawns its harness PTYs right here. A plugin
         // project's commands come from its plugin, so its attaches are queued
@@ -977,12 +1019,17 @@ impl App {
             self.request_plugin_panes(&project, plugin);
         }
 
+        if let Some(tab) = tab
+            && let Some(session) = self.sessions.get_mut(&project.name)
+            && tab < session.tabs.len()
+        {
+            session.active_tab = tab;
+        }
         self.focus = Focus::Claude;
     }
 
     fn reload_store(&mut self) -> Result<()> {
         self.store = store::load()?;
-        self.sidebar.refresh(&self.store);
 
         // Drop sessions whose project is no longer in the store.
         let known: std::collections::HashSet<&str> = self
@@ -1009,6 +1056,7 @@ impl App {
             self.layout_mode = layout;
             self.shell_passthrough = passthru;
         }
+        self.refresh_sidebar();
         Ok(())
     }
 
@@ -1041,7 +1089,7 @@ impl App {
             .get(&project_name)
             .map(|s| s.tabs.len())
             .unwrap_or(0);
-        let claude_content = claude_pane_split(claude_inner, existing + 1).1;
+        let claude_content = claude_pane_split(claude_inner, self.tab_strip_shown(existing + 1)).1;
 
         let Some(project_path) = self.active_project().map(|p| p.path.clone()) else {
             return;
@@ -1211,7 +1259,8 @@ impl App {
         let Some(tab_count) = self.sessions.get(project_name).map(|s| s.tabs.len()) else {
             return;
         };
-        let content = claude_pane_split(compute_layout(body, self).claude_inner(), tab_count).1;
+        let strip = self.tab_strip_shown(tab_count);
+        let content = claude_pane_split(compute_layout(body, self).claude_inner(), strip).1;
         let mut env = self.base_pty_env(project_name);
         env.push(("WRK_TAB".to_string(), status_id.to_string()));
         let tab = self
@@ -2054,6 +2103,7 @@ fn event_loop(
     ipc_rx: Option<Receiver<ipc::Request>>,
 ) -> Result<()> {
     while !app.should_quit {
+        app.refresh_sidebar();
         terminal.draw(|frame| ui::draw(frame, app))?;
 
         let area: Rect = terminal.size().context("terminal size")?.into();
@@ -2063,8 +2113,8 @@ fn event_loop(
         let shell_inner = layout.shell_inner();
 
         // Resize only the active session's panes; inactive sessions keep their grids.
+        let claude_content = app.active_primary_split(claude_inner).1;
         if let Some(session) = app.active_session_mut() {
-            let claude_content = claude_pane_split(claude_inner, session.tabs.len()).1;
             for tab in session.claude_tabs_mut() {
                 if let Some(p) = tab.pane.as_mut() {
                     let _ = p.resize(claude_content.height, claude_content.width);
@@ -2206,14 +2256,14 @@ fn inset(r: Rect) -> Rect {
 
 /// Splits the Claude pane's inner (post-border) area into the optional tab
 /// strip (top row, height 1) and the terminal content area below it. The
-/// strip is only present when there are tabs to display and the inner area
-/// is at least 2 rows tall.
+/// strip is only present when `strip` asks for it (see
+/// [`App::tab_strip_shown`]) and the inner area is at least 2 rows tall.
 ///
 /// Shared by the renderer (`ui::draw_claude_pane`), the resize loop, the PTY
 /// spawn sites, and the mouse click router so they all agree on where the
 /// strip lives and how much room is left for the embedded terminal.
-pub fn claude_pane_split(inner: Rect, tab_count: usize) -> (Option<Rect>, Rect) {
-    if tab_count > 0 && inner.height >= 2 {
+pub fn claude_pane_split(inner: Rect, strip: bool) -> (Option<Rect>, Rect) {
+    if strip && inner.height >= 2 {
         let strip = Rect {
             x: inner.x,
             y: inner.y,
@@ -2743,7 +2793,7 @@ fn handle_paste(app: &mut App, content: String, body: Rect) {
     if app.focus == Focus::Projects {
         if let Some(filter) = app.sidebar.filter.as_mut() {
             filter.push_str(&payload);
-            app.sidebar.refresh(&app.store);
+            app.refresh_sidebar();
         }
         return;
     }
@@ -2860,7 +2910,7 @@ fn handle_projects_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
         }
         KeyCode::Char('/') => {
             app.sidebar.filter = Some(String::new());
-            app.sidebar.refresh(&app.store);
+            app.refresh_sidebar();
         }
         KeyCode::Char('r') => {
             app.reload_store()?;
@@ -2875,20 +2925,20 @@ fn handle_filter_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
     match key.code {
         KeyCode::Esc => {
             app.sidebar.filter = None;
-            app.sidebar.refresh(&app.store);
+            app.refresh_sidebar();
         }
         KeyCode::Enter => {
             app.open_selected(body);
             app.sidebar.filter = None;
-            app.sidebar.refresh(&app.store);
+            app.refresh_sidebar();
         }
         KeyCode::Backspace => {
             filter.pop();
-            app.sidebar.refresh(&app.store);
+            app.refresh_sidebar();
         }
         KeyCode::Char(c) => {
             filter.push(c);
-            app.sidebar.refresh(&app.store);
+            app.refresh_sidebar();
         }
         KeyCode::Down => app.sidebar.select_next(),
         KeyCode::Up => app.sidebar.select_prev(),
@@ -3343,8 +3393,7 @@ fn pane_at(app: &App, layout: &LayoutRects, x: u16, y: u16) -> Option<(Focus, Re
         }
     };
     let inner = if is_claude_pane {
-        let count = app.active_session().map(|s| s.tabs.len()).unwrap_or(0);
-        claude_pane_split(inset(outer), count).1
+        app.active_primary_split(inset(outer)).1
     } else {
         inset(outer)
     };
@@ -3366,8 +3415,7 @@ fn inner_rect_for_focus(app: &App, layout: &LayoutRects, focus: Focus) -> Option
         _ => return None,
     };
     let inner = if is_claude_pane {
-        let count = app.active_session().map(|s| s.tabs.len()).unwrap_or(0);
-        claude_pane_split(inset(outer), count).1
+        app.active_primary_split(inset(outer)).1
     } else {
         inset(outer)
     };
@@ -3432,8 +3480,7 @@ fn forward_mouse_to_pane(
     // session tab strip — adjust the inner rect so pane-local coords match
     // the cells the user can actually see.
     let inner = if target_focus == Focus::Claude {
-        let count = app.active_session().map(|s| s.tabs.len()).unwrap_or(0);
-        claude_pane_split(inset(outer), count).1
+        app.active_primary_split(inset(outer)).1
     } else {
         inset(outer)
     };
@@ -3609,7 +3656,7 @@ fn try_open_url(app: &App, layout: &LayoutRects, pos_x: u16, pos_y: u16) -> bool
         return false;
     };
     let inner = if is_claude_pane {
-        claude_pane_split(inset(outer), session.tabs.len()).1
+        app.active_primary_split(inset(outer)).1
     } else {
         inset(outer)
     };
@@ -3632,15 +3679,9 @@ fn try_open_url(app: &App, layout: &LayoutRects, pos_x: u16, pos_y: u16) -> bool
 
 fn handle_sidebar_click(app: &mut App, sidebar: Rect, row: u16, body: Rect) {
     app.focus = Focus::Projects;
-    let inner_top = sidebar.y + 1;
-    let inner_bottom = sidebar.y + sidebar.height.saturating_sub(1);
-    if row < inner_top || row >= inner_bottom {
+    let Some(visible_idx) = app.sidebar.row_at(sidebar, row) else {
         return;
-    }
-    let visible_idx = (row - inner_top) as usize + app.sidebar.state.offset();
-    if visible_idx >= app.sidebar.filtered_indices.len() {
-        return;
-    }
+    };
     let now = Instant::now();
     let is_double = matches!(
         app.last_click,
@@ -3658,18 +3699,13 @@ fn handle_sidebar_click(app: &mut App, sidebar: Rect, row: u16, body: Rect) {
 
 /// Returns the rect occupied by the Claude pane's per-session tab strip if it
 /// is currently rendered. The strip is on top of the claude inner area when
-/// there is at least one tab and the claude pane is visible (always in Split,
-/// only when focus is not Shell in Tabbed).
+/// it is shown at all (sidebar hidden, at least one tab) and the claude pane
+/// is visible (always in Split, only when focus is not Shell in Tabbed).
 fn visible_claude_tab_strip(app: &App, layout: &LayoutRects) -> Option<Rect> {
-    let session = app.active_session()?;
-    let count = session.tabs.len();
-    if count == 0 {
-        return None;
-    }
     if app.layout_mode == LayoutMode::Tabbed && app.focus == Focus::Shell {
         return None;
     }
-    claude_pane_split(inset(layout.claude), count).0
+    app.active_primary_split(inset(layout.claude)).0
 }
 
 /// Switches the active Claude tab to the one under the click `x`, and gives
@@ -4167,6 +4203,76 @@ mod tests {
         let mut app = app_with_tabs(vec![claude_tab("c")]);
         app.close_active_tab();
         assert_eq!(app.active_session().unwrap().tabs.len(), 1);
+    }
+
+    fn bare_project(name: &str, sessions: &[&str]) -> Project {
+        Project {
+            name: name.to_string(),
+            path: PathBuf::from("/tmp"),
+            tags: vec![],
+            layout_mode: None,
+            shell_passthrough: None,
+            claude_sessions: sessions
+                .iter()
+                .map(|n| crate::store::SessionRef {
+                    name: n.to_string(),
+                    session_id: None,
+                    harness: HarnessKind::Claude,
+                })
+                .collect(),
+            session_names: BTreeMap::new(),
+            plugin: None,
+            plugin_config: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn sidebar_nests_live_and_persisted_sessions_and_follows_the_shown_tab() {
+        use crate::ui::projects::{RowKey, SessionKind, SidebarRow};
+        let mut app = app_with_tabs(vec![claude_tab("a"), md_tab("m"), claude_tab("b")]);
+        app.store.projects.push(bare_project("p", &[]));
+        // Not loaded: its persisted sessions are listed (and openable) anyway.
+        app.store.projects.push(bare_project("q", &["x"]));
+        app.sessions.get_mut("p").unwrap().active_tab = 2;
+        app.focus = Focus::Claude;
+        app.refresh_sidebar();
+
+        let key = |p: &str, t| RowKey::Session(p.to_string(), t);
+        let keys: Vec<_> = app.sidebar.rows.iter().map(SidebarRow::key).collect();
+        assert_eq!(
+            keys,
+            vec![
+                RowKey::Project("p".into()),
+                key("p", 0),
+                key("p", 1),
+                key("p", 2),
+                RowKey::Project("q".into()),
+                key("q", 0),
+            ]
+        );
+        let md = &app.sidebar.rows[2].session.as_ref().unwrap().1;
+        assert_eq!(md.kind, SessionKind::Markdown);
+        assert!(!app.sidebar.rows[5].loaded);
+        // Outside the sidebar the cursor tracks the shown tab…
+        assert_eq!(app.sidebar.selected_target(), Some((0, Some(2))));
+
+        // …but while navigating the sidebar it stays where the user put it.
+        app.focus = Focus::Projects;
+        app.sidebar.select_next();
+        app.refresh_sidebar();
+        assert_eq!(
+            app.sidebar.selected_row().map(SidebarRow::key),
+            Some(RowKey::Project("q".into()))
+        );
+    }
+
+    #[test]
+    fn tab_strip_only_shows_while_the_sidebar_is_hidden() {
+        let mut app = empty_app();
+        assert!(!app.tab_strip_shown(3), "the sidebar lists the sessions");
+        app.sidebar_hidden = true;
+        assert!(app.tab_strip_shown(3));
+        assert!(!app.tab_strip_shown(0));
     }
 
     #[test]
