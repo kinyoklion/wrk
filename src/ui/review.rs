@@ -11,7 +11,7 @@ use ratatui::widgets::{Clear, Paragraph};
 use crate::App;
 use crate::review::diff::{DiffCell, FileStatus, RowKind};
 use crate::review::{
-    DiffRowHit, FileState, ReviewFocus, ReviewHitMap, ReviewSession, Side, VisualLine,
+    DiffRowHit, FileState, ReviewFocus, ReviewHitMap, ReviewSession, Side, VisualLine, display_text,
 };
 use crate::settings::Theme;
 use crate::ui::{bordered, cell_width, truncate_to_width};
@@ -468,7 +468,7 @@ fn cell_spans(
     match cell {
         Some(c) => {
             let num = format!("{:>w$} ", c.line, w = NUM_W);
-            let text = fit(&drop_cols(&c.text, hscroll), text_w);
+            let text = fit(&drop_cols(&display_text(&c.text), hscroll), text_w);
             let text_style = match fg {
                 Some(color) => Style::default().fg(color),
                 None => Style::default(),
@@ -508,7 +508,9 @@ fn drop_cols(s: &str, n: usize) -> String {
             break;
         }
     }
-    chars.collect()
+    // A wide char straddling the cut is dropped whole; pad the cell it leaves
+    // so the rest of the line stays in the same columns as its neighbours.
+    format!("{}{}", " ".repeat(used.saturating_sub(n)), chars.as_str())
 }
 
 /// Greedy word-wrap to `width` cells, breaking at spaces where possible and hard-
@@ -717,6 +719,44 @@ mod tests {
         assert_eq!(drop_cols("hello world", 6), "world");
         assert_eq!(drop_cols("hello", 0), "hello");
         assert_eq!(drop_cols("hi", 10), "");
+        // Cutting through a wide char pads its leftover cell so what follows
+        // keeps its column.
+        assert_eq!(drop_cols("漢字x", 1), " 字x");
+        assert_eq!(drop_cols("漢字x", 2), "字x");
+    }
+
+    /// gofmt-style tab-indented code keeps its indentation and the before/after
+    /// separator stays in one column on every row. (Tabs used to count as one
+    /// cell when padding but draw as none, so each tab dragged the `│` a column
+    /// left and the indentation vanished.)
+    #[test]
+    fn tab_indented_code_keeps_indentation_and_a_straight_separator() {
+        let before = "func f(x int) int {\n\tif x > 0 {\n\t\treturn x\n\t}\n\treturn 0\n}\n";
+        let after = before.replace("return 0", "return -1");
+        let file = build_review_file("f.go".into(), FileStatus::Modified, before, &after);
+        let mut app = app_with(vec![file]);
+        app.review.as_mut().unwrap().set_all_revealed(true);
+        let mut term = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        draw(&mut term, &mut app);
+
+        let review = app.review.as_ref().unwrap();
+        let (body, split) = (review.hits.diff_body, review.hits.side_split);
+        let buf = term.backend().buffer();
+        assert_eq!(review.hits.diff_rows.len(), 6, "every line is drawn");
+        for i in 0..6 {
+            let y = body.y + i;
+            assert_eq!(
+                buf[(split, y)].symbol(),
+                "│",
+                "separator out of line on row {i}:\n{}",
+                buffer_text(&term)
+            );
+        }
+        // Line 3 is two tabs deep: 8 spaces of indentation after the gutter.
+        let (x, y) = find(&term, "return x");
+        let gutter_end = body.x + 1 + NUM_W as u16 + 1;
+        assert_eq!(x - gutter_end, 8, "indentation lost");
+        assert_eq!(row_text(&term, y, gutter_end, x), " ".repeat(8));
     }
 
     #[test]

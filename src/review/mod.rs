@@ -5,6 +5,7 @@
 
 pub mod diff;
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 use diff::{DiffCell, DiffTarget, ReviewFile, Segment};
@@ -89,14 +90,61 @@ pub struct FileState {
     pub content_width: usize,
 }
 
+/// Columns between tab stops when a diff line's tabs are expanded for display.
+pub const TAB_WIDTH: usize = 4;
+
+/// A source line as the overlay draws it: tabs expanded to spaces at
+/// [`TAB_WIDTH`] stops, and any other control character replaced by its Unicode
+/// "control picture" (`␛`, `␍`, …). Neither ratatui nor the terminal draws a
+/// control character as a cell, so raw text would lose its tab indentation and
+/// knock every column after it — the before/after separator included — out of
+/// line (widths are measured on the text, which counts a tab as one cell).
+/// Borrowed when the line has nothing to replace.
+pub fn display_text(s: &str) -> Cow<'_, str> {
+    if !s.contains(char::is_control) {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    // Tab stops are measured in cells, so text between tabs is measured as a
+    // whole (the same way the renderer will measure it).
+    let mut col = 0;
+    for (i, part) in s.split('\t').enumerate() {
+        if i > 0 {
+            let n = TAB_WIDTH - col % TAB_WIDTH;
+            out.extend(std::iter::repeat_n(' ', n));
+            col += n;
+        }
+        let part: String = part.chars().map(control_picture).collect();
+        col += crate::ui::cell_width(&part);
+        out.push_str(&part);
+    }
+    Cow::Owned(out)
+}
+
+/// The visible stand-in for a control character (identity for anything else):
+/// C0 controls map to the U+2400 "control pictures" block, DEL to `␡`, and the
+/// C1 range to `�`.
+fn control_picture(c: char) -> char {
+    match c {
+        '\0'..='\x1f' => char::from_u32(0x2400 + c as u32).unwrap_or('\u{FFFD}'),
+        '\x7f' => '\u{2421}',
+        c if c.is_control() => '\u{FFFD}',
+        c => c,
+    }
+}
+
 impl FileState {
     fn new(file: ReviewFile) -> Self {
+        // Measured in display cells (tabs expanded), the same units `hscroll`
+        // scrolls in.
         let content_width = file
             .rows
             .iter()
             .map(|r| {
-                let w =
-                    |c: &Option<diff::DiffCell>| c.as_ref().map_or(0, |c| c.text.chars().count());
+                let w = |c: &Option<diff::DiffCell>| {
+                    c.as_ref()
+                        .map_or(0, |c| crate::ui::cell_width(&display_text(&c.text)))
+                };
                 w(&r.left).max(w(&r.right))
             })
             .max()
@@ -745,6 +793,30 @@ mod tests {
         assert_eq!(d.side, Side::After);
         assert_eq!(d.line, 2);
         assert_eq!(d.line_text, "b");
+    }
+
+    #[test]
+    fn display_text_expands_tabs_to_stops_and_shows_control_chars() {
+        // Clean lines aren't copied.
+        assert!(matches!(display_text("plain"), Cow::Borrowed("plain")));
+        // A tab advances to the next stop from wherever the text is.
+        assert_eq!(display_text("\treturn"), "    return");
+        assert_eq!(display_text("\t\tx"), "        x");
+        assert_eq!(display_text("ab\tc"), "ab  c");
+        assert_eq!(display_text("abcd\tc"), "abcd    c");
+        // Stops count cells, so a wide char takes two columns.
+        assert_eq!(display_text("漢\tx"), "漢  x");
+        // Other control characters become visible one-cell stand-ins.
+        assert_eq!(display_text("a\x1b[0mb"), "a␛[0mb");
+        assert_eq!(display_text("cr\r"), "cr␍");
+        assert_eq!(display_text("del\x7f"), "del␡");
+    }
+
+    #[test]
+    fn content_width_counts_expanded_tabs() {
+        // Two tabs expand to 8 cells; `hscroll` must be able to reach past them.
+        let s = session_with("a\n", "\t\tlong\n");
+        assert_eq!(s.current().unwrap().content_width, 12);
     }
 
     #[test]
