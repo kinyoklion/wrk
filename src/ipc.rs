@@ -3,14 +3,17 @@
 //! Each running TUI binds a Unix domain socket at
 //! `<runtime>/wrk/sock/wrk-<pid>.sock` and exports its path to every spawned
 //! PTY as `WRK_SOCK` (with `WRK_PROJECT` naming the owning project and, for
-//! Claude tabs, `WRK_TAB` identifying the tab). Two callers connect, write one
-//! line of JSON, and disconnect: `wrk view <file>` sends a [`Request::Open`]
-//! that becomes a markdown tab, and `wrk hook <kind>` (from Claude Code hooks)
-//! sends a [`Request::Status`] that updates the originating tab's sidebar
-//! status. The server accepts one request per connection and forwards it to the
-//! event loop over a channel.
+//! Claude tabs, `WRK_TAB` identifying the tab). Callers connect, write one line
+//! of JSON, and disconnect: `wrk view <file>` sends a [`Request::Open`] that
+//! becomes a markdown tab, `wrk hook <kind>` (from Claude Code hooks) sends a
+//! [`Request::Status`] that updates the originating tab's sidebar status, and
+//! `wrk notify` sends a [`Request::Notify`] for the status bar. A
+//! [`Request::Confirm`] (`wrk confirm`) is the one that gets an answer: wrk
+//! asks the user, then writes one [`ConfirmReply`] line back on the same
+//! connection. The server accepts one request per connection and forwards it,
+//! with the connection, to the event loop over a channel.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
@@ -31,6 +34,101 @@ pub enum Request {
     Status(StatusUpdate),
     /// Start or end an in-TUI code review (`wrk review`).
     Review(ReviewRequest),
+    /// Ask the user a yes/no question (`wrk confirm`); answered with a
+    /// [`ConfirmReply`] line on the same connection.
+    Confirm(ConfirmRequest),
+    /// Show a message in the status bar (`wrk notify`).
+    Notify(NotifyRequest),
+}
+
+/// A yes/no question for the user, from a process in one of wrk's panes (a
+/// pane's command asking before it does something on the user's behalf). wrk
+/// shows it as a prompt, queued behind any prompt already open, and answers
+/// once the user picks. A requester that hangs up first withdraws it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmRequest {
+    /// Project the request came from (from `WRK_PROJECT`), named on the prompt.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// The question, one line.
+    pub title: String,
+    /// Detail shown under the question, a line each.
+    #[serde(default)]
+    pub lines: Vec<String>,
+    /// What `y` does, e.g. `download` (default `yes`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accept: Option<String>,
+    /// What `n` / Esc does, e.g. `decline` (default `no`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decline: Option<String>,
+}
+
+/// wrk's answer to a [`ConfirmRequest`]. Nothing comes back (the connection
+/// just closes) when wrk exits without the user answering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmReply {
+    pub accepted: bool,
+}
+
+/// A message for the status bar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotifyRequest {
+    /// Project the message is about (from `WRK_PROJECT`).
+    #[serde(default)]
+    pub project: Option<String>,
+    pub message: String,
+    /// Show it as an error rather than as information.
+    #[serde(default)]
+    pub error: bool,
+}
+
+/// One request off the socket, with the connection it came on (kept open for
+/// the answer to a [`Request::Confirm`]; dropping it closes the connection).
+pub struct Incoming {
+    pub request: Request,
+    pub reply: Reply,
+}
+
+/// The connection a request came on, for writing the one answer back.
+#[derive(Debug, Default)]
+pub struct Reply {
+    conn: Option<UnixStream>,
+}
+
+impl Reply {
+    pub fn new(conn: UnixStream) -> Self {
+        Reply { conn: Some(conn) }
+    }
+
+    /// Answer a confirm and close the connection. Best effort: a requester
+    /// that already left just misses it.
+    pub fn answer(&mut self, accepted: bool) {
+        if let Some(mut conn) = self.conn.take() {
+            let mut line = serde_json::to_string(&ConfirmReply { accepted }).unwrap_or_default();
+            line.push('\n');
+            let _ = conn.write_all(line.as_bytes());
+        }
+    }
+
+    /// Has the requester hung up (so a prompt waiting on it is moot)? A
+    /// requester sends nothing after its request, so a non-blocking read sees
+    /// either nothing yet (still there) or end of file (gone).
+    pub fn withdrawn(&self) -> bool {
+        let Some(conn) = &self.conn else {
+            return false;
+        };
+        if conn.set_nonblocking(true).is_err() {
+            return true;
+        }
+        let mut buf = [0u8; 64];
+        let gone = match (&*conn).read(&mut buf) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(e) => e.kind() != std::io::ErrorKind::WouldBlock,
+        };
+        let _ = conn.set_nonblocking(false);
+        gone
+    }
 }
 
 /// A request to open a file in a running wrk instance.
@@ -144,10 +242,10 @@ pub fn sweep_stale_sockets() {
 }
 
 /// Bind this process's socket and spawn an accept thread that forwards each
-/// parsed [`Request`] over the returned channel. Returns the socket path (for
-/// the env export and cleanup on exit) and the receiver (drained by the event
-/// loop).
-pub fn serve() -> Result<(PathBuf, Receiver<Request>)> {
+/// parsed [`Request`] (with its connection) over the returned channel. Returns
+/// the socket path (for the env export and cleanup on exit) and the receiver
+/// (drained by the event loop).
+pub fn serve() -> Result<(PathBuf, Receiver<Incoming>)> {
     let dir = socket_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = socket_path(std::process::id());
@@ -157,26 +255,35 @@ pub fn serve() -> Result<(PathBuf, Receiver<Request>)> {
     let listener =
         UnixListener::bind(&path).with_context(|| format!("binding {}", path.display()))?;
 
-    let (tx, rx) = channel::<Request>();
+    let (tx, rx) = channel::<Incoming>();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else {
                 continue;
             };
-            if let Some(req) = read_request(stream)
-                && tx.send(req).is_err()
-            {
-                break; // receiver gone → the app is shutting down
-            }
+            // One slow or silent client must not hold up the rest.
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                if let Some(request) = read_request(&stream) {
+                    let _ = tx.send(Incoming {
+                        request,
+                        reply: Reply::new(stream),
+                    });
+                }
+            });
         }
     });
     Ok((path, rx))
 }
 
-fn read_request(stream: UnixStream) -> Option<Request> {
+/// The connection's one request line. A client that never finishes it is
+/// given up on after a while, so its thread doesn't linger.
+fn read_request(stream: &UnixStream) -> Option<Request> {
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line).ok()?;
+    let _ = stream.set_read_timeout(None);
     serde_json::from_str(line.trim()).ok()
 }
 
@@ -191,6 +298,25 @@ pub fn send(sock: &Path, req: &Request) -> Result<()> {
     stream.write_all(payload.as_bytes())?;
     stream.flush()?;
     Ok(())
+}
+
+/// Client side of a [`Request::Confirm`]: send it and wait for the answer.
+/// `Ok(None)` when wrk closed the connection without one (it exited, or the
+/// request didn't parse).
+pub fn ask(sock: &Path, req: &ConfirmRequest) -> Result<Option<bool>> {
+    let mut stream =
+        UnixStream::connect(sock).with_context(|| format!("connecting to {}", sock.display()))?;
+    let mut payload = serde_json::to_string(&Request::Confirm(req.clone()))?;
+    payload.push('\n');
+    stream.write_all(payload.as_bytes())?;
+    stream.flush()?;
+    let mut line = String::new();
+    BufReader::new(&stream).read_line(&mut line)?;
+    if line.trim().is_empty() {
+        return Ok(None);
+    }
+    let reply: ConfirmReply = serde_json::from_str(line.trim()).context("wrk's answer")?;
+    Ok(Some(reply.accepted))
 }
 
 #[cfg(test)]
@@ -288,6 +414,69 @@ mod tests {
                 project: None,
             })
         );
+    }
+
+    #[test]
+    fn confirm_and_notify_round_trip_with_defaults() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"confirm","title":"send?"}"#).unwrap();
+        assert_eq!(
+            req,
+            Request::Confirm(ConfirmRequest {
+                project: None,
+                title: "send?".into(),
+                lines: vec![],
+                accept: None,
+                decline: None,
+            })
+        );
+        let note: Request =
+            serde_json::from_str(r#"{"cmd":"notify","message":"saved","project":"p"}"#).unwrap();
+        assert_eq!(
+            note,
+            Request::Notify(NotifyRequest {
+                project: Some("p".into()),
+                message: "saved".into(),
+                error: false,
+            })
+        );
+    }
+
+    #[test]
+    fn a_confirm_is_answered_on_its_own_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wrk-1.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let Some(Request::Confirm(req)) = read_request(&stream) else {
+                panic!("not a confirm");
+            };
+            assert_eq!(req.lines, vec!["a.md".to_string()]);
+            let mut reply = Reply::new(stream);
+            assert!(!reply.withdrawn(), "the asker is still waiting");
+            reply.answer(true);
+        });
+        let req = ConfirmRequest {
+            project: Some("web".into()),
+            title: "download?".into(),
+            lines: vec!["a.md".into()],
+            accept: Some("download".into()),
+            decline: None,
+        };
+        assert_eq!(ask(&path, &req).unwrap(), Some(true));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_requester_that_hangs_up_has_withdrawn() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let mut reply = Reply::new(ours);
+        assert!(!reply.withdrawn());
+        drop(theirs);
+        assert!(reply.withdrawn());
+        // Answering a requester that left is harmless.
+        reply.answer(false);
+        assert!(!reply.withdrawn(), "answered: nothing left to withdraw");
     }
 
     #[test]

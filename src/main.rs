@@ -94,6 +94,29 @@ enum Command {
         #[command(subcommand)]
         action: ReviewAction,
     },
+    /// Ask the user a yes/no question in the running wrk instance (from inside
+    /// one of its panes) and wait for the answer. Exits 0 when they accept, 1
+    /// when they decline, and 2 when there is no wrk to ask.
+    Confirm {
+        /// The question, one line.
+        title: String,
+        /// Detail shown under the question, a line each.
+        lines: Vec<String>,
+        /// What answering yes does, e.g. `download` (shown as `y: download`).
+        #[arg(long)]
+        accept: Option<String>,
+        /// What answering no does (shown as `n / Esc: …`).
+        #[arg(long)]
+        decline: Option<String>,
+    },
+    /// Show a message in the running wrk instance's status bar (from inside one
+    /// of its panes). A silent no-op outside a wrk session.
+    Notify {
+        message: String,
+        /// Show it as an error.
+        #[arg(long)]
+        error: bool,
+    },
 }
 
 /// `wrk review` subcommands. Modeled as real clap subcommands (rather than a
@@ -124,6 +147,13 @@ fn main() -> Result<()> {
         Some(Command::UninstallHooks) => cmd_uninstall_hooks(),
         Some(Command::Hook { kind, harness }) => cmd_hook(&kind, harness.as_deref()),
         Some(Command::Review { action }) => cmd_review(action),
+        Some(Command::Confirm {
+            title,
+            lines,
+            accept,
+            decline,
+        }) => cmd_confirm(title, lines, accept, decline),
+        Some(Command::Notify { message, error }) => cmd_notify(message, error),
         None => run_tui(),
     }
 }
@@ -156,6 +186,53 @@ fn cmd_view(path: &Path) -> Result<()> {
         .status()
         .with_context(|| format!("launching {}", prog.display()))?;
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// `wrk confirm`: ask the running instance (`WRK_SOCK`) and exit with the
+/// answer: 0 accepted, 1 declined, 2 no wrk to ask (or it exited unanswered).
+fn cmd_confirm(
+    title: String,
+    lines: Vec<String>,
+    accept: Option<String>,
+    decline: Option<String>,
+) -> Result<()> {
+    let Some(sock) = std::env::var_os("WRK_SOCK").filter(|s| !s.is_empty()) else {
+        eprintln!("wrk confirm: not inside a wrk pane (no WRK_SOCK)");
+        std::process::exit(2);
+    };
+    let req = ipc::ConfirmRequest {
+        project: std::env::var("WRK_PROJECT").ok().filter(|s| !s.is_empty()),
+        title,
+        lines,
+        accept,
+        decline,
+    };
+    match ipc::ask(Path::new(&sock), &req) {
+        Ok(Some(true)) => std::process::exit(0),
+        Ok(Some(false)) => std::process::exit(1),
+        Ok(None) => {
+            eprintln!("wrk confirm: wrk closed without an answer");
+            std::process::exit(2);
+        }
+        Err(e) => {
+            eprintln!("wrk confirm: {e:#}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// `wrk notify`: a status-bar message for the running instance; nothing
+/// outside a wrk session.
+fn cmd_notify(message: String, error: bool) -> Result<()> {
+    if let Some(sock) = std::env::var_os("WRK_SOCK").filter(|s| !s.is_empty()) {
+        let req = ipc::Request::Notify(ipc::NotifyRequest {
+            project: std::env::var("WRK_PROJECT").ok().filter(|s| !s.is_empty()),
+            message,
+            error,
+        });
+        let _ = ipc::send(Path::new(&sock), &req);
+    }
+    Ok(())
 }
 
 /// Locate the `wrk-md` viewer binary: prefer a sibling next to the current
@@ -761,6 +838,8 @@ pub struct App {
     pub plugin_names: Vec<String>,
     /// Projects plugins list themselves, each plugin's a sidebar group.
     pub remote: remote::Remote,
+    /// `wrk confirm` prompts waiting for the one on screen to be answered.
+    pub prompts: std::collections::VecDeque<ui::prompt::PromptModal>,
 }
 
 impl App {
@@ -808,6 +887,7 @@ impl App {
             plugins,
             plugin_names: Vec::new(),
             remote: remote::Remote::default(),
+            prompts: std::collections::VecDeque::new(),
         };
         app.plugin_names = app.settings.plugin_names();
         app.refresh_sidebar();
@@ -1723,8 +1803,24 @@ impl App {
             .sessions
             .get_mut(project_name)
             .ok_or_else(|| anyhow!("project '{project_name}' is not loaded"))?;
-        session.tabs.push(tab);
-        session.active_tab = session.tabs.len() - 1;
+        // A file already open in this project is reloaded where it is (a
+        // document written again, then opened again), not opened twice.
+        let open_at = session.tabs.iter().position(|t| match (t, &tab) {
+            (Tab::Markdown(open), Tab::Markdown(new)) => open.path == new.path,
+            _ => false,
+        });
+        match open_at {
+            Some(i) => {
+                if let Tab::Markdown(open) = &mut session.tabs[i] {
+                    open.reload();
+                }
+                session.active_tab = i;
+            }
+            None => {
+                session.tabs.push(tab);
+                session.active_tab = session.tabs.len() - 1;
+            }
+        }
         if self.active_project_name.as_deref() == Some(project_name) {
             self.focus = Focus::Claude;
         }
@@ -1746,11 +1842,63 @@ impl App {
     }
 
     /// Route an [`ipc::Request`] drained from the socket to its handler.
-    fn handle_request(&mut self, req: ipc::Request) {
+    /// `reply` is its connection, which only a confirm answers on; the rest
+    /// drop it, closing the connection.
+    fn handle_request(&mut self, req: ipc::Request, reply: ipc::Reply) {
         match req {
             ipc::Request::Open(open) => self.handle_open_request(open),
             ipc::Request::Status(update) => self.handle_status_update(update),
             ipc::Request::Review(review) => self.handle_review_request(review),
+            ipc::Request::Confirm(confirm) => {
+                let source = confirm
+                    .project
+                    .as_deref()
+                    .map(|name| self.project_label(name));
+                self.prompts
+                    .push_back(ui::prompt::PromptModal::new(confirm, source, reply));
+                self.tick_prompts();
+            }
+            ipc::Request::Notify(note) => {
+                let message = match note.project.as_deref() {
+                    // A message about a project in the background says which.
+                    Some(name) if self.active_project_name.as_deref() != Some(name) => {
+                        format!("{}: {}", self.project_label(name), note.message)
+                    }
+                    _ => note.message,
+                };
+                if note.error {
+                    push_error(&mut self.error, message);
+                } else {
+                    self.info = Some(message);
+                }
+            }
+        }
+    }
+
+    /// How a project is named to the user: its display name, else the key.
+    fn project_label(&self, name: &str) -> String {
+        self.project(name)
+            .map(|p| p.display_name().to_string())
+            .unwrap_or_else(|| name.to_string())
+    }
+
+    /// Keep `wrk confirm` prompts moving: drop any whose requester hung up
+    /// (closing the one on screen with a note), and show the next once no
+    /// other modal is open.
+    fn tick_prompts(&mut self) {
+        if let Some(ModalState::Prompt(m)) = &self.modal
+            && m.reply.withdrawn()
+        {
+            let who = m.source.clone().unwrap_or_else(|| "a pane".into());
+            self.modal = None;
+            self.info = Some(format!("{who} withdrew its question"));
+        }
+        self.prompts.retain(|m| !m.reply.withdrawn());
+        if self.modal.is_none()
+            && let Some(mut next) = self.prompts.pop_front()
+        {
+            next.show(Instant::now());
+            self.modal = Some(ModalState::Prompt(next));
         }
     }
 
@@ -2453,7 +2601,7 @@ fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
     watch_rx: Receiver<()>,
-    ipc_rx: Option<Receiver<ipc::Request>>,
+    ipc_rx: Option<Receiver<ipc::Incoming>>,
 ) -> Result<()> {
     while !app.should_quit {
         app.poll_remote();
@@ -2489,13 +2637,14 @@ fn event_loop(
             let _ = app.reload_store();
         }
 
-        // Drain IPC requests: `wrk view` open-file requests and `wrk hook`
-        // status pushes.
+        // Drain IPC requests: `wrk view` open-file requests, `wrk hook`
+        // status pushes, `wrk confirm` prompts and `wrk notify` messages.
         if let Some(rx) = &ipc_rx {
-            while let Ok(req) = rx.try_recv() {
-                app.handle_request(req);
+            while let Ok(incoming) = rx.try_recv() {
+                app.handle_request(incoming.request, incoming.reply);
             }
         }
+        app.tick_prompts();
 
         // Drain finished session-plugin jobs (attach / shell / list run off-thread).
         while let Some(event) = app.plugins.try_recv() {
@@ -3483,6 +3632,22 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                 }
             }
         }
+        ModalState::Prompt(m) => {
+            // Keys in its first moments were meant for the pane: ignored.
+            if m.armed(Instant::now()) {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        m.answer(true);
+                        consumed_modal = Some(());
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        m.answer(false);
+                        consumed_modal = Some(());
+                    }
+                    _ => {}
+                }
+            }
+        }
         ModalState::PluginForm(m) => match key.code {
             // Closing while a create runs leaves it running; its result still
             // refreshes the listing and opens what it made.
@@ -4174,13 +4339,16 @@ mod tests {
     use super::{
         App, ClaudeTab, Focus, HarnessKind, MarkdownTab, ModalState, PluginAttach, Project,
         ProjectSession, ProjectStore, Settings, Tab, continue_agent_command, expand_tilde,
-        new_agent_command, new_session_id, normalize_paste, resume_agent_command,
+        handle_modal_key, new_agent_command, new_session_id, normalize_paste, resume_agent_command,
     };
-    use crate::plugin;
     use crate::settings::HarnessConfig;
+    use crate::{ipc, plugin, ui};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
     use std::collections::BTreeMap;
+    use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
+    use std::time::Instant;
 
     #[test]
     fn request_quit_confirms_by_default() {
@@ -4195,6 +4363,146 @@ mod tests {
         // A second request while the modal is up is a no-op (no stacking).
         app.request_quit();
         assert!(matches!(app.modal, Some(ModalState::ConfirmQuit(_))));
+    }
+
+    fn confirm(title: &str) -> ipc::ConfirmRequest {
+        ipc::ConfirmRequest {
+            project: Some("web".into()),
+            title: title.into(),
+            lines: vec!["a.md".into()],
+            accept: Some("download".into()),
+            decline: None,
+        }
+    }
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    /// The prompt on screen, made old enough to take keys.
+    fn arm_prompt(app: &mut App) {
+        let Some(ModalState::Prompt(m)) = app.modal.as_mut() else {
+            panic!("no prompt on screen");
+        };
+        m.shown_at = Some(Instant::now() - ui::prompt::ARM_AFTER);
+    }
+
+    fn answer(theirs: &UnixStream) -> Option<bool> {
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(theirs), &mut line).unwrap();
+        (!line.is_empty()).then(|| {
+            serde_json::from_str::<ipc::ConfirmReply>(line.trim())
+                .unwrap()
+                .accepted
+        })
+    }
+
+    #[test]
+    fn confirm_prompts_queue_and_answer_on_their_own_connections() {
+        let body = Rect::new(0, 0, 100, 40);
+        let mut app = empty_app();
+        let (first_ours, first_theirs) = UnixStream::pair().unwrap();
+        let (second_ours, second_theirs) = UnixStream::pair().unwrap();
+        app.handle_request(
+            ipc::Request::Confirm(confirm("first?")),
+            ipc::Reply::new(first_ours),
+        );
+        app.handle_request(
+            ipc::Request::Confirm(confirm("second?")),
+            ipc::Reply::new(second_ours),
+        );
+        let Some(ModalState::Prompt(m)) = &app.modal else {
+            panic!("the first prompt shows at once");
+        };
+        assert_eq!(m.title, "first?");
+        assert_eq!(app.prompts.len(), 1, "the second waits its turn");
+
+        // A key in its first moments was meant for a pane: ignored.
+        handle_modal_key(&mut app, key('y'), body).unwrap();
+        assert!(matches!(app.modal, Some(ModalState::Prompt(_))));
+
+        arm_prompt(&mut app);
+        handle_modal_key(&mut app, key('y'), body).unwrap();
+        assert_eq!(answer(&first_theirs), Some(true));
+        assert!(app.modal.is_none());
+
+        app.tick_prompts();
+        let Some(ModalState::Prompt(m)) = &app.modal else {
+            panic!("the second prompt follows");
+        };
+        assert_eq!(m.title, "second?");
+        arm_prompt(&mut app);
+        handle_modal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            body,
+        )
+        .unwrap();
+        assert_eq!(answer(&second_theirs), Some(false));
+    }
+
+    #[test]
+    fn a_prompt_whose_asker_hangs_up_goes_away() {
+        let mut app = empty_app();
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let (queued_ours, queued_theirs) = UnixStream::pair().unwrap();
+        app.handle_request(
+            ipc::Request::Confirm(confirm("one?")),
+            ipc::Reply::new(ours),
+        );
+        app.handle_request(
+            ipc::Request::Confirm(confirm("two?")),
+            ipc::Reply::new(queued_ours),
+        );
+        drop(queued_theirs);
+        drop(theirs);
+        app.tick_prompts();
+        assert!(app.modal.is_none(), "both withdrew");
+        assert!(app.prompts.is_empty());
+        assert_eq!(app.info.as_deref(), Some("web withdrew its question"));
+    }
+
+    #[test]
+    fn notify_shows_in_the_status_bar_naming_a_background_project() {
+        let mut app = empty_app();
+        app.active_project_name = Some("api".into());
+        let note = |message: &str, error| {
+            ipc::Request::Notify(ipc::NotifyRequest {
+                project: Some("web".into()),
+                message: message.into(),
+                error,
+            })
+        };
+        app.handle_request(note("saved 2 files", false), ipc::Reply::default());
+        assert_eq!(app.info.as_deref(), Some("web: saved 2 files"));
+        app.handle_request(note("transfer failed", true), ipc::Reply::default());
+        assert_eq!(app.error.as_deref(), Some("web: transfer failed"));
+    }
+
+    #[test]
+    fn opening_an_open_file_again_reloads_it_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        std::fs::write(&path, "# one").unwrap();
+        let mut app = empty_app();
+        app.sessions.insert(
+            "web".to_string(),
+            ProjectSession {
+                tabs: vec![claude_tab("c")],
+                ..Default::default()
+            },
+        );
+        app.add_markdown_tab("web", path.clone()).unwrap();
+        app.sessions.get_mut("web").unwrap().active_tab = 0;
+        std::fs::write(&path, "# two").unwrap();
+        app.add_markdown_tab("web", path.clone()).unwrap();
+        let session = &app.sessions["web"];
+        assert_eq!(session.tabs.len(), 2, "no second tab for the same file");
+        assert_eq!(session.active_tab, 1, "and it is shown");
+        let Tab::Markdown(md) = &session.tabs[1] else {
+            panic!("not a markdown tab");
+        };
+        assert_eq!(md.source, "# two");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 pub mod form;
 pub mod modal;
 pub mod projects;
+pub mod prompt;
 pub mod review;
 
 use ratatui::Frame;
@@ -218,6 +219,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ModalState::PluginForm(m) => {
                 let cursor = m.render(area, frame.buffer_mut(), &theme);
                 frame.set_cursor_position(cursor);
+            }
+            ModalState::Prompt(m) => {
+                m.render(area, frame.buffer_mut(), &theme);
             }
         }
         return;
@@ -834,7 +838,7 @@ fn hint_tiers(app: &App) -> Vec<String> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum ModalState {
     Add(modal::AddProjectModal),
     OpenMarkdown(modal::OpenMarkdownModal),
@@ -844,6 +848,8 @@ pub enum ModalState {
     ClaudeTabPicker(modal::ClaudeTabPickerModal),
     UrlPicker(modal::UrlPickerModal),
     PluginForm(form::PluginFormModal),
+    /// A pane's process asking the user (`wrk confirm`).
+    Prompt(prompt::PromptModal),
 }
 
 #[cfg(test)]
