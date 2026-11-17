@@ -4,7 +4,7 @@
 //! `create`. wrk knows nothing of what the fields mean.
 //!
 //! ```text
-//! ┌ boxes: New session ───────────────────┐
+//! ╭ boxes: New session ───────────────────╮
 //! │Box                                     │
 //! │◂ dev-box ▸                        │
 //! │Project                                 │
@@ -13,7 +13,7 @@
 //! │web                               │
 //! │                                        │
 //! │Tab/↑↓ field  ←/→ choose  Enter create  │
-//! └────────────────────────────────────────┘
+//! ╰────────────────────────────────────────╯
 //! ```
 
 use std::collections::BTreeMap;
@@ -22,11 +22,11 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Clear, Paragraph, Widget, Wrap};
 use wrk_plugin::proto::{FieldKind, FormField, FormResponse};
 
 use super::modal::{centered_rect, field_style};
-use super::{cell_width, truncate_to_width};
+use super::{bordered, cell_width, truncate_to_width};
 use crate::settings::Theme;
 
 #[derive(Debug, Clone)]
@@ -219,9 +219,8 @@ impl PluginFormModal {
             Some(f) if !f.title.is_empty() => format!(" {}: {} ", self.heading, f.title),
             _ => format!(" {} ", self.heading),
         };
-        let block = Block::default()
+        let block = bordered(theme)
             .title(title)
-            .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.border_focused));
         let inner = block.inner(popup);
         block.render(popup, buf);

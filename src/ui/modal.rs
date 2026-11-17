@@ -2,10 +2,11 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+use ratatui::widgets::{Clear, Paragraph, Widget};
 
 use crate::session::DiscoveredSession;
 use crate::settings::{HarnessKind, Theme};
+use crate::ui::bordered;
 
 /// Single-field modal for opening a markdown file as a tab in the active
 /// project's primary pane.
@@ -19,9 +20,8 @@ impl OpenMarkdownModal {
     pub fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) -> Position {
         let popup = centered_rect(60, 20, area);
         Clear.render(popup, buf);
-        let block = Block::default()
+        let block = bordered(theme)
             .title(" open markdown ")
-            .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.border_focused));
         let inner = block.inner(popup);
         block.render(popup, buf);
@@ -154,9 +154,8 @@ impl AddProjectModal {
     pub fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) -> Position {
         let popup = centered_rect(60, 30, area);
         Clear.render(popup, buf);
-        let block = Block::default()
+        let block = bordered(theme)
             .title(" add project ")
-            .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.border_focused));
         let inner = block.inner(popup);
         block.render(popup, buf);
@@ -254,9 +253,8 @@ impl ConfirmDeleteModal {
     pub fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         let popup = centered_rect(50, 20, area);
         Clear.render(popup, buf);
-        let block = Block::default()
+        let block = bordered(theme)
             .title(" confirm delete ")
-            .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.error));
         let inner = block.inner(popup);
         block.render(popup, buf);
@@ -286,9 +284,8 @@ impl ConfirmUnloadModal {
     pub fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         let popup = centered_rect(50, 20, area);
         Clear.render(popup, buf);
-        let block = Block::default()
+        let block = bordered(theme)
             .title(" confirm unload ")
-            .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.error));
         let inner = block.inner(popup);
         block.render(popup, buf);
@@ -321,9 +318,8 @@ impl ConfirmQuitModal {
     pub fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         let popup = centered_rect(50, 20, area);
         Clear.render(popup, buf);
-        let block = Block::default()
+        let block = bordered(theme)
             .title(" quit wrk ")
-            .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.error));
         let inner = block.inner(popup);
         block.render(popup, buf);
@@ -521,9 +517,8 @@ impl ClaudeTabPickerModal {
         } else {
             " add claude session ".to_string()
         };
-        let block = Block::default()
+        let block = bordered(theme)
             .title(title)
-            .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.border_focused));
         let inner = block.inner(popup);
         block.render(popup, buf);
@@ -740,9 +735,8 @@ impl UrlPickerModal {
     pub fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) -> Position {
         let popup = centered_rect(70, 60, area);
         Clear.render(popup, buf);
-        let block = Block::default()
+        let block = bordered(theme)
             .title(" open url ")
-            .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.border_focused));
         let inner = block.inner(popup);
         block.render(popup, buf);

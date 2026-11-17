@@ -6,7 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Clear, Paragraph};
 
 use crate::App;
 use crate::review::diff::{DiffCell, FileStatus, RowKind};
@@ -14,7 +14,7 @@ use crate::review::{
     DiffRowHit, FileState, ReviewFocus, ReviewHitMap, ReviewSession, Side, VisualLine,
 };
 use crate::settings::Theme;
-use crate::ui::{cell_width, truncate_to_width};
+use crate::ui::{bordered, cell_width, truncate_to_width};
 
 /// Width of the line-number gutter on each side (digits only; a space follows).
 const NUM_W: usize = 4;
@@ -142,9 +142,8 @@ fn status_color(status: &FileStatus, theme: &Theme) -> Color {
 
 fn draw_file_list(frame: &mut Frame, area: Rect, review: &mut ReviewSession, theme: &Theme) {
     let focused = review.focus == ReviewFocus::Files;
-    let block = Block::default()
+    let block = bordered(theme)
         .title(" files ")
-        .borders(Borders::ALL)
         .border_style(border(focused, theme));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -232,9 +231,8 @@ fn draw_diff(frame: &mut Frame, area: Rect, review: &mut ReviewSession, theme: &
         Some(fs) => format!(" {} ", fs.file.path),
         None => " review ".to_string(),
     };
-    let block = Block::default()
+    let block = bordered(theme)
         .title(title)
-        .borders(Borders::ALL)
         .border_style(border(focused, theme));
     let inner = block.inner(area);
     frame.render_widget(block, area);
