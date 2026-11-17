@@ -74,7 +74,8 @@ project. Linux-only, native rendering (via your terminal), built on
   [docs/widgets.md](docs/widgets.md) and the GitHub pull-request widget in
   [examples/widgets](examples/widgets/github-prs.sh).
 - **Mouse**: click panes / tabs / projects to focus, double-click a project to
-  open it, scroll wheel paginates the alacritty scrollback (10k lines).
+  open it, scroll wheel paginates the alacritty scrollback (10k lines) and
+  scrolls the project list when the pointer is over it.
   **Ctrl+click** (or **Shift+click**, if your outer terminal swallows Ctrl) on
   a URL in a claude or shell pane opens it in the browser (`xdg-open`). Works
   for OSC 8 hyperlinks and plain `http(s)://` / `ftp://` URLs. For keyboard
@@ -196,9 +197,11 @@ wrk-md --print --width 80 F # force a wrap width for --print (else terminal widt
 | `wrk add <path> [--name N]` | append to `projects.toml` |
 | `wrk rm <name>` | remove from `projects.toml` |
 | `wrk view <file>` | open a markdown file — as a tab in the running wrk (from inside a pane), else in the `wrk-md` pager |
+| `wrk confirm <question> [line…] [--accept L] [--decline L]` | ask the user a yes/no question in the running wrk (from inside a pane); exits 0 yes, 1 no, 2 no wrk to ask |
+| `wrk notify <message> [--error]` | show a message in the running wrk's status bar (from inside a pane) |
 | `wrk install-hooks` | install wrk's status hooks + skills for each enabled harness (Claude → `~/.claude`; Kimi → `~/.kimi-code`) |
 | `wrk uninstall-hooks` | remove them from every harness |
-| `wrk api …` | drive the running wrk from a widget or script: `sessions`, `send`, `focus`, `notify`, `dismiss`, `show`, `hide` (see [docs/widgets.md](docs/widgets.md)) |
+| `wrk api …` | drive the running wrk from a widget or script: `sessions`, `send`, `focus`, `banner`, `dismiss`, `show`, `hide` (see [docs/widgets.md](docs/widgets.md)) |
 
 ### Letting Claude open files
 
@@ -208,7 +211,21 @@ pane, wrk opens the file as a markdown tab in that project (over a per-instance
 Unix socket exported to the pane as `WRK_SOCK`, with `WRK_PROJECT` naming the
 project). Ask Claude to "preview the README" and it renders in a tab beside the
 conversation. Run the same command in a plain shell and it opens the `wrk-md`
-pager instead.
+pager instead. Viewing a file that is already open in that project reloads its
+tab and shows it, rather than opening a second one.
+
+### Asking before acting
+
+A process in one of wrk's panes can ask the user before doing something on
+their behalf: `wrk confirm "Download 3 files?" "report.md  12 KB" --accept
+download` shows a prompt, waits, and exits 0 if they press `y` (1 for `n` or
+Esc). The prompt names the project it came from. Prompts queue one at a time,
+and keys pressed in a prompt's first moments are ignored, so a keystroke meant
+for a pane isn't taken as the answer. A requester that gives up (exits, or
+closes its connection) withdraws its prompt. `wrk notify <message>` reports
+back in the status bar. Plugins speak the same socket protocol directly: a
+`{"cmd":"confirm","title":…,"lines":[…]}` line on `WRK_SOCK`, answered with
+`{"accepted":true|false}` on the same connection.
 
 ## Keybindings (in the TUI)
 
@@ -386,6 +403,7 @@ status_waiting    = "#5faf87"   # sidebar/tab dot: claude has finished (Stop)
 status_busy       = "#d7af00"   # sidebar/tab dot: claude is processing
 status_attention  = "#ff5f5f"   # sidebar/tab dot: claude needs attention
 focus_indicator   = "yellow"    # `[focus]` label in the status bar
+rounded           = true        # rounded box corners; false for square ones
 
 # Optional colors for the markdown viewer (Alt+m tabs and `wrk-md`).
 # Same color syntax as [theme]; anything unset keeps the built-in default.

@@ -1,12 +1,12 @@
 //! Notification banners. Anything that can reach wrk's socket — a widget, a
-//! hook, a script (`wrk api notify`) — can post one. The newest shows on the
+//! hook, a script (`wrk api banner`) — can post one. The newest shows on the
 //! screen's top row (over the pane borders, so nothing resizes) until it's
 //! opened, dismissed, or its `ttl` runs out; opening one shows what it points
 //! at (a session, a project, or a widget).
 
 use std::time::{Duration, Instant};
 
-use crate::ipc::NotifyRequest;
+use crate::ipc::BannerRequest;
 
 /// The banner's rightmost cells (` ✕ `): a click there dismisses instead of
 /// opening.
@@ -62,7 +62,7 @@ pub struct Notifications {
 
 impl Notifications {
     /// Queue a notification; returns its id (for `dismiss`).
-    pub fn push(&mut self, req: NotifyRequest, now: Instant) -> u64 {
+    pub fn push(&mut self, req: BannerRequest, now: Instant) -> u64 {
         self.next_id += 1;
         let target = match (req.session, req.project, req.widget) {
             (Some(s), _, _) => NotifyTarget::Session(s),
@@ -118,8 +118,8 @@ impl Notifications {
 mod tests {
     use super::*;
 
-    fn req(title: &str) -> NotifyRequest {
-        NotifyRequest {
+    fn req(title: &str) -> BannerRequest {
+        BannerRequest {
             title: title.into(),
             body: None,
             session: None,
@@ -149,7 +149,7 @@ mod tests {
         let now = Instant::now();
         let mut n = Notifications::default();
         n.push(
-            NotifyRequest {
+            BannerRequest {
                 session: Some("tab1".into()),
                 project: Some("wrk".into()),
                 ..req("x")
@@ -161,7 +161,7 @@ mod tests {
             NotifyTarget::Session("tab1".into())
         );
         n.push(
-            NotifyRequest {
+            BannerRequest {
                 project: Some("wrk".into()),
                 widget: Some("prs".into()),
                 ..req("x")
@@ -181,7 +181,7 @@ mod tests {
         let now = Instant::now();
         let mut n = Notifications::default();
         n.push(
-            NotifyRequest {
+            BannerRequest {
                 ttl: Some(5),
                 ..req("brief")
             },
@@ -211,7 +211,7 @@ mod tests {
         let now = Instant::now();
         let mut n = Notifications::default();
         n.push(
-            NotifyRequest {
+            BannerRequest {
                 body: Some("line one\nline two".into()),
                 ..req("CI\tdone")
             },

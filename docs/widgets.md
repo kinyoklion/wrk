@@ -56,15 +56,20 @@ A widget's environment:
 
 ## Notifications
 
-`wrk api notify` posts a banner across the top row of the screen. It covers
+`wrk api banner` posts a banner across the top row of the screen. It covers
 the pane borders, so nothing below it moves. A notification can point at a
 session, a project or a widget. Clicking the banner (or `Alt+o`) opens that
 target; its `✕` (or `Alt+c`) dismisses it. A `--ttl` makes it go away on its
 own. If several are queued, the newest shows, with a `+N` count.
 
 ```sh
-"$WRK_BIN" api notify "CI passed on #12" --body "ready to merge" --session "$WRK_TAB"
+"$WRK_BIN" api banner "CI passed on #12" --body "ready to merge" --session "$WRK_TAB"
 ```
+
+Two lighter-weight commands also work from a widget (see the README):
+`wrk notify <message>` shows a one-line message in the status bar, with
+nothing to click, and `wrk confirm <question>` asks the user yes or no and
+exits 0 or 1 with the answer.
 
 ## The API
 
@@ -75,7 +80,7 @@ own. If several are queued, the newest shows, with a `+N` count.
 | `wrk api sessions [--json]` | The open projects' sessions, one per line: `id`, `kind`, `project`, `name`, `status` (tab-separated). `--json` prints every field. |
 | `wrk api send <session> [text…] [--submit] [--focus]` | Types the text into the session as a paste (bracketed when the program asked for that, so multi-line text arrives whole). With no text arguments it reads stdin, without its final newline. `--submit` presses Enter after a short pause. `--focus` switches to the session and hides the widget. |
 | `wrk api focus <session>` | Switches to a session: opens its project on that tab and focuses it. |
-| `wrk api notify <title> [--body B] [--session S \| --project P \| --widget W] [--ttl SECS]` | Posts a banner and prints its id. |
+| `wrk api banner <title> [--body B] [--session S \| --project P \| --widget W] [--ttl SECS]` | Posts a notification banner and prints its id. |
 | `wrk api dismiss <id>` | Takes a notification down. |
 | `wrk api show <widget>` | Shows a widget, starting it if needed. |
 | `wrk api hide` | Hides the widget on screen. |
@@ -115,7 +120,7 @@ printf '%s\n' '{"cmd":"sessions"}' | socat - "UNIX-CONNECT:$WRK_SOCK"
 | `{"cmd":"sessions"}` | `{"sessions":[…]}` |
 | `{"cmd":"send","session":"tab0","text":"…","submit":false,"focus":false}` | `{}` |
 | `{"cmd":"focus","session":"tab0"}` | `{}` |
-| `{"cmd":"notify","title":"…","body":"…","session":"…","project":"…","widget":"…","ttl":30}` | `{"id":1}` |
+| `{"cmd":"banner","title":"…","body":"…","session":"…","project":"…","widget":"…","ttl":30}` | `{"id":1}` |
 | `{"cmd":"dismiss","id":1}` | `{}` |
 | `{"cmd":"show","widget":"prs"}` / `{"cmd":"hide"}` | `{}` |
 

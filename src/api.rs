@@ -15,7 +15,7 @@ use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::ipc::{self, Reply, Request};
+use crate::ipc::{self, ApiReply, Request};
 use crate::notifications::NotifyTarget;
 use crate::pane::terminal::PtyPane;
 use crate::ui::projects::ProjectStatus;
@@ -29,7 +29,7 @@ const SUBMIT_DELAY: Duration = Duration::from_millis(150);
 /// One session, as `sessions` lists it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEntry {
-    /// What `send`, `focus` and `notify --session` take. An agent tab's id is
+    /// What `send`, `focus` and `banner --session` take. An agent tab's id is
     /// its `WRK_TAB`; a project's shell is `shell:<project>`; a markdown tab is
     /// `md:<project>:<index>`.
     pub id: String,
@@ -78,17 +78,18 @@ fn status_name(status: ProjectStatus) -> &'static str {
 
 impl App {
     /// Route a request drained from the socket: answer an API request, or hand
-    /// a fire-and-forget one (`wrk view` / `hook` / `review`) to its handler.
+    /// any other (`wrk view` / `hook` / `review` / `confirm` / `notify`) to
+    /// `handle_request` along with its connection.
     pub(crate) fn handle_incoming(&mut self, incoming: ipc::Incoming, body: Rect) {
-        if incoming.reply.is_none() {
-            self.handle_request(incoming.request);
+        if !incoming.request.is_api() {
+            self.handle_request(incoming.request, incoming.reply);
             return;
         }
         let answer = self.handle_api(incoming.request.clone(), body);
         incoming.respond(answer);
     }
 
-    fn handle_api(&mut self, request: Request, body: Rect) -> Reply {
+    fn handle_api(&mut self, request: Request, body: Rect) -> ApiReply {
         match request {
             Request::Sessions => Ok(json!({ "sessions": self.list_sessions() })),
             Request::Send(req) => {
@@ -108,7 +109,7 @@ impl App {
                 self.focus_target(&target, body);
                 Ok(json!({}))
             }
-            Request::Notify(req) => {
+            Request::Banner(req) => {
                 if req.title.trim().is_empty() {
                     return Err("a notification needs a title".into());
                 }
@@ -130,12 +131,8 @@ impl App {
                 self.hide_widget();
                 Ok(json!({}))
             }
-            // Fire-and-forget requests never carry a reply channel, but answer
-            // sensibly should one arrive here anyway.
-            other => {
-                self.handle_request(other);
-                Ok(json!({}))
-            }
+            // `handle_incoming` only routes API requests here.
+            other => Err(format!("not an API request: {other:?}")),
         }
     }
 
@@ -359,8 +356,9 @@ pub enum ApiAction {
     /// Show a session: open its project on it and focus it.
     Focus { session: String },
     /// Post a notification banner; prints its id. Activating it (click, or
-    /// the open-notification key) shows its target.
-    Notify {
+    /// the open-notification key) shows its target. (For a one-line
+    /// status-bar message, use `wrk notify`.)
+    Banner {
         title: String,
         #[arg(long)]
         body: Option<String>,
@@ -377,7 +375,7 @@ pub enum ApiAction {
         #[arg(long, value_name = "SECS")]
         ttl: Option<u64>,
     },
-    /// Dismiss a notification by the id `notify` printed.
+    /// Dismiss a notification banner by the id `banner` printed.
     Dismiss { id: u64 },
     /// Show a widget, starting it if needed.
     Show { widget: String },
@@ -432,7 +430,7 @@ pub fn cmd_api(action: ApiAction) -> Result<()> {
         ApiAction::Focus { session } => {
             call(Request::Focus(ipc::FocusRequest { session }))?;
         }
-        ApiAction::Notify {
+        ApiAction::Banner {
             title,
             body,
             session,
@@ -440,7 +438,7 @@ pub fn cmd_api(action: ApiAction) -> Result<()> {
             widget,
             ttl,
         } => {
-            let reply = call(Request::Notify(ipc::NotifyRequest {
+            let reply = call(Request::Banner(ipc::BannerRequest {
                 title,
                 body,
                 session,
@@ -482,7 +480,7 @@ fn tsv_row(s: &SessionEntry) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::ipc::{FocusRequest, NotifyRequest, SendRequest};
+    use crate::ipc::{BannerRequest, FocusRequest, SendRequest};
     use crate::settings::{HarnessKind, Settings};
     use crate::store::{Project, ProjectStore};
     use crate::{ClaudeTab, MarkdownTab, PluginAttach, ProjectSession};
@@ -604,7 +602,7 @@ pub(crate) mod tests {
         app
     }
 
-    fn api(app: &mut App, req: Request) -> Reply {
+    fn api(app: &mut App, req: Request) -> ApiReply {
         app.handle_api(req, BODY)
     }
 
@@ -721,7 +719,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = open_app(dir.path());
         let notify = |session: Option<&str>, project: Option<&str>| {
-            Request::Notify(NotifyRequest {
+            Request::Banner(BannerRequest {
                 title: "PR #12 is green".into(),
                 body: None,
                 session: session.map(String::from),

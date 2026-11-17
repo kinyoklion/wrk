@@ -1,6 +1,7 @@
 pub mod form;
 pub mod modal;
 pub mod projects;
+pub mod prompt;
 pub mod review;
 
 use ratatui::Frame;
@@ -226,6 +227,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 let cursor = m.render(area, frame.buffer_mut(), &theme);
                 frame.set_cursor_position(cursor);
             }
+            ModalState::Prompt(m) => {
+                m.render(area, frame.buffer_mut(), &theme);
+            }
         }
         return;
     }
@@ -313,10 +317,7 @@ fn draw_primary_pane(frame: &mut Frame, area: Rect, focused: bool, app: &mut App
     } else {
         theme.border_unfocused
     });
-    let block = Block::default()
-        .title(" claude ")
-        .borders(Borders::ALL)
-        .border_style(border_style);
+    let block = bordered(theme).title(" claude ").border_style(border_style);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -571,10 +572,7 @@ fn draw_terminal_pane(
     } else {
         theme.border_unfocused
     });
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(border_style);
+    let block = bordered(theme).title(title).border_style(border_style);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -611,8 +609,7 @@ fn draw_widget(
             theme.border_focused,
         ),
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = bordered(theme)
         .border_style(Style::default().fg(color))
         .title(format!(" {} ", app.widget_title(&w.key)))
         .title(Line::from(hint).right_aligned());
@@ -831,6 +828,12 @@ fn choose_message(tiers: &[String], budget: usize) -> String {
     }
 }
 
+/// A box with a border on every side, in the theme's line style (rounded by
+/// default). Every bordered pane and dialog starts from this so they match.
+pub(crate) fn bordered<'a>(theme: &Theme) -> Block<'a> {
+    Block::bordered().border_type(theme.border_type)
+}
+
 /// Display width of `s` in terminal cells (accounts for wide/zero-width chars).
 pub(crate) fn cell_width(s: &str) -> usize {
     Span::raw(s).width()
@@ -925,7 +928,7 @@ fn hint_tiers(app: &App) -> Vec<String> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum ModalState {
     Add(modal::AddProjectModal),
     OpenMarkdown(modal::OpenMarkdownModal),
@@ -937,6 +940,8 @@ pub enum ModalState {
     /// Choosing a widget to summon (the URL picker's list, retitled).
     WidgetPicker(modal::UrlPickerModal),
     PluginForm(form::PluginFormModal),
+    /// A pane's process asking the user (`wrk confirm`).
+    Prompt(prompt::PromptModal),
 }
 
 #[cfg(test)]
