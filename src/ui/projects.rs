@@ -156,6 +156,11 @@ pub struct ProjectSidebar {
     /// The query `rows` were last built with. A changed, non-empty query moves
     /// the selection to the best match instead of keeping it in place.
     built_query: String,
+    /// Set by the mouse wheel ([`ProjectSidebar::scroll_by`]): the selected
+    /// row the view was scrolled away from. While the selection is still that
+    /// row the scrolled view holds, even with the selection off-screen; any
+    /// selection change drops it, so the list follows the selection again.
+    scrolled_from: Option<usize>,
 }
 
 impl Default for ProjectSidebar {
@@ -167,6 +172,7 @@ impl Default for ProjectSidebar {
             rows: Vec::new(),
             active: None,
             built_query: String::new(),
+            scrolled_from: None,
         }
     }
 }
@@ -267,6 +273,21 @@ impl ProjectSidebar {
         self.state.select(Some(i));
     }
 
+    /// Scroll the list `delta` rows (positive = down) for the sidebar drawn in
+    /// `area`, leaving the selection alone: the mouse wheel. The selection
+    /// can't move instead, since while focus is elsewhere it follows the shown
+    /// tab and would be reset on the next frame.
+    pub fn scroll_by(&mut self, area: Rect, delta: isize) {
+        let Some(selected) = self.state.selected() else {
+            return;
+        };
+        let height = self.list_area(area).height as usize;
+        let max = self.rows.len().saturating_sub(height);
+        let offset = self.state.offset().saturating_add_signed(delta).min(max);
+        *self.state.offset_mut() = offset;
+        self.scrolled_from = Some(selected);
+    }
+
     /// The row index under screen row `y` for a sidebar drawn in `area`.
     pub fn row_at(&self, area: Rect, y: u16) -> Option<usize> {
         let list = self.list_area(area);
@@ -352,7 +373,28 @@ impl ProjectSidebar {
                 .bg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         );
-        StatefulWidget::render(list, list_area, buf, &mut self.state);
+        if self.scrolled_from.is_some() && self.scrolled_from == self.state.selected() {
+            // Wheel-scrolled: hold the offset. `List` would pull the selection
+            // back into view, so draw from a copy that only carries the
+            // selection when it is on-screen.
+            let height = list_area.height as usize;
+            let offset = self
+                .state
+                .offset()
+                .min(self.rows.len().saturating_sub(height));
+            let selected = self
+                .state
+                .selected()
+                .filter(|&i| i >= offset && i < offset + height);
+            let mut view = ListState::default()
+                .with_offset(offset)
+                .with_selected(selected);
+            StatefulWidget::render(list, list_area, buf, &mut view);
+            *self.state.offset_mut() = offset;
+        } else {
+            self.scrolled_from = None;
+            StatefulWidget::render(list, list_area, buf, &mut self.state);
+        }
         cursor
     }
 
@@ -775,6 +817,58 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    /// Twenty projects in a sidebar showing eight rows (ten tall, minus borders).
+    fn long_sidebar() -> (ProjectSidebar, Vec<Project>, Rect) {
+        let names: Vec<String> = (0..20).map(|i| format!("p{i:02}")).collect();
+        let projects = store(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        let mut sb = ProjectSidebar::default();
+        sb.rebuild(&local(&projects), view);
+        (sb, projects, Rect::new(0, 0, 20, 10))
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_list_without_moving_the_selection() {
+        let (mut sb, projects, area) = long_sidebar();
+        rendered(&mut sb, area);
+        assert_eq!(sb.state.selected(), Some(0));
+
+        sb.scroll_by(area, 3);
+        let rows = rendered(&mut sb, area);
+        assert!(rows[1].starts_with("│p03"), "scrolled 3 rows: {rows:?}");
+        assert_eq!(sb.state.selected(), Some(0), "selection unchanged");
+        assert_eq!(sb.row_at(area, 1), Some(3), "clicks map through the scroll");
+
+        // Rebuilding each frame (as the app does) keeps the scrolled view.
+        sb.rebuild(&local(&projects), view);
+        assert!(rendered(&mut sb, area)[1].starts_with("│p03"));
+
+        // Scrolling clamps at both ends.
+        sb.scroll_by(area, 100);
+        let rows = rendered(&mut sb, area);
+        assert!(
+            rows[8].starts_with("│p19"),
+            "last row at the bottom: {rows:?}"
+        );
+        assert_eq!(sb.state.offset(), 12);
+        sb.scroll_by(area, -100);
+        assert!(rendered(&mut sb, area)[1].starts_with("│p00"));
+    }
+
+    #[test]
+    fn moving_the_selection_brings_it_back_into_view_after_a_wheel_scroll() {
+        let (mut sb, _projects, area) = long_sidebar();
+        rendered(&mut sb, area);
+        sb.scroll_by(area, 10);
+        rendered(&mut sb, area);
+        assert_eq!(sb.state.offset(), 10);
+
+        // The selection (row 0) is off-screen; moving it snaps the view back.
+        sb.select_next();
+        let rows = rendered(&mut sb, area);
+        assert_eq!(sb.state.offset(), 1, "row 1 is the first visible row");
+        assert!(rows[1].starts_with("│p01"), "{rows:?}");
     }
 
     #[test]

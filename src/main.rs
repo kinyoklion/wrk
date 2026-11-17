@@ -3631,12 +3631,18 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
         return;
     }
 
-    // Sidebar clicks always belong to us, never to a PTY.
+    // Sidebar clicks always belong to us, never to a PTY. The wheel scrolls
+    // the list without moving the selection.
     if let Some(sidebar) = layout.sidebar
         && rect_contains(sidebar, pos_x, pos_y)
     {
-        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
-            handle_sidebar_click(app, sidebar, pos_y, body);
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                handle_sidebar_click(app, sidebar, pos_y, body);
+            }
+            MouseEventKind::ScrollDown => app.sidebar.scroll_by(sidebar, SCROLL_LINES as isize),
+            MouseEventKind::ScrollUp => app.sidebar.scroll_by(sidebar, -(SCROLL_LINES as isize)),
+            _ => {}
         }
         return;
     }
