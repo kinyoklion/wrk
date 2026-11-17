@@ -671,6 +671,8 @@ impl ClaudeTabPickerModal {
 /// selection state, and the caller reads `confirmed_url` after Enter.
 #[derive(Debug, Clone)]
 pub struct UrlPickerModal {
+    /// Shown on the border (the same filtered list also picks widgets).
+    pub title: &'static str,
     pub all: Vec<String>,
     pub query: String,
     pub filtered: Vec<usize>,
@@ -680,9 +682,15 @@ pub struct UrlPickerModal {
 
 impl UrlPickerModal {
     pub fn new(urls: Vec<String>) -> Self {
-        let filtered = (0..urls.len()).collect();
+        Self::titled(urls, " open url ")
+    }
+
+    /// A picker over `items` with a custom border title.
+    pub fn titled(items: Vec<String>, title: &'static str) -> Self {
+        let filtered = (0..items.len()).collect();
         Self {
-            all: urls,
+            title,
+            all: items,
             query: String::new(),
             filtered,
             selected: 0,
@@ -736,7 +744,7 @@ impl UrlPickerModal {
         let popup = centered_rect(70, 60, area);
         Clear.render(popup, buf);
         let block = bordered(theme)
-            .title(" open url ")
+            .title(self.title)
             .border_style(Style::default().fg(theme.border_focused));
         let inner = block.inner(popup);
         block.render(popup, buf);

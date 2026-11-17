@@ -65,6 +65,11 @@ pub struct Settings {
     /// default, so wrk with no `[plugin.*]` tables behaves exactly as before.
     #[serde(default)]
     pub plugin: BTreeMap<String, PluginConfig>,
+    /// Widget registry (`[widget.<name>]`): terminal programs wrk can summon
+    /// into a floating overlay, which drive wrk through `wrk api` (list
+    /// sessions, send text, post notifications). See `src/widget.rs`.
+    #[serde(default)]
+    pub widget: BTreeMap<String, WidgetConfig>,
 }
 
 fn default_true() -> bool {
@@ -83,6 +88,7 @@ impl Default for Settings {
             default_harness: HarnessKind::default(),
             harness: HarnessTable::default(),
             plugin: BTreeMap::new(),
+            widget: BTreeMap::new(),
         }
     }
 }
@@ -178,6 +184,38 @@ pub struct PluginConfig {
     /// Requests run off the UI thread, so this can be generous enough for a
     /// plugin that does real work — e.g. provisioning a box — before replying.
     pub request_timeout: Option<u64>,
+}
+
+/// One `[widget.<name>]` entry: a terminal program wrk runs in a floating
+/// overlay. The program draws its own UI and talks back through `wrk api`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct WidgetConfig {
+    /// Command (+ args) to run. Required; an entry without one is skipped.
+    pub command: Vec<String>,
+    /// Shown on the overlay's border (default: the widget's name).
+    pub title: Option<String>,
+    /// Optional key that summons this widget directly (e.g. `"Alt+r"`), in
+    /// the same syntax as `[keys.global]`.
+    pub key: Option<String>,
+    /// `project` (default): one instance per project, run in that project's
+    /// directory with `WRK_PROJECT` set. `global`: a single instance.
+    pub scope: WidgetScope,
+    /// Working directory for a `global` widget (a leading `~` is expanded;
+    /// default `$HOME`). A `project` widget always runs in its project's dir.
+    pub cwd: Option<String>,
+    /// Start a `global` widget hidden when wrk starts, so it can post
+    /// notifications before it's first summoned.
+    pub autostart: bool,
+}
+
+/// Whether a widget runs once per project or once for the whole app.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WidgetScope {
+    #[default]
+    Project,
+    Global,
 }
 
 impl PluginConfig {
@@ -601,6 +639,9 @@ pub struct GlobalKeysConfig {
     pub open_link_picker: Option<String>,
     pub enter_select_mode: Option<String>,
     pub dump_grid: Option<String>,
+    pub widgets: Option<String>,
+    pub open_notification: Option<String>,
+    pub clear_notification: Option<String>,
 }
 
 impl crate::keymap::GlobalKeysSource for GlobalKeysConfig {
@@ -624,6 +665,9 @@ impl crate::keymap::GlobalKeysSource for GlobalKeysConfig {
             GlobalAction::OpenLinkPicker => &self.open_link_picker,
             GlobalAction::EnterSelectMode => &self.enter_select_mode,
             GlobalAction::DumpGrid => &self.dump_grid,
+            GlobalAction::Widgets => &self.widgets,
+            GlobalAction::OpenNotification => &self.open_notification,
+            GlobalAction::ClearNotification => &self.clear_notification,
         };
         s.as_deref()
     }

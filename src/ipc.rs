@@ -8,15 +8,21 @@
 //! becomes a markdown tab, `wrk hook <kind>` (from Claude Code hooks) sends a
 //! [`Request::Status`] that updates the originating tab's sidebar status, and
 //! `wrk notify` sends a [`Request::Notify`] for the status bar. A
-//! [`Request::Confirm`] (`wrk confirm`) is the one that gets an answer: wrk
-//! asks the user, then writes one [`ConfirmReply`] line back on the same
-//! connection. The server accepts one request per connection and forwards it,
-//! with the connection, to the event loop over a channel.
+//! [`Request::Confirm`] (`wrk confirm`) gets an answer: wrk asks the user, then
+//! writes one [`ConfirmReply`] line back on the same connection. The server
+//! accepts one request per connection and forwards it, with the connection, to
+//! the event loop over a channel.
+//!
+//! The **API** requests (`wrk api …`, used by widgets and scripts — see
+//! [`Request::is_api`]) are answered too: the event loop handles them and
+//! writes one line of JSON back, `{"ok":true,…}` or `{"ok":false,"error":"…"}`
+//! ([`Reply::respond`]), before closing.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -39,6 +45,39 @@ pub enum Request {
     Confirm(ConfirmRequest),
     /// Show a message in the status bar (`wrk notify`).
     Notify(NotifyRequest),
+    /// API: list the running sessions. Replies `{"sessions":[…]}`.
+    Sessions,
+    /// API: type text into a session.
+    Send(SendRequest),
+    /// API: show a session (open its project and tab, focus it).
+    Focus(FocusRequest),
+    /// API: post a notification banner. Replies `{"id":N}`.
+    Banner(BannerRequest),
+    /// API: dismiss a notification banner by id.
+    Dismiss(DismissRequest),
+    /// API: summon a widget.
+    Show(ShowRequest),
+    /// API: hide the widget on screen.
+    Hide,
+}
+
+impl Request {
+    /// Whether this is an API request (`wrk api …`), answered with an
+    /// `{"ok":…}` line through [`Reply::respond`]. The others are
+    /// fire-and-forget, except a [`Request::Confirm`], which has its own
+    /// answer ([`Reply::answer`]).
+    pub fn is_api(&self) -> bool {
+        matches!(
+            self,
+            Request::Sessions
+                | Request::Send(_)
+                | Request::Focus(_)
+                | Request::Banner(_)
+                | Request::Dismiss(_)
+                | Request::Show(_)
+                | Request::Hide
+        )
+    }
 }
 
 /// A yes/no question for the user, from a process in one of wrk's panes (a
@@ -83,11 +122,30 @@ pub struct NotifyRequest {
 }
 
 /// One request off the socket, with the connection it came on (kept open for
-/// the answer to a [`Request::Confirm`]; dropping it closes the connection).
+/// the answer to a [`Request::Confirm`] or an API request; dropping it closes
+/// the connection).
 pub struct Incoming {
     pub request: Request,
     pub reply: Reply,
 }
+
+impl Incoming {
+    /// Answer an API request (see [`Reply::respond`]).
+    pub fn respond(mut self, reply: ApiReply) {
+        self.reply.respond(reply);
+    }
+}
+
+/// The answer to an API request: a JSON object (sent with `"ok": true`), or
+/// an error message.
+pub type ApiReply = Result<serde_json::Value, String>;
+
+/// How long the event loop may block writing an answer, so a requester that
+/// stops reading can't wedge the UI thread.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long `call` waits for the reply line.
+const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The connection a request came on, for writing the one answer back.
 #[derive(Debug, Default)]
@@ -103,10 +161,26 @@ impl Reply {
     /// Answer a confirm and close the connection. Best effort: a requester
     /// that already left just misses it.
     pub fn answer(&mut self, accepted: bool) {
+        let line = serde_json::to_string(&ConfirmReply { accepted }).unwrap_or_default();
+        self.write_line(&line);
+    }
+
+    /// Answer an API request with `{"ok":true,…body}` or
+    /// `{"ok":false,"error":…}` and close the connection.
+    pub fn respond(&mut self, reply: ApiReply) {
+        let line = match reply {
+            Ok(body) => ok_line(body),
+            Err(message) => error_line(message),
+        };
+        self.write_line(&line);
+    }
+
+    /// Write the one answer line and close. Best effort: a requester that
+    /// already left just misses it.
+    fn write_line(&mut self, line: &str) {
         if let Some(mut conn) = self.conn.take() {
-            let mut line = serde_json::to_string(&ConfirmReply { accepted }).unwrap_or_default();
-            line.push('\n');
-            let _ = conn.write_all(line.as_bytes());
+            let _ = conn.set_write_timeout(Some(WRITE_TIMEOUT));
+            let _ = writeln!(conn, "{line}");
         }
     }
 
@@ -129,6 +203,56 @@ impl Reply {
         let _ = conn.set_nonblocking(false);
         gone
     }
+}
+
+/// Type `text` into a session's terminal, as if pasted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendRequest {
+    /// Session id, as listed by `sessions`.
+    pub session: String,
+    pub text: String,
+    /// Press Enter after the text (sent a moment later, so the program has
+    /// taken the paste first).
+    #[serde(default)]
+    pub submit: bool,
+    /// Also show the session (and hide the widget on screen).
+    #[serde(default)]
+    pub focus: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FocusRequest {
+    pub session: String,
+}
+
+/// A notification banner (`wrk api banner`). Activating it opens its target:
+/// the session if set, else the project, else the widget; with none it only
+/// dismisses. Not to be confused with [`NotifyRequest`], a one-line status-bar
+/// message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BannerRequest {
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub widget: Option<String>,
+    /// Seconds until it disappears on its own; unset → until dismissed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DismissRequest {
+    pub id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShowRequest {
+    pub widget: String,
 }
 
 /// A request to open a file in a running wrk instance.
@@ -248,7 +372,11 @@ pub fn sweep_stale_sockets() {
 pub fn serve() -> Result<(PathBuf, Receiver<Incoming>)> {
     let dir = socket_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let path = socket_path(std::process::id());
+    serve_at(socket_path(std::process::id()))
+}
+
+/// [`serve`] on an explicit path (tests bind under a temp dir).
+fn serve_at(path: PathBuf) -> Result<(PathBuf, Receiver<Incoming>)> {
     // A stale socket from a crashed prior instance with the same pid would make
     // bind fail with EADDRINUSE; clear it first.
     let _ = std::fs::remove_file(&path);
@@ -277,14 +405,78 @@ pub fn serve() -> Result<(PathBuf, Receiver<Incoming>)> {
 }
 
 /// The connection's one request line. A client that never finishes it is
-/// given up on after a while, so its thread doesn't linger.
+/// given up on after a while, so its thread doesn't linger. A malformed line
+/// is answered with an error (an API caller is waiting to hear why) and
+/// dropped; an empty one — a liveness probe — is dropped silently.
 fn read_request(stream: &UnixStream) -> Option<Request> {
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line).ok()?;
     let _ = stream.set_read_timeout(None);
-    serde_json::from_str(line.trim()).ok()
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    match serde_json::from_str(line) {
+        Ok(request) => Some(request),
+        Err(e) => {
+            let mut stream = stream;
+            let _ = writeln!(stream, "{}", error_line(format!("malformed request: {e}")));
+            None
+        }
+    }
+}
+
+fn ok_line(body: serde_json::Value) -> String {
+    let mut reply = serde_json::Map::new();
+    reply.insert("ok".into(), true.into());
+    if let serde_json::Value::Object(fields) = body {
+        reply.extend(fields);
+    }
+    serde_json::Value::Object(reply).to_string()
+}
+
+fn error_line(message: impl std::fmt::Display) -> String {
+    serde_json::json!({ "ok": false, "error": message.to_string() }).to_string()
+}
+
+/// Client side of an API request: send it, wait for the reply line, and
+/// return its body (the `ok` envelope removed) or the error wrk reported.
+pub fn call(sock: &Path, req: &Request) -> Result<serde_json::Value> {
+    let mut stream =
+        UnixStream::connect(sock).with_context(|| format!("connecting to {}", sock.display()))?;
+    stream.set_read_timeout(Some(CALL_TIMEOUT))?;
+    let mut payload = serde_json::to_string(req)?;
+    payload.push('\n');
+    stream.write_all(payload.as_bytes())?;
+    stream.flush()?;
+    let mut line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .context("reading wrk's reply")?;
+    parse_reply(&line)
+}
+
+/// Unwrap a reply line: the body of an `ok` reply, or its error as `Err`.
+fn parse_reply(line: &str) -> Result<serde_json::Value> {
+    let line = line.trim();
+    if line.is_empty() {
+        anyhow::bail!("wrk closed the connection without replying");
+    }
+    let mut value: serde_json::Value =
+        serde_json::from_str(line).with_context(|| format!("malformed reply: {line}"))?;
+    let Some(fields) = value.as_object_mut() else {
+        anyhow::bail!("malformed reply: {line}");
+    };
+    if fields.remove("ok").and_then(|ok| ok.as_bool()) != Some(true) {
+        let message = fields
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("wrk reported an unspecified error");
+        anyhow::bail!("{message}");
+    }
+    Ok(value)
 }
 
 /// Client side: connect to `sock` and send one request. Fails fast when the
@@ -473,6 +665,12 @@ mod tests {
         let mut reply = Reply::new(ours);
         assert!(!reply.withdrawn());
         drop(theirs);
+        // A concurrent test forking a child briefly holds copies of every fd
+        // (until its exec), which can delay the EOF: poll.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !reply.withdrawn() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(reply.withdrawn());
         // Answering a requester that left is harmless.
         reply.answer(false);
@@ -509,6 +707,119 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(!socket_is_live(&path));
+    }
+
+    #[test]
+    fn api_requests_use_flat_cmd_tagged_json() {
+        let send: Request =
+            serde_json::from_str(r#"{"cmd":"send","session":"tab3","text":"hi","submit":true}"#)
+                .unwrap();
+        assert_eq!(
+            send,
+            Request::Send(SendRequest {
+                session: "tab3".into(),
+                text: "hi".into(),
+                submit: true,
+                focus: false,
+            })
+        );
+        assert!(send.is_api());
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"cmd":"sessions"}"#).unwrap(),
+            Request::Sessions
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::Hide).unwrap(),
+            r#"{"cmd":"hide"}"#
+        );
+        let banner: Request = serde_json::from_str(r#"{"cmd":"banner","title":"CI"}"#).unwrap();
+        assert!(matches!(banner, Request::Banner(b) if b.title == "CI" && b.ttl.is_none()));
+        assert!(parses_as_api(r#"{"cmd":"banner","title":"CI"}"#));
+        // `notify` is the status-bar message (`wrk notify`), not a banner: a
+        // banner-shaped `notify` is rejected rather than misread.
+        assert!(serde_json::from_str::<Request>(r#"{"cmd":"notify","title":"CI"}"#).is_err());
+        // The fire-and-forget requests, and a confirm, aren't API requests.
+        assert!(
+            !Request::Status(StatusUpdate {
+                tab: "t".into(),
+                kind: StatusKind::Busy,
+                session_id: None,
+                source: None,
+            })
+            .is_api()
+        );
+        assert!(!parses_as_api(r#"{"cmd":"notify","message":"saved"}"#));
+        assert!(!parses_as_api(r#"{"cmd":"confirm","title":"send?"}"#));
+    }
+
+    fn parses_as_api(json: &str) -> bool {
+        serde_json::from_str::<Request>(json).unwrap().is_api()
+    }
+
+    /// An API call goes through the socket to the event loop (here, a thread
+    /// standing in for it) and its reply comes back, ok or error; a
+    /// fire-and-forget request still arrives, and is never answered.
+    #[test]
+    fn api_calls_get_replies_through_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, rx) = serve_at(dir.path().join("t.sock")).unwrap();
+        let fake_loop = std::thread::spawn(move || {
+            let (mut fire_and_forget, mut hidden) = (0, false);
+            // Each connection is read on its own thread, so the Open and the
+            // Hide may arrive in either order: run until both have.
+            while !(hidden && fire_and_forget == 1) {
+                let incoming = rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("a request");
+                let reply = match &incoming.request {
+                    Request::Sessions => Ok(serde_json::json!({ "sessions": ["a"] })),
+                    Request::Focus(f) => Err(format!("no session '{}'", f.session)),
+                    Request::Hide => {
+                        hidden = true;
+                        Ok(serde_json::json!({}))
+                    }
+                    _ => {
+                        fire_and_forget += 1;
+                        continue;
+                    }
+                };
+                incoming.respond(reply);
+            }
+            fire_and_forget
+        });
+
+        let body = call(&path, &Request::Sessions).unwrap();
+        assert_eq!(body, serde_json::json!({ "sessions": ["a"] }));
+        let err = call(
+            &path,
+            &Request::Focus(FocusRequest {
+                session: "nope".into(),
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "no session 'nope'");
+        send(
+            &path,
+            &Request::Open(OpenRequest {
+                path: "/x.md".into(),
+                project: None,
+            }),
+        )
+        .unwrap();
+        call(&path, &Request::Hide).unwrap();
+        assert_eq!(fake_loop.join().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_malformed_api_request_is_told_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _rx) = serve_at(dir.path().join("t.sock")).unwrap();
+        let mut stream = UnixStream::connect(&path).unwrap();
+        stream.write_all(b"{\"cmd\":\"bogus\"}\n").unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        let err = parse_reply(&line).unwrap_err().to_string();
+        assert!(err.starts_with("malformed request"), "{err}");
     }
 
     #[test]

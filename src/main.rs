@@ -1,5 +1,7 @@
+mod api;
 mod ipc;
 mod keymap;
+mod notifications;
 mod pane;
 mod plugin;
 mod proc;
@@ -10,6 +12,7 @@ mod settings;
 mod status;
 mod store;
 mod ui;
+mod widget;
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Stdout};
@@ -117,6 +120,13 @@ enum Command {
         #[arg(long)]
         error: bool,
     },
+    /// Drive the running wrk from a widget or script: list sessions, type into
+    /// one, show one, post notifications, show/hide widgets. Runs inside wrk
+    /// (needs `WRK_SOCK`). See docs/widgets.md.
+    Api {
+        #[command(subcommand)]
+        action: api::ApiAction,
+    },
 }
 
 /// `wrk review` subcommands. Modeled as real clap subcommands (rather than a
@@ -154,6 +164,7 @@ fn main() -> Result<()> {
             decline,
         }) => cmd_confirm(title, lines, accept, decline),
         Some(Command::Notify { message, error }) => cmd_notify(message, error),
+        Some(Command::Api { action }) => api::cmd_api(action),
         None => run_tui(),
     }
 }
@@ -838,6 +849,16 @@ pub struct App {
     pub plugin_names: Vec<String>,
     /// Projects plugins list themselves, each plugin's a sidebar group.
     pub remote: remote::Remote,
+    /// Widget programs (`[widget.<name>]`): the running ones and the one on
+    /// screen, if any.
+    pub widgets: widget::Widgets,
+    /// `[widget.<name>] key` bindings, each summoning its widget.
+    pub widget_keys: HashMap<KeyEvent, String>,
+    /// Notification banners posted through the API.
+    pub notifications: notifications::Notifications,
+    /// `wrk api send --submit` Enters waiting out their pause: when, and the
+    /// session id to press it in.
+    pub pending_submits: Vec<(Instant, String)>,
     /// `wrk confirm` prompts waiting for the one on screen to be answered.
     pub prompts: std::collections::VecDeque<ui::prompt::PromptModal>,
 }
@@ -855,6 +876,10 @@ impl App {
         // them by triggering any other action that overwrites `app.error`.
         let mut error = None;
         for w in keymap_warnings {
+            push_error(&mut error, w);
+        }
+        let (widget_keys, widget_key_warnings) = widget::summon_keys(&settings.widget, &keymap);
+        for w in widget_key_warnings {
             push_error(&mut error, w);
         }
         let mut app = Self {
@@ -887,6 +912,10 @@ impl App {
             plugins,
             plugin_names: Vec::new(),
             remote: remote::Remote::default(),
+            widgets: widget::Widgets::default(),
+            widget_keys,
+            notifications: notifications::Notifications::default(),
+            pending_submits: Vec::new(),
             prompts: std::collections::VecDeque::new(),
         };
         app.plugin_names = app.settings.plugin_names();
@@ -1872,6 +1901,15 @@ impl App {
                     self.info = Some(message);
                 }
             }
+            // API requests are answered by `handle_incoming` (`api.rs`), which
+            // never routes them here.
+            ipc::Request::Sessions
+            | ipc::Request::Send(_)
+            | ipc::Request::Focus(_)
+            | ipc::Request::Banner(_)
+            | ipc::Request::Dismiss(_)
+            | ipc::Request::Show(_)
+            | ipc::Request::Hide => {}
         }
     }
 
@@ -2538,6 +2576,12 @@ fn run_tui() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("creating terminal")?;
 
+    // Widgets that run from the start (hidden), so they can notify before
+    // they're first summoned. After the socket exists: they get `WRK_SOCK`.
+    if let Ok(size) = terminal.size() {
+        app.autostart_widgets(body_rect(size.into()));
+    }
+
     let watch_rx = spawn_watcher()?;
 
     let res = event_loop(&mut terminal, &mut app, watch_rx, ipc_rx);
@@ -2637,14 +2681,19 @@ fn event_loop(
             let _ = app.reload_store();
         }
 
-        // Drain IPC requests: `wrk view` open-file requests, `wrk hook`
-        // status pushes, `wrk confirm` prompts and `wrk notify` messages.
+        // Drain IPC requests: `wrk view` open-file requests, `wrk hook` status
+        // pushes, `wrk review`, `wrk confirm` prompts, `wrk notify` messages,
+        // and API calls (answered).
         if let Some(rx) = &ipc_rx {
             while let Ok(incoming) = rx.try_recv() {
-                app.handle_request(incoming.request, incoming.reply);
+                app.handle_incoming(incoming, body);
             }
         }
         app.tick_prompts();
+        let now = Instant::now();
+        app.flush_pending_submits(now);
+        app.notifications.expire(now);
+        app.tick_widgets(body);
 
         // Drain finished session-plugin jobs (attach / shell / list run off-thread).
         while let Some(event) = app.plugins.try_recv() {
@@ -2846,6 +2895,12 @@ fn handle_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
         return handle_modal_key(app, key, body);
     }
 
+    // A widget on screen gets the keyboard (bar its own hide/switch keys).
+    if app.widgets.shown.is_some() {
+        app.widget_key(key, body);
+        return Ok(());
+    }
+
     let action = app.keymap.lookup(&key);
 
     // While select mode is on, only Esc (cancel) and the select-mode trigger
@@ -2870,6 +2925,20 @@ fn handle_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
     // nested apps (tmux, zellij, vim, …) keep their own shortcuts.
     if app.shell_passthrough && app.focus == Focus::Shell {
         forward_key_to_focused_pty(app, key);
+        return Ok(());
+    }
+
+    // A widget's own summon key (`[widget.<name>] key`). Global shortcuts win;
+    // a conflicting widget key was dropped with a warning at startup.
+    if action.is_none()
+        && let Some(name) = app
+            .widget_keys
+            .get(&KeyEvent::new(key.code, key.modifiers))
+            .cloned()
+    {
+        if let Err(e) = app.show_widget(&name, body) {
+            push_error(&mut app.error, e);
+        }
         return Ok(());
     }
 
@@ -3199,6 +3268,10 @@ fn dispatch_global_action(app: &mut App, action: GlobalAction, body: Rect) -> bo
         GlobalAction::DumpGrid => {
             dump_focused_grid(app);
         }
+        GlobalAction::Widgets => app.toggle_widgets(body),
+        // With no banner up these keys belong to the focused program.
+        GlobalAction::OpenNotification => return app.open_notification(body),
+        GlobalAction::ClearNotification => return app.notifications.pop_newest().is_some(),
     }
     true
 }
@@ -3296,7 +3369,7 @@ fn handle_paste(app: &mut App, content: String, body: Rect) {
                     input.push_str(payload.trim_end_matches('\r').replace('\r', " ").as_str());
                 }
             }
-            ModalState::UrlPicker(m) => {
+            ModalState::UrlPicker(m) | ModalState::WidgetPicker(m) => {
                 for c in payload.chars() {
                     m.push_char(c);
                 }
@@ -3304,6 +3377,14 @@ fn handle_paste(app: &mut App, content: String, body: Rect) {
             // ConfirmDelete is y/n only; ClaudeTabPicker with the list focused
             // has no text input to append to.
             _ => {}
+        }
+        return;
+    }
+
+    if let Some(w) = app.widgets.shown_mut() {
+        if w.exited.is_none() {
+            let bytes = paste_bytes(&w.pane, &payload);
+            let _ = w.pane.write(&bytes);
         }
         return;
     }
@@ -3340,6 +3421,20 @@ fn normalize_paste(s: &str) -> String {
     out
 }
 
+/// The bytes that paste `payload` (already [`normalize_paste`]d) into `pane`:
+/// wrapped in bracketed-paste markers when the program asked for them.
+fn paste_bytes(pane: &PtyPane, payload: &str) -> Vec<u8> {
+    if pane.bracketed_paste_mode() {
+        let mut v = Vec::with_capacity(payload.len() + 12);
+        v.extend_from_slice(b"\x1b[200~");
+        v.extend_from_slice(payload.as_bytes());
+        v.extend_from_slice(b"\x1b[201~");
+        v
+    } else {
+        payload.as_bytes().to_vec()
+    }
+}
+
 fn forward_paste_to_focused_pty(app: &mut App, payload: &str) {
     let focus = app.focus;
     let Some(session) = app.active_session_mut() else {
@@ -3353,15 +3448,7 @@ fn forward_paste_to_focused_pty(app: &mut App, payload: &str) {
     let Some(pane) = pane else {
         return;
     };
-    let bytes: Vec<u8> = if pane.bracketed_paste_mode() {
-        let mut v = Vec::with_capacity(payload.len() + 12);
-        v.extend_from_slice(b"\x1b[200~");
-        v.extend_from_slice(payload.as_bytes());
-        v.extend_from_slice(b"\x1b[201~");
-        v
-    } else {
-        payload.as_bytes().to_vec()
-    };
+    let bytes = paste_bytes(pane, payload);
     let _ = pane.write(&bytes);
     pane.scroll_to_bottom();
 }
@@ -3676,7 +3763,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
             },
             _ => {}
         },
-        ModalState::UrlPicker(m) => match key.code {
+        ModalState::UrlPicker(m) | ModalState::WidgetPicker(m) => match key.code {
             KeyCode::Esc => consumed_modal = Some(()),
             KeyCode::Up => m.select_prev(),
             KeyCode::Down => m.select_next(),
@@ -3709,6 +3796,18 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                     m.tab_name.trim().to_string()
                 };
                 app.add_claude_tab(name, m.harness, session_id, body);
+            }
+            Some(ModalState::WidgetPicker(m)) => {
+                // The picker lists labels in `widget_names` order.
+                let name = m
+                    .confirmed_url
+                    .and_then(|label| m.all.iter().position(|l| *l == label))
+                    .and_then(|i| app.widget_names().get(i).cloned());
+                if let Some(name) = name
+                    && let Err(e) = app.show_widget(&name, body)
+                {
+                    push_error(&mut app.error, e);
+                }
             }
             Some(ModalState::UrlPicker(m)) => {
                 if let Some(url) = m.confirmed_url {
@@ -3784,6 +3883,25 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
     }
 
     let body = body_rect(area);
+
+    // The notification banner on the top row: a click on its ✕ dismisses it,
+    // anywhere else opens what it points at.
+    if !app.notifications.is_empty() && m.row == area.y {
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if m.column + notifications::CLOSE_HIT_WIDTH >= area.right() {
+                app.notifications.pop_newest();
+            } else {
+                app.open_notification(body);
+            }
+        }
+        return;
+    }
+
+    if app.widgets.shown.is_some() {
+        handle_widget_mouse(app, m, body);
+        return;
+    }
+
     let layout = compute_layout(body, app);
     let pos_x = m.column;
     let pos_y = m.row;
@@ -3875,6 +3993,56 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
         MouseEventKind::ScrollDown => {
             scroll_at(app, &layout, pos_x, pos_y, -SCROLL_LINES);
         }
+        _ => {}
+    }
+}
+
+/// A mouse event while a widget is on screen. Inside it, events go to the
+/// widget's program when it asked for mouse reporting, else the wheel scrolls
+/// its scrollback. A click outside hides it (like dismissing a popup).
+fn handle_widget_mouse(app: &mut App, m: MouseEvent, body: Rect) {
+    let outer = widget::overlay_rect(body);
+    let inner = widget::overlay_inner(body);
+    let down = matches!(m.kind, MouseEventKind::Down(MouseButton::Left));
+    if !rect_contains(outer, m.column, m.row) {
+        if down {
+            app.hide_widget();
+        }
+        return;
+    }
+    let Some(w) = app.widgets.shown_mut() else {
+        return;
+    };
+    if w.exited.is_some() {
+        if down {
+            app.hide_widget();
+        }
+        return;
+    }
+    if !rect_contains(inner, m.column, m.row) {
+        return; // the border
+    }
+    let mode = w.pane.mouse_mode();
+    let forward = match m.kind {
+        MouseEventKind::Down(_) | MouseEventKind::Up(_) => mode.any(),
+        MouseEventKind::Drag(_) => mode.drag || mode.motion,
+        MouseEventKind::Moved => mode.motion,
+        MouseEventKind::ScrollUp
+        | MouseEventKind::ScrollDown
+        | MouseEventKind::ScrollLeft
+        | MouseEventKind::ScrollRight => mode.any(),
+    };
+    if forward {
+        let (cx, cy) = (m.column - inner.x + 1, m.row - inner.y + 1);
+        let bytes = pane::mouse_to_bytes(m, cx, cy, mode);
+        if !bytes.is_empty() {
+            let _ = w.pane.write(&bytes);
+        }
+        return;
+    }
+    match m.kind {
+        MouseEventKind::ScrollUp => w.pane.scroll(SCROLL_LINES),
+        MouseEventKind::ScrollDown => w.pane.scroll(-SCROLL_LINES),
         _ => {}
     }
 }
@@ -4456,7 +4624,14 @@ mod tests {
         );
         drop(queued_theirs);
         drop(theirs);
+        // A concurrent test forking a child briefly holds copies of every fd
+        // (until its exec), which can delay the EOF a hang-up shows as: poll.
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
         app.tick_prompts();
+        while (app.modal.is_some() || !app.prompts.is_empty()) && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            app.tick_prompts();
+        }
         assert!(app.modal.is_none(), "both withdrew");
         assert!(app.prompts.is_empty());
         assert_eq!(app.info.as_deref(), Some("web withdrew its question"));
@@ -5338,5 +5513,80 @@ mod tests {
     #[test]
     fn empty_in_empty_out() {
         assert_eq!(normalize_paste(""), "");
+    }
+
+    /// The notification banner draws over the top row, and a click on it
+    /// opens (here: reports the gone target) or, on its ✕, just dismisses.
+    #[test]
+    fn the_notification_banner_draws_on_top_and_takes_clicks() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = crate::api::tests::open_app(dir.path());
+        let area = crate::Rect::new(0, 0, 120, 41);
+        let notify = |app: &mut crate::App, title: &str, project: Option<&str>| {
+            app.notifications.push(
+                crate::ipc::BannerRequest {
+                    title: title.into(),
+                    body: Some("ready to look at".into()),
+                    session: None,
+                    project: project.map(String::from),
+                    widget: None,
+                    ttl: None,
+                },
+                std::time::Instant::now(),
+            );
+        };
+        notify(&mut app, "first", None);
+        notify(&mut app, "Build done", Some("gone"));
+
+        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let top: String = (0..area.width).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(top.contains("Build done — ready to look at"), "{top}");
+        assert!(top.contains("+1 · Alt+o open · Alt+c clear ✕"), "{top}");
+
+        let click = |x: u16| crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: x,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        // Clicking the message opens it: its project is gone, so that's reported.
+        crate::handle_mouse(&mut app, click(10), area);
+        assert!(app.error.as_deref().unwrap().contains("no project 'gone'"));
+        assert_eq!(app.notifications.newest().unwrap().title, "first");
+        // The ✕ dismisses without opening.
+        app.error = None;
+        crate::handle_mouse(&mut app, click(area.width - 2), area);
+        assert!(app.notifications.is_empty());
+        assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn a_click_outside_the_widget_hides_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = crate::api::tests::open_app(dir.path());
+        app.settings.widget.insert(
+            "w".into(),
+            crate::settings::WidgetConfig {
+                command: vec!["sh".into(), "-c".into(), "exec cat".into()],
+                ..Default::default()
+            },
+        );
+        let area = crate::Rect::new(0, 0, 120, 41);
+        app.show_widget("w", crate::body_rect(area)).unwrap();
+        let click = |x: u16, y: u16| crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let inner = crate::widget::overlay_inner(crate::body_rect(area));
+        crate::handle_mouse(&mut app, click(inner.x + 2, inner.y + 2), area);
+        assert!(app.widgets.shown.is_some(), "a click inside stays");
+        crate::handle_mouse(&mut app, click(1, 20), area);
+        assert!(app.widgets.shown.is_none());
+        assert_eq!(app.widgets.instances.len(), 1, "still running");
     }
 }
