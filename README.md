@@ -68,7 +68,8 @@ project. Linux-only, native rendering (via your terminal), built on
   diff, unchanged sections collapsed); comment on any before/after line, then
   `/end-local-review` hands your comments back to Claude to act on. See below.
 - **Mouse**: click panes / tabs / projects to focus, double-click a project to
-  open it, scroll wheel paginates the alacritty scrollback (10k lines).
+  open it, scroll wheel paginates the alacritty scrollback (10k lines) and
+  scrolls the project list when the pointer is over it.
   **Ctrl+click** (or **Shift+click**, if your outer terminal swallows Ctrl) on
   a URL in a claude or shell pane opens it in the browser (`xdg-open`). Works
   for OSC 8 hyperlinks and plain `http(s)://` / `ftp://` URLs. For keyboard
