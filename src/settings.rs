@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow};
 use directories::ProjectDirs;
 use ratatui::style::Color;
+use ratatui::widgets::BorderType;
 use serde::{Deserialize, Serialize};
 use wrk_markdown::MdTheme;
 
@@ -362,6 +363,9 @@ pub struct Theme {
     pub status_attention: Color,
     /// Color for the `[focus]` label in the status bar.
     pub focus_indicator: Color,
+    /// Line style of the boxes around panes and dialogs: rounded corners by
+    /// default, square with `[theme] rounded = false`.
+    pub border_type: BorderType,
 }
 
 impl Default for Theme {
@@ -380,6 +384,7 @@ impl Default for Theme {
             status_busy: Color::Yellow,
             status_attention: Color::Red,
             focus_indicator: Color::Yellow,
+            border_type: BorderType::Rounded,
         }
     }
 }
@@ -400,6 +405,8 @@ pub struct ThemeConfig {
     pub status_busy: Option<String>,
     pub status_attention: Option<String>,
     pub focus_indicator: Option<String>,
+    /// Rounded box corners (default `true`); `false` draws square ones.
+    pub rounded: Option<bool>,
 }
 
 impl ThemeConfig {
@@ -425,6 +432,9 @@ impl ThemeConfig {
         apply(&mut t.status_busy, &self.status_busy);
         apply(&mut t.status_attention, &self.status_attention);
         apply(&mut t.focus_indicator, &self.focus_indicator);
+        if self.rounded == Some(false) {
+            t.border_type = BorderType::Plain;
+        }
         t
     }
 }
@@ -693,6 +703,23 @@ mod tests {
         assert_eq!(t.error, Color::LightMagenta);
         // Unset slots keep defaults.
         assert_eq!(t.accent, Color::Cyan);
+    }
+
+    #[test]
+    fn boxes_are_rounded_unless_turned_off() {
+        assert_eq!(
+            ThemeConfig::default().resolve().border_type,
+            BorderType::Rounded
+        );
+        let parse = |toml: &str| -> ThemeConfig { toml::from_str(toml).unwrap() };
+        assert_eq!(
+            parse("rounded = true").resolve().border_type,
+            BorderType::Rounded
+        );
+        assert_eq!(
+            parse("rounded = false").resolve().border_type,
+            BorderType::Plain
+        );
     }
 
     #[test]

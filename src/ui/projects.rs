@@ -34,7 +34,7 @@ use ratatui::widgets::{
     Block, Borders, List, ListItem, ListState, Paragraph, StatefulWidget, Widget,
 };
 
-use super::{cell_width, truncate_to_width};
+use super::{bordered, cell_width, truncate_to_width};
 use crate::store::Project;
 
 /// One section of the sidebar: the local projects, or one plugin's.
@@ -305,9 +305,8 @@ impl ProjectSidebar {
         } else {
             theme.border_unfocused
         });
-        let block = Block::default()
+        let block = bordered(theme)
             .title(" projects ")
-            .borders(Borders::ALL)
             .border_style(border_style);
         let inner = block.inner(area);
         block.render(area, buf);
@@ -775,6 +774,30 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn the_box_has_rounded_corners_unless_the_theme_says_square() {
+        let mut sb = ProjectSidebar::default();
+        sb.rebuild(&local(&store(&["wrk", "notes"])), view);
+        let area = Rect::new(0, 0, 20, 10);
+        let rows = rendered(&mut sb, area);
+        assert!(
+            rows[0].starts_with('╭') && rows[0].ends_with('╮'),
+            "{rows:?}"
+        );
+        assert!(
+            rows[9].starts_with('╰') && rows[9].ends_with('╯'),
+            "{rows:?}"
+        );
+
+        let square = crate::settings::Theme {
+            border_type: ratatui::widgets::BorderType::Plain,
+            ..Default::default()
+        };
+        let mut buf = Buffer::empty(area);
+        sb.render(area, &mut buf, &square);
+        assert_eq!(buf[(0, 0)].symbol(), "┌");
     }
 
     #[test]

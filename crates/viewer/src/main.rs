@@ -25,7 +25,7 @@ use ratatui::backend::CrosstermBackend;
 #[cfg(feature = "images")]
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{Block, Borders};
+use ratatui::widgets::{Block, BorderType};
 #[cfg(feature = "images")]
 use ratatui::widgets::{Clear, Paragraph};
 use wrk_markdown::{MarkdownView, MarkdownViewState, RenderOptions, RenderedDoc};
@@ -164,9 +164,9 @@ fn pager_loop(
                 );
                 return;
             }
-            let block = Block::default()
+            let block = Block::bordered()
+                .border_type(BorderType::Rounded)
                 .title(title)
-                .borders(Borders::ALL)
                 .border_style(Style::default().add_modifier(Modifier::DIM));
             let view = MarkdownView::new(&doc).block(block);
             frame.render_stateful_widget(view, area, &mut state);

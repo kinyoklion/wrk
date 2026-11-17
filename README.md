@@ -377,6 +377,7 @@ status_waiting    = "#5faf87"   # sidebar/tab dot: claude has finished (Stop)
 status_busy       = "#d7af00"   # sidebar/tab dot: claude is processing
 status_attention  = "#ff5f5f"   # sidebar/tab dot: claude needs attention
 focus_indicator   = "yellow"    # `[focus]` label in the status bar
+rounded           = true        # rounded box corners; false for square ones
 
 # Optional colors for the markdown viewer (Alt+m tabs and `wrk-md`).
 # Same color syntax as [theme]; anything unset keeps the built-in default.

@@ -295,10 +295,7 @@ fn draw_primary_pane(frame: &mut Frame, area: Rect, focused: bool, app: &mut App
     } else {
         theme.border_unfocused
     });
-    let block = Block::default()
-        .title(" claude ")
-        .borders(Borders::ALL)
-        .border_style(border_style);
+    let block = bordered(theme).title(" claude ").border_style(border_style);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -553,10 +550,7 @@ fn draw_terminal_pane(
     } else {
         theme.border_unfocused
     });
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(border_style);
+    let block = bordered(theme).title(title).border_style(border_style);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -738,6 +732,12 @@ fn choose_message(tiers: &[String], budget: usize) -> String {
         Some(t) => truncate_to_width(t, budget),
         None => String::new(),
     }
+}
+
+/// A box with a border on every side, in the theme's line style (rounded by
+/// default). Every bordered pane and dialog starts from this so they match.
+pub(crate) fn bordered<'a>(theme: &Theme) -> Block<'a> {
+    Block::bordered().border_type(theme.border_type)
 }
 
 /// Display width of `s` in terminal cells (accounts for wide/zero-width chars).
