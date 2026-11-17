@@ -189,6 +189,11 @@ impl PtyPane {
         matches!(self.pty.child.try_wait(), Ok(Some(_)))
     }
 
+    /// The child's exit status once it has exited; `None` while it runs.
+    pub fn exit_status(&mut self) -> Option<portable_pty::ExitStatus> {
+        self.pty.child.try_wait().ok().flatten()
+    }
+
     /// True when the embedded program has switched the terminal into
     /// "application cursor key" mode (DECCKM). When set, arrow keys and
     /// Home/End must be sent as `ESC O X` instead of `ESC [ X`.

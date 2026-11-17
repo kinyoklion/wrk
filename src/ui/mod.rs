@@ -18,12 +18,14 @@ use crate::settings::Theme;
 use crate::status::HookEvent;
 use crate::store::{LayoutMode, Project};
 use crate::ui::projects::{ProjectStatus, ProjectView, SessionInfo, SessionKind};
-use crate::{App, ClaudeTab, PluginAttach, ProjectSession, Tab, claude_pane_split, compute_layout};
+use crate::{
+    App, ClaudeTab, PluginAttach, ProjectSession, Tab, claude_pane_split, compute_layout, widget,
+};
 use wrk_markdown::MarkdownView;
 
 const WAITING_THRESHOLD: Duration = Duration::from_millis(500);
 
-fn tab_status(tab: &ClaudeTab) -> ProjectStatus {
+pub(crate) fn tab_status(tab: &ClaudeTab) -> ProjectStatus {
     if tab.pane.is_none() {
         return ProjectStatus::None;
     }
@@ -186,6 +188,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     draw_status(frame, status, app);
 
+    if let Some(w) = app.widgets.shown() {
+        draw_widget(frame, body, w, app, &theme);
+    }
+    draw_notification_banner(frame, area, app, &theme);
+
     if let Some(modal) = &app.modal {
         match modal {
             ModalState::Add(m) => {
@@ -211,7 +218,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     frame.set_cursor_position(cursor);
                 }
             }
-            ModalState::UrlPicker(m) => {
+            ModalState::UrlPicker(m) | ModalState::WidgetPicker(m) => {
                 let cursor = m.render(area, frame.buffer_mut(), &theme);
                 frame.set_cursor_position(cursor);
             }
@@ -219,6 +226,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 let cursor = m.render(area, frame.buffer_mut(), &theme);
                 frame.set_cursor_position(cursor);
             }
+        }
+        return;
+    }
+
+    // A widget on screen has the keyboard, so the cursor is its program's.
+    if let Some(w) = app.widgets.shown() {
+        if w.exited.is_none()
+            && let Some(pos) =
+                crate::pane::terminal::cursor_position(&w.pane, widget::overlay_inner(body))
+        {
+            frame.set_cursor_position(pos);
         }
         return;
     }
@@ -571,6 +589,79 @@ fn draw_terminal_pane(
     }
 }
 
+/// The widget overlay: its program's terminal in a box floating over the
+/// body, titled with the widget (and project), the hide key on the right. A
+/// failed run keeps its last output up with the exit status instead.
+fn draw_widget(
+    frame: &mut Frame,
+    body: Rect,
+    w: &crate::widget::WidgetInstance,
+    app: &App,
+    theme: &Theme,
+) {
+    let rect = widget::overlay_rect(body);
+    frame.render_widget(Clear, rect);
+    let (hint, color) = match &w.exited {
+        Some(why) => (format!(" {why} · any key closes "), theme.error),
+        None => (
+            format!(
+                " {} hide ",
+                app.keymap.display(crate::keymap::GlobalAction::Widgets)
+            ),
+            theme.border_focused,
+        ),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color))
+        .title(format!(" {} ", app.widget_title(&w.key)))
+        .title(Line::from(hint).right_aligned());
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    frame.render_widget(PtyPaneWidget(&w.pane), inner);
+}
+
+/// The newest notification, across the top row (over the pane borders, so
+/// nothing below moves): its text on the left; on the right how many more are
+/// queued, the open/clear keys, and a ✕ that dismisses it on click.
+fn draw_notification_banner(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let Some(n) = app.notifications.newest() else {
+        return;
+    };
+    let row = Rect { height: 1, ..area };
+    let width = row.width as usize;
+    let more = app.notifications.len() - 1;
+    let keys = &app.keymap;
+    let right = format!(
+        " {}{} open · {} clear ✕ ",
+        if more > 0 {
+            format!("+{more} · ")
+        } else {
+            String::new()
+        },
+        keys.display(crate::keymap::GlobalAction::OpenNotification),
+        keys.display(crate::keymap::GlobalAction::ClearNotification),
+    );
+    // On a narrow screen the message keeps the room; the keys go first.
+    let right = if cell_width(&right) + 12 > width {
+        " ✕ ".to_string()
+    } else {
+        right
+    };
+    let room = width.saturating_sub(cell_width(&right));
+    let left = truncate_to_width(&format!(" ● {}", n.text()), room);
+    let pad = room.saturating_sub(cell_width(&left));
+    let style = Style::default().bg(theme.accent).fg(theme.accent_fg);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(left, style.add_modifier(Modifier::BOLD)),
+            Span::styled(" ".repeat(pad), style),
+            Span::styled(right, style),
+        ])),
+        row,
+    );
+}
+
 fn inner_area(area: Rect) -> Rect {
     Block::default().borders(Borders::ALL).inner(area)
 }
@@ -843,6 +934,8 @@ pub enum ModalState {
     ConfirmQuit(modal::ConfirmQuitModal),
     ClaudeTabPicker(modal::ClaudeTabPickerModal),
     UrlPicker(modal::UrlPickerModal),
+    /// Choosing a widget to summon (the URL picker's list, retitled).
+    WidgetPicker(modal::UrlPickerModal),
     PluginForm(form::PluginFormModal),
 }
 

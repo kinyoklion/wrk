@@ -67,6 +67,12 @@ project. Linux-only, native rendering (via your terminal), built on
   Claude. `/start-local-review` opens a full-screen review (file list + side-by-side
   diff, unchanged sections collapsed); comment on any before/after line, then
   `/end-local-review` hands your comments back to Claude to act on. See below.
+- **Widgets & notifications** — summon any terminal program (an `fzf` script,
+  a TUI) into a floating overlay with `Alt+e`. It drives wrk through `wrk api`:
+  list sessions, type into one, switch to one. Anything running in wrk can post
+  a notification banner that opens its session when clicked. See
+  [docs/widgets.md](docs/widgets.md) and the GitHub pull-request widget in
+  [examples/widgets](examples/widgets/github-prs.sh).
 - **Mouse**: click panes / tabs / projects to focus, double-click a project to
   open it, scroll wheel paginates the alacritty scrollback (10k lines).
   **Ctrl+click** (or **Shift+click**, if your outer terminal swallows Ctrl) on
@@ -192,6 +198,7 @@ wrk-md --print --width 80 F # force a wrap width for --print (else terminal widt
 | `wrk view <file>` | open a markdown file — as a tab in the running wrk (from inside a pane), else in the `wrk-md` pager |
 | `wrk install-hooks` | install wrk's status hooks + skills for each enabled harness (Claude → `~/.claude`; Kimi → `~/.kimi-code`) |
 | `wrk uninstall-hooks` | remove them from every harness |
+| `wrk api …` | drive the running wrk from a widget or script: `sessions`, `send`, `focus`, `notify`, `dismiss`, `show`, `hide` (see [docs/widgets.md](docs/widgets.md)) |
 
 ### Letting Claude open files
 
@@ -218,6 +225,8 @@ pager instead.
 | `Alt+s` | enter select mode — drag to highlight, release to copy via OSC 52 |
 | `Ctrl+Space` | jump back to projects from any pane |
 | `F12` | toggle shell-pane passthrough (persisted per project) |
+| `Alt+e` | summon a widget (a picker when you have several), or hide the one on screen |
+| `Alt+o` / `Alt+c` | open / clear the notification on the top row (fall through to the pane when there's none) |
 
 **Shell-pane passthrough.** When toggled on, wrk forwards every key (including
 `Alt+…` and `Ctrl+Space`) directly to the shell pane's PTY — useful for nested
@@ -419,6 +428,17 @@ toggle_shell_passthrough = "F12"
 open_link_picker         = "Alt+u"
 enter_select_mode        = "Alt+s"
 dump_grid                = "Alt+x"   # diagnostic: dump the focused PTY grid
+widgets                  = "Alt+e"   # summon / hide a widget
+open_notification        = "Alt+o"
+clear_notification       = "Alt+c"
+
+# Widgets: terminal programs summoned into a floating overlay (docs/widgets.md).
+[widget.prs]
+command = ["/path/to/examples/widgets/github-prs.sh"]
+title   = "Pull requests"
+key     = "Alt+g"        # optional direct key
+# scope = "global"       # default "project": one per project, run in its dir
+# autostart = true       # global widgets: start hidden at launch
 ```
 
 ### Status hooks (`wrk install-hooks`)

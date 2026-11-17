@@ -41,6 +41,13 @@ pub enum GlobalAction {
     OpenLinkPicker,
     EnterSelectMode,
     DumpGrid,
+    /// Summon a widget (a picker when several are configured), or hide the
+    /// one on screen.
+    Widgets,
+    /// Act on the newest notification: open what it points at.
+    OpenNotification,
+    /// Dismiss the newest notification.
+    ClearNotification,
 }
 
 impl GlobalAction {
@@ -66,6 +73,9 @@ impl GlobalAction {
             Self::OpenLinkPicker => "Alt+u",
             Self::EnterSelectMode => "Alt+s",
             Self::DumpGrid => "Alt+x",
+            Self::Widgets => "Alt+e",
+            Self::OpenNotification => "Alt+o",
+            Self::ClearNotification => "Alt+c",
         }
     }
 
@@ -90,6 +100,9 @@ impl GlobalAction {
         Self::OpenLinkPicker,
         Self::EnterSelectMode,
         Self::DumpGrid,
+        Self::Widgets,
+        Self::OpenNotification,
+        Self::ClearNotification,
     ];
 }
 
@@ -305,6 +318,9 @@ fn action_name(a: GlobalAction) -> &'static str {
         GlobalAction::OpenLinkPicker => "open_link_picker",
         GlobalAction::EnterSelectMode => "enter_select_mode",
         GlobalAction::DumpGrid => "dump_grid",
+        GlobalAction::Widgets => "widgets",
+        GlobalAction::OpenNotification => "open_notification",
+        GlobalAction::ClearNotification => "clear_notification",
     }
 }
 
