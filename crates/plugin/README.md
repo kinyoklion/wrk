@@ -284,6 +284,11 @@ wrk shows `message`, lists your projects again, and opens `project` (on tab
 return before what it makes exists (a box that is still launching, say). Keep
 `create` within `request_timeout`, as any request.
 
+A `create` can also come from a script or widget through `wrk api create`
+(see wrk's `docs/widgets.md`), with values it filled in itself rather than
+from your form. Check them as you would a form's, and say what's wrong in the
+error: it is shown to whoever asked.
+
 ## How wrk drives a plugin
 
 | the user… | wrk sends |

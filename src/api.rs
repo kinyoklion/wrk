@@ -26,6 +26,15 @@ use crate::{App, Focus, Tab, push_error};
 /// as a paste for part of the paste; after a short pause it's a keypress.
 const SUBMIT_DELAY: Duration = Duration::from_millis(150);
 
+/// A `create` waiting on its plugin: answered when the plugin's result comes
+/// back with this ticket (`App::finish_api_create`).
+#[derive(Debug)]
+pub struct PendingCreate {
+    pub ticket: u64,
+    pub reply: ipc::Reply,
+    pub open: bool,
+}
+
 /// One session, as `sessions` lists it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEntry {
@@ -85,6 +94,14 @@ impl App {
             self.handle_request(incoming.request, incoming.reply);
             return;
         }
+        // A create is answered later, once the plugin has made the thing.
+        if let Request::Create(req) = incoming.request {
+            let mut reply = incoming.reply;
+            if let Err(e) = self.start_api_create(req, &mut reply) {
+                reply.respond(Err(e));
+            }
+            return;
+        }
         let answer = self.handle_api(incoming.request.clone(), body);
         incoming.respond(answer);
     }
@@ -134,6 +151,88 @@ impl App {
             // `handle_incoming` only routes API requests here.
             other => Err(format!("not an API request: {other:?}")),
         }
+    }
+
+    /// Hand a `create` to its plugin, off the UI thread; `reply` is kept to
+    /// answer once the plugin has.
+    fn start_api_create(
+        &mut self,
+        req: ipc::CreateRequest,
+        reply: &mut ipc::Reply,
+    ) -> Result<(), String> {
+        if !self.plugin_names.contains(&req.plugin) {
+            return Err(format!(
+                "no plugin '{}' (configure it as [plugin.{}])",
+                req.plugin, req.plugin
+            ));
+        }
+        let project = match &req.project {
+            None => None,
+            Some(key) => {
+                let project = self
+                    .remote
+                    .find(key)
+                    .filter(|p| p.plugin.as_deref() == Some(req.plugin.as_str()))
+                    .ok_or_else(|| format!("'{}' lists no project '{key}'", req.plugin))?;
+                Some(crate::plugin::payload(project))
+            }
+        };
+        let ticket = self.next_create_ticket;
+        self.next_create_ticket += 1;
+        self.plugins.submit(
+            &req.plugin,
+            crate::plugin::Job::Create {
+                project,
+                values: req.values,
+                ticket: Some(ticket),
+            },
+        );
+        self.api_creates.push(PendingCreate {
+            ticket,
+            reply: std::mem::take(reply),
+            open: req.open,
+        });
+        Ok(())
+    }
+
+    /// A plugin answered an API `create`: open what it made once it's listed
+    /// (unless asked not to), and answer the request.
+    pub(crate) fn finish_api_create(
+        &mut self,
+        plugin: &str,
+        ticket: u64,
+        result: anyhow::Result<crate::plugin::CreateResponse>,
+    ) {
+        let Some(at) = self.api_creates.iter().position(|p| p.ticket == ticket) else {
+            return;
+        };
+        let mut pending = self.api_creates.swap_remove(at);
+        let created = match result {
+            Ok(created) => created,
+            Err(e) => {
+                pending.reply.respond(Err(format!("{e:#}")));
+                return;
+            }
+        };
+        let project = created
+            .project
+            .as_deref()
+            .map(|id| crate::remote::key(plugin, id));
+        if pending.open
+            && let Some(key) = &project
+        {
+            self.remote
+                .open_when_listed(key.clone(), created.session.clone(), Instant::now());
+        }
+        self.remote.refresh_soon(plugin);
+        if let Some(message) = &created.message {
+            self.info = Some(message.clone());
+        }
+        pending.reply.respond(Ok(json!({
+            "project": project,
+            "session": created.session,
+            "message": created.message,
+        })));
     }
 
     /// Every session of every open project, in sidebar order: each project's
@@ -381,6 +480,26 @@ pub enum ApiAction {
     Show { widget: String },
     /// Hide the widget on screen (it keeps running).
     Hide,
+    /// Have a session plugin create a project or session, given the values
+    /// its creation form takes. Waits for the plugin, then prints
+    /// `project<TAB>session<TAB>message` (`-` for what it didn't say). What it
+    /// made opens in wrk once the plugin lists it.
+    Create {
+        /// The plugin, as configured (`[plugin.<name>]`).
+        plugin: String,
+        /// Form values: a field's id, `=`, its value.
+        #[arg(value_name = "FIELD=VALUE")]
+        values: Vec<String>,
+        /// Create from inside this listed project (`<plugin>/<id>`).
+        #[arg(long)]
+        project: Option<String>,
+        /// Don't open what it made.
+        #[arg(long)]
+        no_open: bool,
+        /// Print the reply as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn cmd_api(action: ApiAction) -> Result<()> {
@@ -458,6 +577,45 @@ pub fn cmd_api(action: ApiAction) -> Result<()> {
         }
         ApiAction::Hide => {
             call(Request::Hide)?;
+        }
+        ApiAction::Create {
+            plugin,
+            values,
+            project,
+            no_open,
+            json,
+        } => {
+            let values = values
+                .iter()
+                .map(|kv| {
+                    kv.split_once('=')
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .ok_or_else(|| anyhow!("'{kv}' isn't FIELD=VALUE"))
+                })
+                .collect::<Result<_>>()?;
+            let reply = call(Request::Create(ipc::CreateRequest {
+                plugin,
+                project,
+                values,
+                open: !no_open,
+            }))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&reply)?);
+            } else {
+                let field = |k: &str| {
+                    reply
+                        .get(k)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("-")
+                        .replace(['\t', '\n', '\r'], " ")
+                };
+                println!(
+                    "{}\t{}\t{}",
+                    field("project"),
+                    field("session"),
+                    field("message")
+                );
+            }
         }
     }
     Ok(())

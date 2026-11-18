@@ -201,7 +201,7 @@ wrk-md --print --width 80 F # force a wrap width for --print (else terminal widt
 | `wrk notify <message> [--error]` | show a message in the running wrk's status bar (from inside a pane) |
 | `wrk install-hooks` | install wrk's status hooks + skills for each enabled harness (Claude → `~/.claude`; Kimi → `~/.kimi-code`) |
 | `wrk uninstall-hooks` | remove them from every harness |
-| `wrk api …` | drive the running wrk from a widget or script: `sessions`, `send`, `focus`, `banner`, `dismiss`, `show`, `hide` (see [docs/widgets.md](docs/widgets.md)) |
+| `wrk api …` | drive the running wrk from a widget or script: `sessions`, `send`, `focus`, `banner`, `dismiss`, `show`, `hide`, `create` (a plugin's creation form, filled in by the caller) (see [docs/widgets.md](docs/widgets.md)) |
 
 ### Letting Claude open files
 

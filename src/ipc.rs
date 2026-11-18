@@ -59,6 +59,9 @@ pub enum Request {
     Show(ShowRequest),
     /// API: hide the widget on screen.
     Hide,
+    /// API: have a session plugin create something, as its creation form
+    /// does. Answered once the plugin has: `{"project","session"?,"message"?}`.
+    Create(CreateRequest),
 }
 
 impl Request {
@@ -76,6 +79,7 @@ impl Request {
                 | Request::Dismiss(_)
                 | Request::Show(_)
                 | Request::Hide
+                | Request::Create(_)
         )
     }
 }
@@ -146,6 +150,10 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How long `call` waits for the reply line.
 const CALL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// A `create` is answered once the plugin has made the thing, which can take
+/// as long as the plugin's own request timeout.
+const CREATE_CALL_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// The connection a request came on, for writing the one answer back.
 #[derive(Debug, Default)]
@@ -253,6 +261,28 @@ pub struct DismissRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShowRequest {
     pub widget: String,
+}
+
+/// Ask a session plugin to create a project or session, with the values its
+/// creation form would have sent (`wrk api create`). What it makes opens in
+/// wrk once the plugin lists it, unless `open` is false.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateRequest {
+    /// The plugin, as configured (`[plugin.<name>]`).
+    pub plugin: String,
+    /// One of the plugin's listed projects (its wrk key, `<plugin>/<id>`), for
+    /// a create made from inside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Form field id → value.
+    #[serde(default)]
+    pub values: std::collections::BTreeMap<String, String>,
+    #[serde(default = "default_true")]
+    pub open: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// A request to open a file in a running wrk instance.
@@ -446,7 +476,11 @@ fn error_line(message: impl std::fmt::Display) -> String {
 pub fn call(sock: &Path, req: &Request) -> Result<serde_json::Value> {
     let mut stream =
         UnixStream::connect(sock).with_context(|| format!("connecting to {}", sock.display()))?;
-    stream.set_read_timeout(Some(CALL_TIMEOUT))?;
+    let timeout = match req {
+        Request::Create(_) => CREATE_CALL_TIMEOUT,
+        _ => CALL_TIMEOUT,
+    };
+    stream.set_read_timeout(Some(timeout))?;
     let mut payload = serde_json::to_string(req)?;
     payload.push('\n');
     stream.write_all(payload.as_bytes())?;
@@ -750,6 +784,25 @@ mod tests {
         );
         assert!(!parses_as_api(r#"{"cmd":"notify","message":"saved"}"#));
         assert!(!parses_as_api(r#"{"cmd":"confirm","title":"send?"}"#));
+    }
+
+    #[test]
+    fn a_create_names_its_plugin_and_opens_by_default() {
+        let create: Request = serde_json::from_str(
+            r#"{"cmd":"create","plugin":"boxes","values":{"box":"b1","name":"review"}}"#,
+        )
+        .unwrap();
+        assert!(create.is_api());
+        let Request::Create(req) = create else {
+            panic!("{create:?}");
+        };
+        assert_eq!(req.plugin, "boxes");
+        assert_eq!(req.project, None);
+        assert_eq!(req.values["name"], "review");
+        assert!(req.open);
+        let quiet: Request =
+            serde_json::from_str(r#"{"cmd":"create","plugin":"boxes","open":false}"#).unwrap();
+        assert!(matches!(quiet, Request::Create(r) if !r.open && r.values.is_empty()));
     }
 
     fn parses_as_api(json: &str) -> bool {

@@ -83,10 +83,13 @@ pub enum Job {
     ListProjects,
     /// Fetch the plugin's creation form.
     CreateForm { project: Option<ProjectPayload> },
-    /// Create what a filled-in form describes.
+    /// Create what a filled-in form describes. `ticket` comes back on the
+    /// [`PluginEvent::Created`], to tell an API request's create from the
+    /// form's (`None`).
     Create {
         project: Option<ProjectPayload>,
         values: BTreeMap<String, String>,
+        ticket: Option<u64>,
     },
 }
 
@@ -132,6 +135,7 @@ pub enum PluginEvent {
     Created {
         plugin: String,
         result: Result<CreateResponse>,
+        ticket: Option<u64>,
     },
 }
 
@@ -376,12 +380,23 @@ impl Worker {
                 });
                 PluginEvent::Form { plugin, result }
             }
-            Job::Create { project, values } => {
+            Job::Create {
+                project,
+                values,
+                ticket,
+            } => {
                 let result = self.connect(true).and_then(|conn| {
+                    if !conn.caps.create {
+                        return Err(anyhow!("it can't create projects or sessions"));
+                    }
                     let request = Request::Create { project, values };
                     client::call(&conn.socket, &request, conn.timeout)
                 });
-                PluginEvent::Created { plugin, result }
+                PluginEvent::Created {
+                    plugin,
+                    result,
+                    ticket,
+                }
             }
         })
     }
@@ -782,10 +797,12 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            ticket: Some(7),
         };
         match host.worker("p").run(create(&[("name", "svc")])) {
-            Some(PluginEvent::Created { result, .. }) => {
+            Some(PluginEvent::Created { result, ticket, .. }) => {
                 assert_eq!(result.unwrap().session.as_deref(), Some("svc/main"));
+                assert_eq!(ticket, Some(7), "the ticket comes back with the result");
             }
             other => panic!("{other:?}"),
         }
