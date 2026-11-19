@@ -84,6 +84,7 @@ exits 0 or 1 with the answer.
 | `wrk api dismiss <id>` | Takes a notification down. |
 | `wrk api show <widget>` | Shows a widget, starting it if needed. |
 | `wrk api hide` | Hides the widget on screen. |
+| `wrk api create <plugin> [field=value…] [--project P] [--no-open] [--json]` | Has a session plugin create a project or session, with the values its creation form takes (the form's field ids). Waits for the plugin, then prints `project`, `session` and the plugin's message (tab-separated, `-` when it didn't say). What it made opens in wrk once the plugin lists it, unless `--no-open`. `--project` names one of the plugin's listed projects to create from, as `Alt+n` inside it would. |
 
 Errors (an unknown session, a session that isn't running, …) print to stderr
 and exit non-zero.
@@ -123,6 +124,15 @@ printf '%s\n' '{"cmd":"sessions"}' | socat - "UNIX-CONNECT:$WRK_SOCK"
 | `{"cmd":"banner","title":"…","body":"…","session":"…","project":"…","widget":"…","ttl":30}` | `{"id":1}` |
 | `{"cmd":"dismiss","id":1}` | `{}` |
 | `{"cmd":"show","widget":"prs"}` / `{"cmd":"hide"}` | `{}` |
+| `{"cmd":"create","plugin":"boxes","values":{"name":"review"},"project":"…","open":true}` | `{"project":"boxes/b1","session":"b1/review","message":"…"}`, once the plugin has answered |
 
 Optional fields can be left out. A reply is `{"ok":true, …body}` or
 `{"ok":false,"error":"…"}`.
+
+A `create` is answered only once the plugin has made the thing, which can take
+as long as the plugin's `request_timeout`. Its `project` is the wrk project key
+(`<plugin>/<id>`) and its `session` the plugin's session id: once wrk has
+opened it, `sessions --json` lists that tab with the same `session_id`, and its
+own `id` is what `send` and `focus` take. A newly created agent may take a
+moment to start, so wait for it to be `running` with `status` `idle` before
+typing into it.

@@ -861,6 +861,9 @@ pub struct App {
     pub pending_submits: Vec<(Instant, String)>,
     /// `wrk confirm` prompts waiting for the one on screen to be answered.
     pub prompts: std::collections::VecDeque<ui::prompt::PromptModal>,
+    /// `wrk api create` requests waiting on their plugin, by ticket.
+    pub api_creates: Vec<api::PendingCreate>,
+    pub next_create_ticket: u64,
 }
 
 impl App {
@@ -917,6 +920,8 @@ impl App {
             notifications: notifications::Notifications::default(),
             pending_submits: Vec::new(),
             prompts: std::collections::VecDeque::new(),
+            api_creates: Vec::new(),
+            next_create_ticket: 1,
         };
         app.plugin_names = app.settings.plugin_names();
         app.refresh_sidebar();
@@ -1626,9 +1631,16 @@ impl App {
                 self.apply_listing(&plugin, result, body);
             }
             plugin::PluginEvent::Form { plugin, result } => self.show_plugin_form(&plugin, result),
-            plugin::PluginEvent::Created { plugin, result } => {
-                self.finish_plugin_create(&plugin, result);
-            }
+            plugin::PluginEvent::Created {
+                plugin,
+                result,
+                ticket: None,
+            } => self.finish_plugin_create(&plugin, result),
+            plugin::PluginEvent::Created {
+                plugin,
+                result,
+                ticket: Some(ticket),
+            } => self.finish_api_create(&plugin, ticket, result),
         }
     }
 
@@ -1909,7 +1921,8 @@ impl App {
             | ipc::Request::Banner(_)
             | ipc::Request::Dismiss(_)
             | ipc::Request::Show(_)
-            | ipc::Request::Hide => {}
+            | ipc::Request::Hide
+            | ipc::Request::Create(_) => {}
         }
     }
 
@@ -3827,8 +3840,14 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
             .as_deref()
             .and_then(|key| app.remote.find(key))
             .map(plugin::payload);
-        app.plugins
-            .submit(&plugin, plugin::Job::Create { project, values });
+        app.plugins.submit(
+            &plugin,
+            plugin::Job::Create {
+                project,
+                values,
+                ticket: None,
+            },
+        );
     }
     // Deferred markdown open: succeed → close the modal; fail → keep it open and
     // show the error inline.
@@ -5295,6 +5314,112 @@ mod tests {
         let tab = app.sessions["boxes/i-1"].active_claude_tab().unwrap();
         assert!(tab.pane.is_none() && !tab.attach_when_shown);
         assert_eq!(tab.plugin_attach, PluginAttach::Idle);
+    }
+
+    /// Send `request` as if over the socket; the other end of its connection.
+    fn api_call(app: &mut App, request: ipc::Request) -> UnixStream {
+        let (client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        app.handle_incoming(
+            ipc::Incoming {
+                request,
+                reply: ipc::Reply::new(server),
+            },
+            Rect::new(0, 0, 120, 40),
+        );
+        client
+    }
+
+    fn reply_of(client: UnixStream) -> serde_json::Value {
+        use std::io::BufRead;
+        let mut line = String::new();
+        std::io::BufReader::new(client)
+            .read_line(&mut line)
+            .unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    fn create_request(plugin: &str, project: Option<&str>) -> ipc::Request {
+        ipc::Request::Create(ipc::CreateRequest {
+            plugin: plugin.into(),
+            project: project.map(Into::into),
+            values: [("name".to_string(), "api".to_string())].into(),
+            open: true,
+        })
+    }
+
+    #[test]
+    fn an_api_create_is_answered_once_its_plugin_has_and_opens_what_it_made() {
+        let mut app = empty_app();
+        app.plugin_names = vec!["boxes".into()];
+        listed(&mut app, &["web/main"]);
+        let client = api_call(&mut app, create_request("boxes", Some("boxes/i-1")));
+        assert_eq!(app.api_creates.len(), 1, "waiting on the plugin");
+        let ticket = app.api_creates[0].ticket;
+        // Not answered yet.
+        client.set_nonblocking(true).unwrap();
+        assert!(std::io::Read::read(&mut &client, &mut [0u8; 8]).is_err());
+        client.set_nonblocking(false).unwrap();
+
+        // A result for some other create (the form's has no ticket) isn't this one's.
+        app.finish_api_create("boxes", ticket + 1, Err(anyhow::anyhow!("not mine")));
+        assert_eq!(app.api_creates.len(), 1);
+        app.finish_api_create(
+            "boxes",
+            ticket,
+            Ok(plugin::CreateResponse {
+                project: Some("i-1".into()),
+                session: Some("api/main".into()),
+                message: Some("creating api".into()),
+            }),
+        );
+        assert!(app.api_creates.is_empty());
+        let reply = reply_of(client);
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["project"], "boxes/i-1");
+        assert_eq!(reply["session"], "api/main");
+        assert_eq!(reply["message"], "creating api");
+        assert_eq!(app.info.as_deref(), Some("creating api"));
+        // It opens once a listing includes it.
+        listed(&mut app, &["web/main", "api/main"]);
+        assert_eq!(app.active_project_name.as_deref(), Some("boxes/i-1"));
+        assert_eq!(app.sessions["boxes/i-1"].active_tab, 1);
+    }
+
+    #[test]
+    fn an_api_create_reports_what_went_wrong() {
+        let mut app = empty_app();
+        app.plugin_names = vec!["boxes".into()];
+        listed(&mut app, &["web/main"]);
+        let reply = reply_of(api_call(&mut app, create_request("nope", None)));
+        assert_eq!(reply["ok"], false);
+        assert!(
+            reply["error"]
+                .as_str()
+                .unwrap()
+                .contains("no plugin 'nope'")
+        );
+        let reply = reply_of(api_call(
+            &mut app,
+            create_request("boxes", Some("boxes/i-9")),
+        ));
+        assert!(
+            reply["error"]
+                .as_str()
+                .unwrap()
+                .contains("no project 'boxes/i-9'")
+        );
+        assert!(app.api_creates.is_empty());
+
+        let client = api_call(&mut app, create_request("boxes", None));
+        let ticket = app.api_creates[0].ticket;
+        app.finish_api_create("boxes", ticket, Err(anyhow::anyhow!("name taken")));
+        let reply = reply_of(client);
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error"], "name taken");
+        assert_eq!(app.active_project_name, None, "nothing to open");
     }
 
     #[test]
