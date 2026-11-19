@@ -115,6 +115,7 @@ capabilities you advertise in `hello`.
 | `close` | sends `close` when a tab hosting one of your sessions is closed | sends nothing |
 | `projects` | sends `list_projects` and shows your projects as a sidebar group of their own | only projects in `projects.toml` name your plugin |
 | `create` | offers a creation form in your group (`create_form`, then `create`) | your group offers no way to create |
+| `remove` | lets `d` remove one of your listed projects or sessions, with a form you describe (`remove_form`, then `remove`) | `d` on them says to remove them in your plugin |
 
 wrk asks **once per daemon**: it caches the answer until the socket stops
 answering (a restarted daemon is asked again). **A `hello` reply wrk can't parse
@@ -289,6 +290,39 @@ A `create` can also come from a script or widget through `wrk api create`
 from your form. Check them as you would a form's, and say what's wrong in the
 error: it is shown to whoever asked.
 
+### `remove_form` and `remove` — removing projects (`remove` capability)
+
+`d` on one of your listed projects, or on one of its tabs, asks you what
+removing it means:
+
+```json
+{"method":"remove_form","project":{"name":"boxes/i-0abc","path":"/home/me","config":{"box":"i-0abc"}},"session_id":"p1/fix"}
+```
+```json
+{"ok":true,"title":"Terminate dev-box","submit":"Terminate",
+ "description":"Terminates dev-box and archives its 2 projects (web, api). This can't be undone.",
+ "fields":[{"id":"confirm","label":"Type dev-box to confirm","required":true}]}
+```
+
+`session_id` is there when a tab was selected, and absent for the project
+itself. The reply is a form, as `create_form`'s, and its optional
+`description` is shown above the fields: say what submitting will do. A form
+with no fields is a plain confirmation (Enter submits it). Ask for something
+typed, as above, when the removal can't be undone. wrk sends the visible
+fields for the same project and session:
+
+```json
+{"method":"remove","project":{"name":"boxes/i-0abc","path":"/home/me","config":{"box":"i-0abc"}},"values":{"confirm":"dev-box"}}
+```
+```json
+{"ok":true,"message":"terminating dev-box"}
+```
+
+An error reply is shown in the form, which stays open (check the typed
+confirmation here, and say what's wrong). On success wrk shows `message` and
+lists your projects again. What you removed leaves the sidebar once a listing
+no longer has it, and its tabs go with it.
+
 ## How wrk drives a plugin
 
 | the user… | wrk sends |
@@ -302,6 +336,7 @@ error: it is shown to whoever asked.
 | starts wrk, waits 20 s, presses `r` (with `projects`) | `list_projects` |
 | opens one of your listed projects, or shows another of its tabs | an agent `attach` for the tab on screen only, and a shell `attach` with that tab's `session_id` while the shell is visible |
 | presses `+` in your group, or `Alt+n` in your project (with `create`) | `create_form`, then `create` with the values |
+| presses `d` on one of your projects or its tabs (with `remove`) | `remove_form`, then `remove` with the values |
 
 Before every request except `close`, wrk probes the socket. If nothing is
 listening and `command` is set, it **launches** the daemon:
@@ -408,7 +443,11 @@ fn handle(request: Request) -> Result<String> {
         Request::Attach(request) => proto::ok_reply(&attach(request)?),
         // Not advertised, so wrk never sends these, but answer anyway.
         Request::Close { .. } => proto::ok_reply(&serde_json::json!({})),
-        Request::ListProjects | Request::CreateForm { .. } | Request::Create { .. } => {
+        Request::ListProjects
+        | Request::CreateForm { .. }
+        | Request::Create { .. }
+        | Request::RemoveForm { .. }
+        | Request::Remove { .. } => {
             Ok(proto::error_reply("not supported"))
         }
     }

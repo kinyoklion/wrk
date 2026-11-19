@@ -160,9 +160,11 @@ impl Plugin {
             // Claude sessions live on disk; a closed tab leaves nothing to tear down.
             Request::Close { .. } => proto::ok_reply(&serde_json::json!({})),
             // Not advertised: this plugin's projects are projects.toml's.
-            Request::ListProjects | Request::CreateForm { .. } | Request::Create { .. } => {
-                Ok(proto::error_reply("not supported by this plugin"))
-            }
+            Request::ListProjects
+            | Request::CreateForm { .. }
+            | Request::Create { .. }
+            | Request::RemoveForm { .. }
+            | Request::Remove { .. } => Ok(proto::error_reply("not supported by this plugin")),
         }
     }
 

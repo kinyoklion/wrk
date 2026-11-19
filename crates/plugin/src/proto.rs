@@ -57,6 +57,24 @@ pub enum Request {
         #[serde(default)]
         values: BTreeMap<String, String>,
     },
+    /// Describe the form for removing one of the plugin's listed projects, or
+    /// the session `session_id` in it ([`FormResponse`]): what removing means
+    /// is the plugin's to say, and the form is how the person confirms it.
+    /// Only sent with the `remove` capability.
+    RemoveForm {
+        project: ProjectPayload,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
+    /// Remove what the filled-in removal form describes ([`RemoveResponse`]),
+    /// for the same `project` and `session_id`. Only sent with `remove`.
+    Remove {
+        project: ProjectPayload,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default)]
+        values: BTreeMap<String, String>,
+    },
 }
 
 /// The project a request is about: its name, its local directory, and the
@@ -135,6 +153,9 @@ pub struct Capabilities {
     /// `create_form` and `create` are supported: wrk can create projects and
     /// sessions with a form the plugin describes.
     pub create: bool,
+    /// `remove_form` and `remove` are supported: wrk can remove the plugin's
+    /// listed projects and sessions, with a form the plugin describes.
+    pub remove: bool,
 }
 
 /// Reply to [`Request::Hello`].
@@ -298,8 +319,12 @@ impl FormField {
 pub struct FormResponse {
     /// The dialog's title.
     pub title: String,
+    /// A paragraph shown above the fields: what submitting will do.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub fields: Vec<FormField>,
-    /// The submit action's label; `None` ⇒ "Create".
+    /// The submit action's label; `None` ⇒ "Create" (or "Remove", for a
+    /// removal form).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub submit: Option<String>,
 }
@@ -317,6 +342,16 @@ pub struct CreateResponse {
     pub session: Option<String>,
     /// A line for the status bar ("starting box-3; the session appears once
     /// it's up").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Reply to [`Request::Remove`]. wrk lists the plugin's projects again, so
+/// what was removed leaves the sidebar once a listing no longer has it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RemoveResponse {
+    /// A line for the status bar ("terminating box-3").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -501,6 +536,23 @@ mod tests {
             serde_json::from_str::<Request>(r#"{"method":"create_form"}"#).unwrap(),
             Request::CreateForm { project: None }
         );
+        let remove = Request::Remove {
+            project: project(),
+            session_id: Some("p/main".into()),
+            values: BTreeMap::from([("confirm".to_string(), "box-1".to_string())]),
+        };
+        let json = serde_json::to_string(&remove).unwrap();
+        assert!(json.starts_with(r#"{"method":"remove","#), "{json}");
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), remove);
+        let form = Request::RemoveForm {
+            project: project(),
+            session_id: None,
+        };
+        let json = serde_json::to_string(&form).unwrap();
+        assert!(!json.contains("session_id"), "{json}");
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), form);
+        let removed: RemoveResponse = parse_reply(r#"{"ok":true,"message":"gone"}"#).unwrap();
+        assert_eq!(removed.message.as_deref(), Some("gone"));
 
         let listing: ProjectsResponse = parse_reply(
             r#"{"ok":true,"group":"boxes","projects":[{"id":"b1","name":"box-1","state":"stopped",
