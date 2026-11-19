@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.1.17](https://github.com/kinyoklion/wrk/compare/wrk-v0.1.16...wrk-v0.1.17) (2026-11-19)
+
+### Features
+
+* **plugins:** let plugins remove the projects and sessions they list (#117) ([#117](https://github.com/kinyoklion/wrk/issues/117))
+* **api:** let widgets and scripts create through a session plugin (#116) ([#116](https://github.com/kinyoklion/wrk/issues/116))
+* **widgets:** widget plugins, notifications, and the wrk API (#110) (#114) ([#110](https://github.com/kinyoklion/wrk/issues/110)) ([#114](https://github.com/kinyoklion/wrk/issues/114))
+* **ipc:** let panes ask the user to confirm and post status messages (#115) ([#115](https://github.com/kinyoklion/wrk/issues/115))
+* **ui:** rounded corners on panes and dialogs (#109) (#113) ([#109](https://github.com/kinyoklion/wrk/issues/109)) ([#113](https://github.com/kinyoklion/wrk/issues/113))
+* **plugins:** let plugins list their own projects and create them from a form (#107) ([#107](https://github.com/kinyoklion/wrk/issues/107))
+* **review:** mouse support in the code-review overlay (#84) (#105) ([#84](https://github.com/kinyoklion/wrk/issues/84)) ([#105](https://github.com/kinyoklion/wrk/issues/105))
+* **sidebar:** nest sessions under projects with session search (#103) (#104) ([#103](https://github.com/kinyoklion/wrk/issues/103)) ([#104](https://github.com/kinyoklion/wrk/issues/104))
+* **plugins:** back projects with external session plugins (#102) ([#102](https://github.com/kinyoklion/wrk/issues/102))
+* **sessions:** follow in-tab session switches and remember past session names (#87, #99, #100, #86) (#101) ([#87](https://github.com/kinyoklion/wrk/issues/87)) ([#99](https://github.com/kinyoklion/wrk/issues/99)) ([#100](https://github.com/kinyoklion/wrk/issues/100)) ([#86](https://github.com/kinyoklion/wrk/issues/86)) ([#101](https://github.com/kinyoklion/wrk/issues/101))
+* **harness:** add Kimi coding-agent harness alongside Claude (#98) ([#98](https://github.com/kinyoklion/wrk/issues/98))
+* **layout:** default new projects to tabbed layout (#92) ([#92](https://github.com/kinyoklion/wrk/issues/92))
+
+### Bug Fixes
+
+* **review:** expand tabs so tab-indented code keeps its layout (#106) (#111) ([#106](https://github.com/kinyoklion/wrk/issues/106)) ([#111](https://github.com/kinyoklion/wrk/issues/111))
+* **sidebar:** mouse wheel scrolls the project list (#108) (#112) ([#108](https://github.com/kinyoklion/wrk/issues/108)) ([#112](https://github.com/kinyoklion/wrk/issues/112))
+* **review:** resolve repo from invocation dir; real subcommands for `review` (#94, #95) (#96) ([#94](https://github.com/kinyoklion/wrk/issues/94)) ([#95](https://github.com/kinyoklion/wrk/issues/95)) ([#96](https://github.com/kinyoklion/wrk/issues/96)) ([#94](https://github.com/kinyoklion/wrk/issues/94)) ([#95](https://github.com/kinyoklion/wrk/issues/95))
+
 ## [0.1.16](https://github.com/kinyoklion/wrk/compare/wrk-v0.1.15...wrk-v0.1.16) (2026-08-06)
 
 ### Features
