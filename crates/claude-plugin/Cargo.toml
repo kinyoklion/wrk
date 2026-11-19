@@ -1,7 +1,7 @@
 [package]
 name = "wrk-claude-plugin"
 description = "Reference wrk session plugin: wrk's built-in Claude support, externalized over the plugin protocol."
-version = "0.1.16" # x-release-please-version
+version = "0.1.17" # x-release-please-version
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
