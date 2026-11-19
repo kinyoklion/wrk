@@ -29,7 +29,7 @@ use wrk_plugin::proto::{
     AttachKind, AttachRequest, Capabilities, HelloResponse, ListResponse, ProjectPayload, Request,
 };
 pub use wrk_plugin::proto::{
-    AttachResponse, CreateResponse, FormResponse, PluginSession, ProjectsResponse,
+    AttachResponse, CreateResponse, FormResponse, PluginSession, ProjectsResponse, RemoveResponse,
 };
 
 use crate::settings::PluginConfig;
@@ -91,6 +91,25 @@ pub enum Job {
         values: BTreeMap<String, String>,
         ticket: Option<u64>,
     },
+    /// Fetch the plugin's form for removing listed project `project`, or its
+    /// session `session_id`.
+    RemoveForm {
+        project: ProjectPayload,
+        session_id: Option<String>,
+    },
+    /// Remove what a filled-in removal form describes.
+    Remove {
+        project: ProjectPayload,
+        session_id: Option<String>,
+        values: BTreeMap<String, String>,
+    },
+}
+
+/// Which of a plugin's forms a [`PluginEvent::Form`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormFor {
+    Create,
+    Remove,
 }
 
 /// A plugin's answer to [`Job::ListProjects`].
@@ -99,6 +118,8 @@ pub struct Listing {
     pub projects: ProjectsResponse,
     /// The plugin advertises `create`: its group offers a creation form.
     pub can_create: bool,
+    /// The plugin advertises `remove`: its projects and sessions can be removed.
+    pub can_remove: bool,
 }
 
 /// The outcome of a [`Job`], for the event loop. Errors are for display (the
@@ -130,12 +151,17 @@ pub enum PluginEvent {
     },
     Form {
         plugin: String,
+        purpose: FormFor,
         result: Result<FormResponse>,
     },
     Created {
         plugin: String,
         result: Result<CreateResponse>,
         ticket: Option<u64>,
+    },
+    Removed {
+        plugin: String,
+        result: Result<RemoveResponse>,
     },
 }
 
@@ -367,6 +393,7 @@ impl Worker {
                     Ok(Some(Listing {
                         projects,
                         can_create: conn.caps.create,
+                        can_remove: conn.caps.remove,
                     }))
                 });
                 PluginEvent::Projects { plugin, result }
@@ -378,7 +405,11 @@ impl Worker {
                     }
                     client::call(&conn.socket, &Request::CreateForm { project }, conn.timeout)
                 });
-                PluginEvent::Form { plugin, result }
+                PluginEvent::Form {
+                    plugin,
+                    purpose: FormFor::Create,
+                    result,
+                }
             }
             Job::Create {
                 project,
@@ -397,6 +428,44 @@ impl Worker {
                     result,
                     ticket,
                 }
+            }
+            Job::RemoveForm {
+                project,
+                session_id,
+            } => {
+                let result = self.connect(true).and_then(|conn| {
+                    if !conn.caps.remove {
+                        return Err(anyhow!("it can't remove projects or sessions"));
+                    }
+                    let request = Request::RemoveForm {
+                        project,
+                        session_id,
+                    };
+                    client::call(&conn.socket, &request, conn.timeout)
+                });
+                PluginEvent::Form {
+                    plugin,
+                    purpose: FormFor::Remove,
+                    result,
+                }
+            }
+            Job::Remove {
+                project,
+                session_id,
+                values,
+            } => {
+                let result = self.connect(true).and_then(|conn| {
+                    if !conn.caps.remove {
+                        return Err(anyhow!("it can't remove projects or sessions"));
+                    }
+                    let request = Request::Remove {
+                        project,
+                        session_id,
+                        values,
+                    };
+                    client::call(&conn.socket, &request, conn.timeout)
+                });
+                PluginEvent::Removed { plugin, result }
             }
         })
     }
@@ -580,6 +649,21 @@ mod tests {
                     }),
                     None => Ok(proto::error_reply("name is required")),
                 },
+                Request::RemoveForm { session_id, .. } => proto::ok_reply(&FormResponse {
+                    title: format!("Remove {}", session_id.as_deref().unwrap_or("box-1")),
+                    ..Default::default()
+                }),
+                Request::Remove {
+                    session_id, values, ..
+                } => match values.get("confirm").map(String::as_str) {
+                    Some("yes") => proto::ok_reply(&RemoveResponse {
+                        message: Some(format!(
+                            "removed {}",
+                            session_id.as_deref().unwrap_or("box-1")
+                        )),
+                    }),
+                    _ => Ok(proto::error_reply("not confirmed")),
+                },
             };
             let _ = (&stream).write_all(format!("{}\n", reply.unwrap()).as_bytes());
         }
@@ -610,6 +694,7 @@ mod tests {
             close: true,
             projects: true,
             create: true,
+            remove: true,
         };
         serve_fake(UnixListener::bind(socket).unwrap(), all, None);
     }
@@ -809,6 +894,72 @@ mod tests {
         match host.worker("p").run(create(&[])) {
             Some(PluginEvent::Created { result, .. }) => {
                 assert_eq!(result.unwrap_err().to_string(), "name is required");
+            }
+            other => panic!("{other:?}"),
+        }
+        // It doesn't remove: wrk says so without asking.
+        let remove_form = || Job::RemoveForm {
+            project: project(),
+            session_id: Some("p/main".into()),
+        };
+        match host.worker("p").run(remove_form()) {
+            Some(PluginEvent::Form {
+                result, purpose, ..
+            }) => {
+                assert_eq!(purpose, FormFor::Remove);
+                assert!(result.unwrap_err().to_string().contains("can't remove"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_removing_plugin_describes_and_carries_out_removals() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fake.sock");
+        let _seen = spawn_fake(
+            &socket,
+            Capabilities {
+                projects: true,
+                remove: true,
+                ..Default::default()
+            },
+        );
+        let mut host = host(dir.path(), config(None, Some(&socket)));
+        match host.worker("p").run(Job::ListProjects) {
+            Some(PluginEvent::Projects { result, .. }) => {
+                let listing = result.unwrap().unwrap();
+                assert!(listing.can_remove && !listing.can_create);
+            }
+            other => panic!("{other:?}"),
+        }
+        let form = Job::RemoveForm {
+            project: project(),
+            session_id: Some("p/main".into()),
+        };
+        match host.worker("p").run(form) {
+            Some(PluginEvent::Form {
+                result, purpose, ..
+            }) => {
+                assert_eq!(purpose, FormFor::Remove);
+                assert_eq!(result.unwrap().title, "Remove p/main");
+            }
+            other => panic!("{other:?}"),
+        }
+        let remove = |confirm: &str| Job::Remove {
+            project: project(),
+            session_id: None,
+            values: BTreeMap::from([("confirm".to_string(), confirm.to_string())]),
+        };
+        match host.worker("p").run(remove("yes")) {
+            Some(PluginEvent::Removed { result, .. }) => {
+                assert_eq!(result.unwrap().message.as_deref(), Some("removed box-1"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match host.worker("p").run(remove("no")) {
+            Some(PluginEvent::Removed { result, .. }) => {
+                assert_eq!(result.unwrap_err().to_string(), "not confirmed");
             }
             other => panic!("{other:?}"),
         }

@@ -44,6 +44,8 @@ pub struct RemoteGroup {
     pub error: Option<String>,
     /// The plugin advertises `create`.
     pub can_create: bool,
+    /// The plugin advertises `remove`.
+    pub can_remove: bool,
     /// A listing has arrived at least once.
     pub listed: bool,
 }
@@ -133,6 +135,7 @@ impl Remote {
                             projects: Vec::new(),
                             error: None,
                             can_create: false,
+                            can_remove: false,
                             listed: false,
                         });
                         self.groups.last_mut().expect("just pushed")
@@ -169,6 +172,7 @@ impl Remote {
                     projects,
                     error: None,
                     can_create: listing.can_create,
+                    can_remove: listing.can_remove,
                     listed: true,
                 };
                 match position {
@@ -324,6 +328,7 @@ mod tests {
                 projects,
             },
             can_create: true,
+            can_remove: true,
         }))
     }
 

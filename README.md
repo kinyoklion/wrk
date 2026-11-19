@@ -270,7 +270,7 @@ by default; tmux needs `set -g allow-passthrough on`).
 | `↑` / `↓` (or `j` / `k`) | move selection |
 | `Enter` (or double-click) | open the selected project, or the selected session (opening its project if needed) |
 | `+` | add a project (modal) |
-| `d` | delete the selected (or selected session's) project (modal) |
+| `d` | delete the selected (or selected session's) project (modal). On a project a plugin lists, or one of its tabs, the plugin's own form says what removing it means |
 | `u` | unload the selected (or selected session's) project — kill its claude + shell, free the session (modal) |
 | `/` | fuzzy filter over projects **and** sessions — a query matches `"<project> <session>"`, so `wrk issues` narrows to one session; `↑`/`↓` move, `Enter` opens, `Esc` clears |
 | `r` | reload `projects.toml` from disk |
@@ -536,13 +536,15 @@ is one line of JSON in, one line out, then the connection closes. Methods:
 
 | method          | request fields                                                                  | reply |
 |-----------------|---------------------------------------------------------------------------------|-------|
-| `hello`         | —                                                                               | `{name, version, capabilities:{list,shell,status,close,projects,create}}` |
+| `hello`         | —                                                                               | `{name, version, capabilities:{list,shell,status,close,projects,create,remove}}` |
 | `list_sessions` | `project`                                                                       | `{sessions:[{id, name?, state?}]}` (needs `list` cap) |
 | `attach`        | `project, session_id?, kind:"agent"\|"shell", fresh, name, wrk_sock?, wrk_tab?` | `{command:[…], env?:{…}, cwd?, session_id?}` |
 | `close`         | `project, session_id`                                                           | ignored (needs `close` cap, best-effort) |
 | `list_projects` | —                                                                               | `{group?, projects:[{id, name, state?, config?, sessions:[{id, name?, status?}]}]}` (needs `projects` cap) |
-| `create_form`   | `project?`                                                                      | `{title, fields:[{id, label, kind:"text"\|"select", options?, default?, required?, show_if?}], submit?}` (needs `create` cap) |
+| `create_form`   | `project?`                                                                      | `{title, description?, fields:[{id, label, kind:"text"\|"select", options?, default?, required?, show_if?}], submit?}` (needs `create` cap) |
 | `create`        | `project?, values:{field id: value}`                                            | `{project?, session?, message?}` (needs `create` cap) |
+| `remove_form`   | `project, session_id?`                                                          | a form, as `create_form`'s, with `description?` (needs `remove` cap) |
+| `remove`        | `project, session_id?, values:{field id: value}`                                | `{message?}` (needs `remove` cap) |
 
 `project` is `{name, path, config}` (config = the project's `plugin_config`).
 Replies carry `"ok": true`; reply `{"ok": false, "error": "…"}` to report a

@@ -1,7 +1,8 @@
-//! A form a session plugin describes (`create_form`) and wrk renders: text
-//! and select fields, some shown only while another field has a given value
-//! (`show_if`). Submitting sends the visible fields' values to the plugin's
-//! `create`. wrk knows nothing of what the fields mean.
+//! A form a session plugin describes (`create_form`, `remove_form`) and wrk
+//! renders: an optional description, then text and select fields, some shown
+//! only while another field has a given value (`show_if`). Submitting sends
+//! the visible fields' values to the plugin's `create` (or `remove`). wrk
+//! knows nothing of what the fields mean.
 //!
 //! ```text
 //! ╭ boxes: New session ───────────────────╮
@@ -25,6 +26,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Widget, Wrap};
 use wrk_plugin::proto::{FieldKind, FormField, FormResponse};
 
+pub use crate::plugin::FormFor;
+
 use super::modal::{centered_rect, field_style};
 use super::{bordered, cell_width, truncate_to_width};
 use crate::settings::Theme;
@@ -35,8 +38,13 @@ pub struct PluginFormModal {
     pub plugin: String,
     /// The plugin's sidebar heading, for the title.
     pub heading: String,
-    /// The listed project the form was opened from (its key), if any.
+    /// The listed project the form was opened from (its key), if any. A
+    /// removal form is always opened from one.
     pub context: Option<String>,
+    /// Whether submitting creates or removes.
+    pub purpose: FormFor,
+    /// For a removal: the session (tab) being removed, if it's one.
+    pub session_id: Option<String>,
     /// `None` until the plugin's description arrives.
     pub form: Option<FormResponse>,
     /// One value per field of `form`, by index: a text field's text, or the
@@ -56,6 +64,8 @@ impl PluginFormModal {
             plugin,
             heading,
             context,
+            purpose: FormFor::Create,
+            session_id: None,
             form: None,
             values: Vec::new(),
             focus: 0,
@@ -203,11 +213,56 @@ impl PluginFormModal {
             .unwrap_or(value)
     }
 
+    /// A removal form, for listed project `context` (or its session).
+    pub fn removing(
+        plugin: String,
+        heading: String,
+        context: String,
+        session_id: Option<String>,
+    ) -> Self {
+        Self {
+            purpose: FormFor::Remove,
+            session_id,
+            ..Self::loading(plugin, heading, Some(context))
+        }
+    }
+
+    /// The description, wrapped to `width`.
+    fn description_lines(&self, width: usize) -> Vec<String> {
+        let Some(text) = self.form.as_ref().and_then(|f| f.description.as_deref()) else {
+            return Vec::new();
+        };
+        let mut lines = Vec::new();
+        for paragraph in text.lines() {
+            let mut line = String::new();
+            for word in paragraph.split_whitespace() {
+                if !line.is_empty() && cell_width(&line) + 1 + cell_width(word) > width {
+                    lines.push(std::mem::take(&mut line));
+                }
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(word);
+            }
+            lines.push(line);
+        }
+        lines
+    }
+
     pub fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) -> Position {
         let visible = self.visible();
-        // Two rows a field, a spacer, the help and the footer.
-        let wanted = (visible.len().max(1) * 2 + 4) as u16;
         let popup = centered_rect(60, 100, area);
+        let description = self.description_lines(popup.width.saturating_sub(2).max(1) as usize);
+        // The description and a spacer, two rows a field, a spacer, the help
+        // and the footer. A confirmation (a description, no fields) needs
+        // only its spacer and footer.
+        let wanted = if visible.is_empty() && !description.is_empty() {
+            description.len() + 2
+        } else if description.is_empty() {
+            visible.len().max(1) * 2 + 4
+        } else {
+            description.len() + 1 + visible.len() * 2 + 4
+        } as u16;
         let height = (wanted + 2).min(area.height);
         let popup = Rect {
             y: area.y + area.height.saturating_sub(height) / 2,
@@ -245,6 +300,18 @@ impl PluginFormModal {
         }
 
         let mut y = 0u16;
+        // Rows kept below it: the spacer and footer, and the help with fields.
+        let below = if visible.is_empty() { 2 } else { 3 };
+        for line in &description {
+            if y + below >= inner.height {
+                break;
+            }
+            Paragraph::new(truncate_to_width(line, width)).render(row(y), buf);
+            y += 1;
+        }
+        if !description.is_empty() {
+            y += 1;
+        }
         for &i in &visible {
             if y + 1 >= inner.height {
                 break;
@@ -321,13 +388,20 @@ impl PluginFormModal {
             .form
             .as_ref()
             .and_then(|f| f.submit.clone())
-            .unwrap_or_else(|| "create".into())
+            .unwrap_or_else(|| match self.purpose {
+                FormFor::Create => "create".into(),
+                FormFor::Remove => "remove".into(),
+            })
             .to_lowercase();
         let (footer, style) = match (&self.error, self.submitting) {
             (Some(e), _) => (e.clone(), Style::default().fg(theme.error)),
             (None, true) => ("working…".to_string(), Style::default().fg(theme.hint)),
             (None, false) => (
-                format!("Tab/↑↓ field  ←/→ choose  Enter {submit}  Esc cancel"),
+                if visible.is_empty() {
+                    format!("Enter {submit}  Esc cancel")
+                } else {
+                    format!("Tab/↑↓ field  ←/→ choose  Enter {submit}  Esc cancel")
+                },
                 Style::default().fg(theme.hint),
             ),
         };
@@ -383,6 +457,7 @@ mod tests {
                 },
             ],
             submit: None,
+            description: None,
         }
     }
 
@@ -466,5 +541,66 @@ mod tests {
         assert!(all.contains("my-project"), "placeholder\n{all}");
         assert!(all.contains("Enter create"), "{all}");
         assert!(!all.contains("Box name"), "hidden\n{all}");
+    }
+
+    fn screen(m: &PluginFormModal, width: u16, height: u16) -> String {
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        m.render(area, &mut buf, &Theme::default());
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_removal_form_says_what_it_will_do_and_offers_to_remove() {
+        let mut m = PluginFormModal::removing(
+            "boxes".into(),
+            "boxes".into(),
+            "boxes/i-1".into(),
+            Some("p/main".into()),
+        );
+        assert_eq!(m.purpose, FormFor::Remove);
+        assert_eq!(m.context.as_deref(), Some("boxes/i-1"));
+        m.set_form(FormResponse {
+            title: "Archive project svc".into(),
+            description: Some(
+                "Stops every agent and shell in svc and archives it. Its three sessions leave the sidebar."
+                    .into(),
+            ),
+            ..Default::default()
+        });
+        // No fields: Enter alone confirms.
+        assert_eq!(m.submission().unwrap(), BTreeMap::new());
+        let all = screen(&m, 80, 20);
+        assert!(all.contains("boxes: Archive project svc"), "{all}");
+        assert!(all.contains("Stops every agent and shell"), "{all}");
+        assert!(all.contains("sidebar."), "wrapped, not cut\n{all}");
+        assert!(all.contains("Enter remove  Esc cancel"), "{all}");
+
+        // With a field, and a submit label of its own.
+        m.set_form(FormResponse {
+            title: "Terminate box dev".into(),
+            description: Some("Terminates dev for good.".into()),
+            submit: Some("Terminate".into()),
+            fields: vec![FormField {
+                id: "confirm".into(),
+                label: "Type dev to confirm".into(),
+                required: true,
+                ..Default::default()
+            }],
+        });
+        let all = screen(&m, 80, 20);
+        assert!(all.contains("Type dev to confirm *"), "{all}");
+        assert!(all.contains("Enter terminate"), "{all}");
+        assert_eq!(
+            m.submission().unwrap_err(),
+            "Type dev to confirm is required"
+        );
     }
 }

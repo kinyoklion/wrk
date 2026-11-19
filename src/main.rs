@@ -1357,11 +1357,16 @@ impl App {
     }
 
     /// The plugin's form description arrived: fill the open form with it.
-    fn show_plugin_form(&mut self, plugin: &str, result: Result<plugin::FormResponse>) {
+    fn show_plugin_form(
+        &mut self,
+        plugin: &str,
+        purpose: plugin::FormFor,
+        result: Result<plugin::FormResponse>,
+    ) {
         let Some(ModalState::PluginForm(m)) = self.modal.as_mut() else {
             return;
         };
-        if m.plugin != plugin || m.form.is_some() {
+        if m.plugin != plugin || m.purpose != purpose || m.form.is_some() {
             return;
         }
         match result {
@@ -1374,7 +1379,11 @@ impl App {
     /// the plugin's projects again, and open what it made once it's listed.
     fn finish_plugin_create(&mut self, plugin: &str, result: Result<plugin::CreateResponse>) {
         let form = match self.modal.as_mut() {
-            Some(ModalState::PluginForm(m)) if m.plugin == plugin && m.submitting => Some(m),
+            Some(ModalState::PluginForm(m))
+                if m.plugin == plugin && m.submitting && m.purpose == plugin::FormFor::Create =>
+            {
+                Some(m)
+            }
             _ => None,
         };
         match result {
@@ -1402,6 +1411,104 @@ impl App {
                         Instant::now(),
                     );
                 }
+                self.remote.refresh_soon(plugin);
+            }
+        }
+    }
+
+    /// The session of tab `tab` of listed project `key`, as the sidebar
+    /// shows it: an open tab's, or a listed one's before the project opens.
+    /// `None` for a markdown tab.
+    fn listed_session_at(&self, key: &str, tab: usize) -> Option<String> {
+        match self.sessions.get(key) {
+            Some(session) => match session.tabs.get(tab)? {
+                Tab::Claude(c) => c.session_id.clone(),
+                Tab::Markdown(_) => None,
+            },
+            None => self
+                .remote
+                .find(key)?
+                .claude_sessions
+                .get(tab)?
+                .session_id
+                .clone(),
+        }
+    }
+
+    /// `d` on a listed project, or on tab `tab` of one: its plugin's removal
+    /// form, when it removes things.
+    fn remove_listed(&mut self, key: &str, tab: Option<usize>) {
+        let Some(project) = self.remote.find(key) else {
+            return;
+        };
+        let Some(r) = project.remote.as_ref() else {
+            return;
+        };
+        let can_remove = self.remote.group(&r.plugin).is_some_and(|g| g.can_remove);
+        if !can_remove {
+            self.info = Some(format!(
+                "'{}' is listed by plugin '{}'; remove it there",
+                r.label, r.plugin
+            ));
+            return;
+        }
+        let session_id = match tab {
+            None => None,
+            Some(tab) => match self.listed_session_at(key, tab) {
+                Some(id) => Some(id),
+                None => {
+                    self.info = Some("a document tab: Alt+w closes it".into());
+                    return;
+                }
+            },
+        };
+        let plugin = r.plugin.clone();
+        let heading = self
+            .remote
+            .group(&plugin)
+            .map_or_else(|| plugin.clone(), |g| g.label.clone());
+        let payload = plugin::payload(project);
+        self.modal = Some(ModalState::PluginForm(PluginFormModal::removing(
+            plugin.clone(),
+            heading,
+            key.to_string(),
+            session_id.clone(),
+        )));
+        self.plugins.submit(
+            &plugin,
+            plugin::Job::RemoveForm {
+                project: payload,
+                session_id,
+            },
+        );
+    }
+
+    /// A `remove` finished: close its form (or say why it failed in it), and
+    /// list the plugin's projects again, which drops what's gone.
+    fn finish_plugin_remove(&mut self, plugin: &str, result: Result<plugin::RemoveResponse>) {
+        let form = match self.modal.as_mut() {
+            Some(ModalState::PluginForm(m))
+                if m.plugin == plugin && m.submitting && m.purpose == plugin::FormFor::Remove =>
+            {
+                Some(m)
+            }
+            _ => None,
+        };
+        match result {
+            Err(e) => match form {
+                Some(m) => {
+                    m.submitting = false;
+                    m.error = Some(format!("{e:#}"));
+                }
+                None => push_error(&mut self.error, format!("plugin '{plugin}': {e:#}")),
+            },
+            Ok(removed) => {
+                if form.is_some() {
+                    self.modal = None;
+                }
+                self.info = Some(removed.message.unwrap_or_else(|| {
+                    "removed; it leaves the sidebar once it's no longer listed".into()
+                }));
                 self.remote.refresh_soon(plugin);
             }
         }
@@ -1630,7 +1737,14 @@ impl App {
             plugin::PluginEvent::Projects { plugin, result } => {
                 self.apply_listing(&plugin, result, body);
             }
-            plugin::PluginEvent::Form { plugin, result } => self.show_plugin_form(&plugin, result),
+            plugin::PluginEvent::Form {
+                plugin,
+                purpose,
+                result,
+            } => self.show_plugin_form(&plugin, purpose, result),
+            plugin::PluginEvent::Removed { plugin, result } => {
+                self.finish_plugin_remove(&plugin, result);
+            }
             plugin::PluginEvent::Created {
                 plugin,
                 result,
@@ -3487,6 +3601,15 @@ fn forward_key_to_focused_pty(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// A plugin form's values, on their way to the plugin.
+struct FormSubmission {
+    plugin: String,
+    context: Option<String>,
+    purpose: plugin::FormFor,
+    session_id: Option<String>,
+    values: BTreeMap<String, String>,
+}
+
 fn handle_projects_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
     if app.sidebar.filter.is_some() {
         return handle_filter_key(app, key, body);
@@ -3511,21 +3634,16 @@ fn handle_projects_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
             }
         },
         KeyCode::Char('d') => {
-            if let Some(name) = app.sidebar.selected_project()
-                && let Some(p) = app.project(name)
+            if let Some((name, tab)) = app.sidebar.selected_target()
+                && let Some(p) = app.project(&name)
             {
-                app.modal = match &p.remote {
-                    Some(r) => {
-                        app.info = Some(format!(
-                            "'{}' is listed by plugin '{}'; remove it there",
-                            r.label, r.plugin
-                        ));
-                        None
-                    }
-                    None => Some(ModalState::ConfirmDelete(ConfirmDeleteModal {
+                if p.remote.is_some() {
+                    app.remove_listed(&name, tab);
+                } else {
+                    app.modal = Some(ModalState::ConfirmDelete(ConfirmDeleteModal {
                         project_name: p.name.clone(),
-                    })),
-                };
+                    }));
+                }
             }
         }
         KeyCode::Char('u') => {
@@ -3588,7 +3706,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
     // ends (opening needs `&mut app`).
     let mut open_md_input: Option<String> = None;
     // Deferred like `open_md_input`: (plugin, the form's project, values).
-    let mut create: Option<(String, Option<String>, BTreeMap<String, String>)> = None;
+    let mut submitted: Option<FormSubmission> = None;
     match app.modal.as_mut().unwrap() {
         ModalState::Add(m) => match key.code {
             KeyCode::Esc => {
@@ -3770,7 +3888,13 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
                 Ok(values) => {
                     m.submitting = true;
                     m.error = None;
-                    create = Some((m.plugin.clone(), m.context.clone(), values));
+                    submitted = Some(FormSubmission {
+                        plugin: m.plugin.clone(),
+                        context: m.context.clone(),
+                        purpose: m.purpose,
+                        session_id: m.session_id.clone(),
+                        values,
+                    });
                 }
                 Err(e) => m.error = Some(e),
             },
@@ -3835,19 +3959,33 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, body: Rect) -> Result<()> {
             _ => {}
         }
     }
-    if let Some((plugin, context, values)) = create {
-        let project = context
+    if let Some(sent) = submitted {
+        let project = sent
+            .context
             .as_deref()
             .and_then(|key| app.remote.find(key))
             .map(plugin::payload);
-        app.plugins.submit(
-            &plugin,
-            plugin::Job::Create {
+        let job = match (sent.purpose, project) {
+            (plugin::FormFor::Create, project) => Some(plugin::Job::Create {
                 project,
-                values,
+                values: sent.values,
                 ticket: None,
-            },
-        );
+            }),
+            (plugin::FormFor::Remove, Some(project)) => Some(plugin::Job::Remove {
+                project,
+                session_id: sent.session_id,
+                values: sent.values,
+            }),
+            // Its project left the listing while the form was open.
+            (plugin::FormFor::Remove, None) => None,
+        };
+        match job {
+            Some(job) => app.plugins.submit(&sent.plugin, job),
+            None => {
+                app.modal = None;
+                app.info = Some("it's gone already".into());
+            }
+        }
     }
     // Deferred markdown open: succeed → close the modal; fail → keep it open and
     // show the error inline.
@@ -4524,9 +4662,10 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, ClaudeTab, Focus, HarnessKind, MarkdownTab, ModalState, PluginAttach, Project,
-        ProjectSession, ProjectStore, Settings, Tab, continue_agent_command, expand_tilde,
-        handle_modal_key, new_agent_command, new_session_id, normalize_paste, resume_agent_command,
+        App, ClaudeTab, Focus, HarnessKind, MarkdownTab, ModalState, PluginAttach, PluginFormModal,
+        Project, ProjectSession, ProjectStore, Settings, Tab, continue_agent_command, expand_tilde,
+        handle_modal_key, handle_projects_key, new_agent_command, new_session_id, normalize_paste,
+        resume_agent_command,
     };
     use crate::settings::HarnessConfig;
     use crate::{ipc, plugin, ui};
@@ -5196,6 +5335,7 @@ mod tests {
                 }],
             },
             can_create: true,
+            can_remove: true,
         };
         app.apply_listing("boxes", Ok(Some(listing)), Rect::new(0, 0, 120, 40));
     }
@@ -5297,6 +5437,7 @@ mod tests {
             Ok(Some(plugin::Listing {
                 projects: Default::default(),
                 can_create: true,
+                can_remove: false,
             })),
             Rect::new(0, 0, 120, 40),
         );
@@ -5439,6 +5580,109 @@ mod tests {
         listed(&mut app, &["web/main", "api/main"]);
         assert_eq!(app.active_project_name.as_deref(), Some("boxes/i-1"));
         assert_eq!(app.sessions["boxes/i-1"].active_tab, 1);
+    }
+
+    #[test]
+    fn d_on_a_listed_project_or_tab_asks_its_plugin_how_to_remove_it() {
+        use crate::ui::projects::RowKey;
+        let body = Rect::new(0, 0, 120, 40);
+        let mut app = empty_app();
+        listed(&mut app, &["web/main", "web/fix"]);
+        app.refresh_sidebar();
+        let form = |app: &App| match app.modal.as_ref() {
+            Some(ModalState::PluginForm(m)) => Some((
+                m.purpose,
+                m.context.clone(),
+                m.session_id.clone(),
+                m.form.is_some(),
+            )),
+            _ => None,
+        };
+
+        // A plugin that doesn't remove: say where to do it instead.
+        app.remote.groups[0].can_remove = false;
+        app.sidebar.select_key(&RowKey::Project("boxes/i-1".into()));
+        handle_projects_key(&mut app, key('d'), body).unwrap();
+        assert!(app.modal.is_none());
+        assert!(app.info.as_deref().unwrap().contains("remove it there"));
+        app.remote.groups[0].can_remove = true;
+
+        // The project: a removal form for it, loading.
+        handle_projects_key(&mut app, key('d'), body).unwrap();
+        assert_eq!(
+            form(&app),
+            Some((
+                plugin::FormFor::Remove,
+                Some("boxes/i-1".into()),
+                None,
+                false
+            ))
+        );
+        // A late creation form doesn't fill it; the removal form does.
+        let described = |title: &str| {
+            Ok(plugin::FormResponse {
+                title: title.into(),
+                ..Default::default()
+            })
+        };
+        app.show_plugin_form("boxes", plugin::FormFor::Create, described("New"));
+        assert!(!form(&app).unwrap().3);
+        app.show_plugin_form(
+            "boxes",
+            plugin::FormFor::Remove,
+            described("Terminate dev-box"),
+        );
+        assert!(form(&app).unwrap().3);
+
+        // A tab: the form is for its session.
+        app.modal = None;
+        app.sidebar
+            .select_key(&RowKey::Session("boxes/i-1".into(), 1));
+        handle_projects_key(&mut app, key('d'), body).unwrap();
+        assert_eq!(
+            form(&app),
+            Some((
+                plugin::FormFor::Remove,
+                Some("boxes/i-1".into()),
+                Some("web/fix".into()),
+                false
+            ))
+        );
+    }
+
+    #[test]
+    fn a_removal_closes_its_form_or_says_why_it_failed_there() {
+        let mut app = empty_app();
+        listed(&mut app, &["web/main"]);
+        let mut m =
+            PluginFormModal::removing("boxes".into(), "boxes".into(), "boxes/i-1".into(), None);
+        m.set_form(plugin::FormResponse::default());
+        m.submitting = true;
+        app.modal = Some(ModalState::PluginForm(m));
+        app.finish_plugin_remove("boxes", Err(anyhow::anyhow!("type the box's name")));
+        match app.modal.as_ref() {
+            Some(ModalState::PluginForm(m)) => {
+                assert_eq!(m.error.as_deref(), Some("type the box's name"));
+                assert!(!m.submitting, "it can be sent again");
+            }
+            other => panic!("{other:?}"),
+        }
+        // A creation's result is not this form's.
+        if let Some(ModalState::PluginForm(m)) = app.modal.as_mut() {
+            m.submitting = true;
+        }
+        app.finish_plugin_create("boxes", Err(anyhow::anyhow!("unrelated")));
+        assert!(
+            matches!(&app.modal, Some(ModalState::PluginForm(m)) if m.error.as_deref() == Some("type the box's name"))
+        );
+        app.finish_plugin_remove(
+            "boxes",
+            Ok(plugin::RemoveResponse {
+                message: Some("terminating dev-box".into()),
+            }),
+        );
+        assert!(app.modal.is_none());
+        assert_eq!(app.info.as_deref(), Some("terminating dev-box"));
     }
 
     #[test]
