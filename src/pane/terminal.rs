@@ -10,6 +10,7 @@ use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::term::ClipboardType;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, TermMode, viewport_to_point};
 use anyhow::{Context, Result};
@@ -42,18 +43,40 @@ impl Dimensions for TermSize {
 
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
+/// Text a pane's program copied with OSC 52 (`ESC ]52;c;<base64>`), waiting
+/// for wrk to put it on the host terminal's clipboard. A program on another
+/// machine (over ssh, or in a remote tmux) has no clipboard but this one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Copied {
+    /// The primary selection rather than the clipboard (`p` or `s`).
+    pub primary: bool,
+    pub text: String,
+}
+
 #[derive(Clone)]
 struct PtyEventListener {
     writer: SharedWriter,
+    copied: Arc<Mutex<Vec<Copied>>>,
 }
 
 impl EventListener for PtyEventListener {
     fn send_event(&self, event: Event) {
-        if let Event::PtyWrite(s) = event
-            && let Ok(mut w) = self.writer.lock()
-        {
-            let _ = w.write_all(s.as_bytes());
-            let _ = w.flush();
+        match event {
+            Event::PtyWrite(s) => {
+                if let Ok(mut w) = self.writer.lock() {
+                    let _ = w.write_all(s.as_bytes());
+                    let _ = w.flush();
+                }
+            }
+            Event::ClipboardStore(kind, text) => {
+                if let Ok(mut copied) = self.copied.lock() {
+                    copied.push(Copied {
+                        primary: kind == ClipboardType::Selection,
+                        text,
+                    });
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -62,6 +85,7 @@ pub struct PtyPane {
     term: Arc<Mutex<Term<PtyEventListener>>>,
     pty: Pty,
     writer: SharedWriter,
+    copied: Arc<Mutex<Vec<Copied>>>,
     reader_thread: Option<JoinHandle<()>>,
     /// Timestamp of the most recently received PTY output, updated by the
     /// reader thread. Used by the sidebar to infer "waiting for input"
@@ -92,8 +116,10 @@ impl PtyPane {
         let raw_writer = pty.master.take_writer().context("taking pty writer")?;
         let writer: SharedWriter = Arc::new(Mutex::new(raw_writer));
 
+        let copied = Arc::new(Mutex::new(Vec::new()));
         let listener = PtyEventListener {
             writer: Arc::clone(&writer),
+            copied: Arc::clone(&copied),
         };
         let term = Term::new(Config::default(), &size, listener);
         let term = Arc::new(Mutex::new(term));
@@ -129,6 +155,7 @@ impl PtyPane {
             term,
             pty,
             writer,
+            copied,
             reader_thread: Some(reader_thread),
             last_output,
             rows,
@@ -144,6 +171,14 @@ impl PtyPane {
         w.write_all(bytes).context("writing to pty")?;
         w.flush().ok();
         Ok(())
+    }
+
+    /// What the program has copied (OSC 52) since the last call, oldest first.
+    pub fn take_copied(&self) -> Vec<Copied> {
+        self.copied
+            .lock()
+            .map(|mut c| std::mem::take(&mut *c))
+            .unwrap_or_default()
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
@@ -693,6 +728,35 @@ mod tests {
 
     fn chars(s: &str) -> Vec<char> {
         s.chars().collect()
+    }
+
+    /// The program's OSC 52 copies, as each kind of program writes them:
+    /// Claude Code's `c`, tmux's empty selection (the clipboard too), the
+    /// primary selection, and either terminator.
+    #[test]
+    fn a_pane_keeps_what_its_program_copies_for_wrk() {
+        let script = r"printf '\033]52;c;aGk=\007\033]52;;ZnJvbSB0bXV4\033\\\033]52;p;cHJpbWFyeQ==\007'; exec cat";
+        let cmd = ["sh", "-c", script].map(String::from);
+        let pane = PtyPane::spawn(&cmd, Path::new("/"), 24, 80, &[]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut copied = Vec::new();
+        while copied.len() < 3 && Instant::now() < deadline {
+            copied.extend(pane.take_copied());
+            thread::sleep(Duration::from_millis(20));
+        }
+        let copy = |primary, text: &str| Copied {
+            primary,
+            text: text.into(),
+        };
+        assert_eq!(
+            copied,
+            [
+                copy(false, "hi"),
+                copy(false, "from tmux"),
+                copy(true, "primary")
+            ]
+        );
+        assert!(pane.take_copied().is_empty(), "each copy is taken once");
     }
 
     #[test]

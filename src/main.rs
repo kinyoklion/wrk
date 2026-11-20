@@ -2047,6 +2047,22 @@ impl App {
             .unwrap_or_else(|| name.to_string())
     }
 
+    /// What programs in any pane (every session's tabs and shell, and the
+    /// widgets) copied with OSC 52 since the last call, for the host
+    /// terminal's clipboard. Background panes count too, as in a terminal.
+    fn take_copied(&self) -> Vec<pane::terminal::Copied> {
+        let sessions = self.sessions.values().flat_map(|s| {
+            s.claude_tabs()
+                .filter_map(|t| t.pane.as_ref())
+                .chain(s.shell.as_ref())
+        });
+        let widgets = self.widgets.instances.iter().map(|w| &w.pane);
+        sessions
+            .chain(widgets)
+            .flat_map(|p| p.take_copied())
+            .collect()
+    }
+
     /// Keep `wrk confirm` prompts moving: drop any whose requester hung up
     /// (closing the one on screen with a note), and show the next once no
     /// other modal is open.
@@ -2621,14 +2637,33 @@ fn push_error(slot: &mut Option<String>, msg: String) {
 /// Copy `text` to the host terminal's clipboard via OSC 52 (`ESC ]52;c;<b64> BEL`).
 /// Self-contained so it works over SSH without needing `xclip`/`wl-copy`. Some
 /// terminals require enabling OSC 52 clipboard writes (e.g. xterm
-/// `allowWindowOps`/`disallowedWindowOps`, tmux `set -g allow-passthrough on`).
+/// `allowWindowOps`/`disallowedWindowOps`; inside tmux, `set -g set-clipboard on`).
 fn copy_to_clipboard(text: &str) {
+    write_to_host(&osc52(text, false));
+}
+
+/// The OSC 52 sequence that puts `text` on the clipboard, or on the primary
+/// selection when `primary`.
+fn osc52(text: &str, primary: bool) -> String {
     use base64::Engine;
-    use std::io::Write;
     let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    let payload = format!("\x1b]52;c;{encoded}\x07");
+    let target = if primary { 'p' } else { 'c' };
+    format!("\x1b]52;{target};{encoded}\x07")
+}
+
+/// Pass what programs in panes copied on to the host terminal, as a terminal
+/// does. A program in a remote session can't reach a clipboard any other way.
+fn forward_copied(app: &App) {
+    for c in app.take_copied() {
+        write_to_host(&osc52(&c.text, c.primary));
+    }
+}
+
+/// Write an escape sequence straight to the host terminal, between frames.
+fn write_to_host(seq: &str) {
+    use std::io::Write;
     let mut stdout = io::stdout();
-    let _ = stdout.write_all(payload.as_bytes());
+    let _ = stdout.write_all(seq.as_bytes());
     let _ = stdout.flush();
 }
 
@@ -2838,6 +2873,9 @@ fn event_loop(
                 _ => {}
             }
         }
+
+        // Before reaping, so a program that copies and exits still lands.
+        forward_copied(app);
 
         // Reap dead children on the active session so the placeholder shows.
         if let Some(session) = app.active_session_mut() {
@@ -5930,6 +5968,39 @@ mod tests {
         crate::handle_mouse(&mut app, click(area.width - 2), area);
         assert!(app.notifications.is_empty());
         assert!(app.error.is_none());
+    }
+
+    /// What a program in any pane copies (OSC 52) is passed on to the host
+    /// terminal's clipboard: a background tab's and the shell's as well as
+    /// the shown tab's.
+    #[test]
+    fn what_programs_in_panes_copy_goes_to_the_host_clipboard() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = crate::api::tests::open_app(dir.path());
+        let copying = |b64: &str| {
+            let script = format!("printf '\\033]52;c;{b64}\\007'; exec cat");
+            let cmd = ["sh".to_string(), "-c".into(), script];
+            crate::PtyPane::spawn(&cmd, dir.path(), 24, 80, &[]).unwrap()
+        };
+        let session = app.sessions.get_mut("p").unwrap();
+        // "side" is a background tab; "main" is shown.
+        session.tabs[1].as_claude_mut().unwrap().pane = Some(copying("c2lkZQ=="));
+        session.shell = Some(copying("c2hlbGw="));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut copied = Vec::new();
+        while copied.len() < 2 && Instant::now() < deadline {
+            copied.extend(app.take_copied().into_iter().map(|c| c.text));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        copied.sort();
+        assert_eq!(copied, ["shell", "side"]);
+        assert!(app.take_copied().is_empty());
+
+        // As the host terminal gets it.
+        assert_eq!(crate::osc52("side", false), "\x1b]52;c;c2lkZQ==\x07");
+        assert_eq!(crate::osc52("side", true), "\x1b]52;p;c2lkZQ==\x07");
     }
 
     #[test]
