@@ -81,7 +81,8 @@ Each `PtyPane` wraps:
 - a `portable_pty` master/child pair (spawned via `proc::spawn`, which sets `TERM=xterm-256color` and any extra env),
 - a shared `Arc<Mutex<Term<PtyEventListener>>>` (alacritty grid),
 - a reader thread that pumps PTY bytes through `vte::ansi::Processor` into the `Term`,
-- a `last_output: Arc<Mutex<Instant>>` updated by the reader thread for the idle-heuristic fallback.
+- a `last_output: Arc<Mutex<Instant>>` updated by the reader thread for the idle-heuristic fallback,
+- a `copied` queue: `PtyEventListener` answers `Event::PtyWrite` back into the PTY and queues `Event::ClipboardStore` (the program's OSC 52 copy) as `Copied{primary, text}`. Every tick `forward_copied` drains every pane's queue (`App::take_copied`: all sessions' tabs and shells, and widgets) and writes each to the host terminal as OSC 52 (`osc52`, `write_to_host`, between frames). That's the only way a remote session's copy (ssh, a remote tmux) reaches the clipboard.
 
 A custom `PtyPaneWidget` reads the alacritty grid each frame and emits styled `ratatui::Cell`s. On resize we call both `Term::resize` and `pty.resize` together. Mouse wheel scrolls the alacritty scrollback (10k lines).
 

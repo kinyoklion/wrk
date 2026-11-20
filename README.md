@@ -87,6 +87,11 @@ project. Linux-only, native rendering (via your terminal), built on
   bar shows a `[select]` chip), drag with the mouse to highlight cells in the
   focused pane, release to copy via OSC 52 — works through SSH and bypasses
   the host terminal's whole-row selection. Esc cancels without copying.
+- **Copies from programs in panes reach your clipboard**: what a program
+  copies with OSC 52 (Claude's copy-on-select and its copy prompts, tmux copy
+  mode, a remote shell's `osc52` helper) is passed on to your terminal, as a
+  terminal does. That's how a session on another machine, over ssh or in a
+  remote tmux, reaches your clipboard at all.
 - **Configurable claude command** for quirky setups (e.g. `steam-run claude
   --continue` on NixOS).
 
@@ -259,9 +264,11 @@ shows a `[select]` chip): plain mouse-drag highlights cells in whichever pane
 mouse capture and the host terminal's whole-row selection — and releasing the
 button copies the selection to your clipboard via OSC 52. In a markdown tab the
 selection covers the visible area (scroll first, then drag). The mode auto-exits after the copy;
-press `Esc` to cancel without copying. OSC 52 must be allowed by your outer
+press `Esc` to cancel without copying. Programs in panes can copy too: what
+one writes as OSC 52 (`ESC ]52;c;<base64>`) is passed on the same way, from a
+background tab as well as the shown one. OSC 52 must be allowed by your outer
 terminal for the clipboard write to land (xterm/Ghostty/kitty/foot allow it
-by default; tmux needs `set -g allow-passthrough on`).
+by default; tmux needs `set -g set-clipboard on`).
 
 **On the projects pane:**
 
