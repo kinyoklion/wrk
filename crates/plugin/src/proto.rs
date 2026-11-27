@@ -156,6 +156,12 @@ pub struct Capabilities {
     /// `remove_form` and `remove` are supported: wrk can remove the plugin's
     /// listed projects and sessions, with a form the plugin describes.
     pub remove: bool,
+    /// Closing one of the plugin's listed tabs (`projects`) ends its session:
+    /// wrk sends `close` for it and drops the tab, and the plugin is expected
+    /// to stop the session so later listings no longer include it. Without
+    /// it, closing a listed tab only detaches its pane and the tab stays.
+    /// Enough on its own: it does not need `close` as well.
+    pub close_listed: bool,
 }
 
 /// Reply to [`Request::Hello`].
@@ -589,5 +595,13 @@ mod tests {
     fn hello_defaults_when_capabilities_are_omitted() {
         let hello: HelloResponse = parse_reply(r#"{"ok":true,"name":"x"}"#).unwrap();
         assert_eq!(hello.capabilities, Capabilities::default());
+    }
+
+    #[test]
+    fn close_listed_is_its_own_capability() {
+        let hello: HelloResponse =
+            parse_reply(r#"{"ok":true,"name":"x","capabilities":{"close_listed":true}}"#).unwrap();
+        assert!(hello.capabilities.close_listed);
+        assert!(!hello.capabilities.close, "it doesn't imply `close`");
     }
 }

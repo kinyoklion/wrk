@@ -533,20 +533,21 @@ sessions come from its listing (`list_projects`, asked at startup, every 20 s,
 and on `r`), not from `projects.toml`, and are never written there. Opening one
 attaches only the tab on screen (others attach when you show them), and its
 shell follows the shown tab. `Alt+w` on such a tab only detaches it: the session
-keeps running wherever the plugin keeps it. With `create`, `+` in the group (or
-`Enter` on its heading, or `Alt+n` in one of its projects) opens a form the
-plugin describes (text and select fields, some shown only for certain choices),
-and what it creates opens once a listing includes it.
+keeps running wherever the plugin keeps it. A plugin advertising `close_listed`
+ends the session instead: the tab closes and the plugin is sent `close`. With
+`create`, `+` in the group (or `Enter` on its heading, or `Alt+n` in one of its
+projects) opens a form the plugin describes (text and select fields, some shown
+only for certain choices), and what it creates opens once a listing includes it.
 
 **Protocol.** wrk is the client; the plugin listens on the socket. Each request
 is one line of JSON in, one line out, then the connection closes. Methods:
 
 | method          | request fields                                                                  | reply |
 |-----------------|---------------------------------------------------------------------------------|-------|
-| `hello`         | —                                                                               | `{name, version, capabilities:{list,shell,status,close,projects,create,remove}}` |
+| `hello`         | —                                                                               | `{name, version, capabilities:{list,shell,status,close,projects,create,remove,close_listed}}` |
 | `list_sessions` | `project`                                                                       | `{sessions:[{id, name?, state?}]}` (needs `list` cap) |
 | `attach`        | `project, session_id?, kind:"agent"\|"shell", fresh, name, wrk_sock?, wrk_tab?` | `{command:[…], env?:{…}, cwd?, session_id?}` |
-| `close`         | `project, session_id`                                                           | ignored (needs `close` cap, best-effort) |
+| `close`         | `project, session_id`                                                           | ignored (needs `close`, or `close_listed` for a listed tab; best-effort) |
 | `list_projects` | —                                                                               | `{group?, projects:[{id, name, state?, config?, sessions:[{id, name?, status?}]}]}` (needs `projects` cap) |
 | `create_form`   | `project?`                                                                      | `{title, description?, fields:[{id, label, kind:"text"\|"select", options?, default?, required?, show_if?}], submit?}` (needs `create` cap) |
 | `create`        | `project?, values:{field id: value}`                                            | `{project?, session?, message?}` (needs `create` cap) |
