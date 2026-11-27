@@ -29,20 +29,36 @@ impl DiffTarget {
     ///
     /// `""` → [`DiffTarget::WorkingVsHead`]; `"a..b"` (or `"a...b"`) →
     /// [`DiffTarget::Range`]; anything else → [`DiffTarget::WorkingVs`].
-    pub fn parse(s: &str) -> DiffTarget {
+    ///
+    /// A revision starting with `-` is refused: it would reach git as an
+    /// option (`git diff --name-status --output=<file>` writes a file), and
+    /// no branch, tag or commit is named that way (#95).
+    pub fn parse(s: &str) -> Result<DiffTarget> {
         let s = s.trim();
         if s.is_empty() {
-            return DiffTarget::WorkingVsHead;
+            return Ok(DiffTarget::WorkingVsHead);
         }
-        if let Some((a, b)) = s.split_once("..") {
+        let target = if let Some((a, b)) = s.split_once("..") {
             let a = a.trim();
             // Tolerate the three-dot `a...b` form by stripping the extra dot.
             let b = b.trim().trim_start_matches('.').trim();
             let a = if a.is_empty() { "HEAD" } else { a };
             let b = if b.is_empty() { "HEAD" } else { b };
-            return DiffTarget::Range(a.to_string(), b.to_string());
+            DiffTarget::Range(a.to_string(), b.to_string())
+        } else {
+            DiffTarget::WorkingVs(s.to_string())
+        };
+        let revs = match &target {
+            DiffTarget::WorkingVsHead => vec![],
+            DiffTarget::WorkingVs(rev) => vec![rev],
+            DiffTarget::Range(a, b) => vec![a, b],
+        };
+        if revs.iter().any(|rev| rev.starts_with('-')) {
+            return Err(anyhow!(
+                "not a git revision: '{s}' (a review target can't start with '-')"
+            ));
         }
-        DiffTarget::WorkingVs(s.to_string())
+        Ok(target)
     }
 
     /// Short human label for the status/confirmation line.
@@ -458,25 +474,45 @@ mod tests {
 
     #[test]
     fn parse_target_forms() {
-        assert_eq!(DiffTarget::parse(""), DiffTarget::WorkingVsHead);
-        assert_eq!(DiffTarget::parse("  "), DiffTarget::WorkingVsHead);
+        let parse = |s: &str| DiffTarget::parse(s).unwrap();
+        assert_eq!(parse(""), DiffTarget::WorkingVsHead);
+        assert_eq!(parse("  "), DiffTarget::WorkingVsHead);
+        assert_eq!(parse("main"), DiffTarget::WorkingVs("main".into()));
         assert_eq!(
-            DiffTarget::parse("main"),
-            DiffTarget::WorkingVs("main".into())
-        );
-        assert_eq!(
-            DiffTarget::parse("main..HEAD"),
+            parse("main..HEAD"),
             DiffTarget::Range("main".into(), "HEAD".into())
         );
         // Three-dot form tolerated.
         assert_eq!(
-            DiffTarget::parse("origin/main...feature"),
+            parse("origin/main...feature"),
             DiffTarget::Range("origin/main".into(), "feature".into())
         );
         // Open-ended ranges default the empty side to HEAD.
         assert_eq!(
-            DiffTarget::parse("v1.0.."),
+            parse("v1.0.."),
             DiffTarget::Range("v1.0".into(), "HEAD".into())
+        );
+    }
+
+    /// A revision that git would read as an option is refused, on either side
+    /// of a range (#95: `git diff --name-status --output=<file>` writes a file).
+    #[test]
+    fn parse_refuses_revisions_that_look_like_options() {
+        for target in [
+            "-x",
+            "--help",
+            " --output=/tmp/f ",
+            "--output=a..b",
+            "main..-x",
+            "main...--output=f",
+        ] {
+            let err = DiffTarget::parse(target).unwrap_err().to_string();
+            assert!(err.contains("can't start with '-'"), "{target}: {err}");
+        }
+        // A dash inside a name is fine.
+        assert_eq!(
+            DiffTarget::parse("fix-95..my-branch").unwrap(),
+            DiffTarget::Range("fix-95".into(), "my-branch".into())
         );
     }
 
