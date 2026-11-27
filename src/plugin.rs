@@ -120,6 +120,9 @@ pub struct Listing {
     pub can_create: bool,
     /// The plugin advertises `remove`: its projects and sessions can be removed.
     pub can_remove: bool,
+    /// The plugin advertises `close_listed`: closing a listed tab ends its
+    /// session (wrk sends `close` and drops the tab) rather than detaching.
+    pub can_close: bool,
 }
 
 /// The outcome of a [`Job`], for the event loop. Errors are for display (the
@@ -373,7 +376,7 @@ impl Worker {
                 session_id,
             } => {
                 if let Ok(conn) = self.connect(false)
-                    && conn.caps.close
+                    && (conn.caps.close || conn.caps.close_listed)
                 {
                     let request = Request::Close {
                         project,
@@ -394,6 +397,7 @@ impl Worker {
                         projects,
                         can_create: conn.caps.create,
                         can_remove: conn.caps.remove,
+                        can_close: conn.caps.close_listed,
                     }))
                 });
                 PluginEvent::Projects { plugin, result }
@@ -587,11 +591,12 @@ mod tests {
     /// A minimal plugin: answers `hello` with `caps`, and `attach` with a
     /// command plus a session id naming the serving process (to tell a
     /// relaunched daemon from the original). Each attach request is sent to
-    /// `seen`, if given.
+    /// `seen`, and each closed session id to `closed`, if given.
     fn serve_fake(
         listener: UnixListener,
         caps: Capabilities,
         seen: Option<std::sync::mpsc::Sender<AttachRequest>>,
+        closed: Option<std::sync::mpsc::Sender<String>>,
     ) {
         for stream in listener.incoming().flatten() {
             let mut line = String::new();
@@ -622,7 +627,12 @@ mod tests {
                         status: None,
                     }],
                 }),
-                Request::Close { .. } => proto::ok_reply(&serde_json::json!({})),
+                Request::Close { session_id, .. } => {
+                    if let Some(closed) = &closed {
+                        let _ = closed.send(session_id);
+                    }
+                    proto::ok_reply(&serde_json::json!({}))
+                }
                 Request::ListProjects => proto::ok_reply(&ProjectsResponse {
                     group: Some("fakes".into()),
                     projects: vec![wrk_plugin::proto::RemoteProject {
@@ -673,7 +683,15 @@ mod tests {
     fn spawn_fake(socket: &Path, caps: Capabilities) -> std::sync::mpsc::Receiver<AttachRequest> {
         let listener = UnixListener::bind(socket).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || serve_fake(listener, caps, Some(tx)));
+        std::thread::spawn(move || serve_fake(listener, caps, Some(tx), None));
+        rx
+    }
+
+    /// [`spawn_fake`], reporting the session ids it is told closed instead.
+    fn spawn_fake_closes(socket: &Path, caps: Capabilities) -> std::sync::mpsc::Receiver<String> {
+        let listener = UnixListener::bind(socket).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || serve_fake(listener, caps, None, Some(tx)));
         rx
     }
 
@@ -695,8 +713,9 @@ mod tests {
             projects: true,
             create: true,
             remove: true,
+            close_listed: true,
         };
-        serve_fake(UnixListener::bind(socket).unwrap(), all, None);
+        serve_fake(UnixListener::bind(socket).unwrap(), all, None, None);
     }
 
     fn fake_daemon_command() -> Vec<String> {
@@ -997,6 +1016,62 @@ mod tests {
         };
         assert!(host.worker("p").run(job).is_none());
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn close_notices_go_to_plugins_that_want_them() {
+        // (close, close_listed) ⇒ whether the notice is delivered.
+        for (close, close_listed, delivered) in [
+            (false, false, false),
+            (true, false, true),
+            (false, true, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("fake.sock");
+            let closed = spawn_fake_closes(
+                &socket,
+                Capabilities {
+                    close,
+                    close_listed,
+                    ..Default::default()
+                },
+            );
+            let mut host = host(dir.path(), config(None, Some(&socket)));
+            let job = Job::Close {
+                project: project(),
+                session_id: "s1".into(),
+            };
+            assert!(host.worker("p").run(job).is_none());
+            let got = closed.recv_timeout(Duration::from_millis(500)).ok();
+            assert_eq!(
+                got.as_deref(),
+                delivered.then_some("s1"),
+                "close={close} close_listed={close_listed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_listing_says_whether_closing_a_tab_ends_its_session() {
+        for close_listed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("fake.sock");
+            let _seen = spawn_fake(
+                &socket,
+                Capabilities {
+                    projects: true,
+                    close_listed,
+                    ..Default::default()
+                },
+            );
+            let mut host = host(dir.path(), config(None, Some(&socket)));
+            match host.worker("p").run(Job::ListProjects) {
+                Some(PluginEvent::Projects { result, .. }) => {
+                    assert_eq!(result.unwrap().unwrap().can_close, close_listed);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
     }
 
     #[test]

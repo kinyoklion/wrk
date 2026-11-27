@@ -2216,13 +2216,43 @@ impl App {
         let Some(project_name) = self.active_project_name.clone() else {
             return;
         };
-        let remote = self.project(&project_name).is_some_and(Project::is_remote);
+        let listed_by = self
+            .project(&project_name)
+            .and_then(|p| p.remote.as_ref())
+            .map(|meta| meta.plugin.clone());
+        let ends_session = listed_by
+            .as_deref()
+            .and_then(|plugin| self.remote.group(plugin))
+            .is_some_and(|g| g.can_close);
         let Some(session) = self.sessions.get_mut(&project_name) else {
             return;
         };
         // A listed project's tab mirrors a session that lives on with its
-        // plugin: closing it only detaches the pane. The tab stays listed.
-        if remote && let Some(Tab::Claude(tab)) = session.current_mut() {
+        // plugin. With `close_listed`, closing the tab ends that session: the
+        // tab goes (even the last one; a listed project may have none), the
+        // plugin is told, and the session is held out of listings meanwhile.
+        if let Some(plugin) = &listed_by
+            && ends_session
+            && let Some(Tab::Claude(tab)) = session.current()
+        {
+            let name = tab.name.clone();
+            let closed_session_id = tab.session_id.clone();
+            session.tabs.remove(session.active_tab);
+            if session.active_tab >= session.tabs.len() {
+                session.active_tab = session.tabs.len().saturating_sub(1);
+            }
+            if let Some(id) = &closed_session_id {
+                self.remote.close_session(&project_name, id, Instant::now());
+            }
+            self.notify_plugin_close(&project_name, closed_session_id);
+            self.remote.refresh_soon(plugin);
+            self.info = Some(format!("closed '{name}'; its session is ending"));
+            return;
+        }
+        // Otherwise closing it only detaches the pane. The tab stays listed.
+        if listed_by.is_some()
+            && let Some(Tab::Claude(tab)) = session.current_mut()
+        {
             tab.pane = None;
             tab.plugin_attach = PluginAttach::Idle;
             tab.attach_when_shown = false;
@@ -5404,6 +5434,12 @@ mod tests {
 
     /// `boxes` lists box `dev-box` with sessions `ids`.
     fn listed(app: &mut App, ids: &[&str]) {
+        listed_with(app, ids, false);
+    }
+
+    /// [`listed`], by a plugin that ends a session when its tab closes
+    /// (`close_listed`) when `can_close`.
+    fn listed_with(app: &mut App, ids: &[&str], can_close: bool) {
         use wrk_plugin::proto::{PluginSession, ProjectsResponse, RemoteProject};
         let sessions = ids
             .iter()
@@ -5426,6 +5462,7 @@ mod tests {
             },
             can_create: true,
             can_remove: true,
+            can_close,
         };
         app.apply_listing("boxes", Ok(Some(listing)), Rect::new(0, 0, 120, 40));
     }
@@ -5528,6 +5565,7 @@ mod tests {
                 projects: Default::default(),
                 can_create: true,
                 can_remove: false,
+                can_close: false,
             })),
             Rect::new(0, 0, 120, 40),
         );
@@ -5545,6 +5583,46 @@ mod tests {
         let tab = app.sessions["boxes/i-1"].active_claude_tab().unwrap();
         assert!(tab.pane.is_none() && !tab.attach_when_shown);
         assert_eq!(tab.plugin_attach, PluginAttach::Idle);
+    }
+
+    #[test]
+    fn closing_a_listed_tab_ends_its_session_with_close_listed() {
+        let mut app = empty_app();
+        listed_with(&mut app, &["web/main", "web/fix", "api/main"], true);
+        app.open_project("boxes/i-1", Some(2), Rect::new(0, 0, 120, 40));
+        app.close_active_tab();
+        assert_eq!(tab_names(&app, "boxes/i-1"), ["web-main", "web-fix"]);
+        assert_eq!(app.sessions["boxes/i-1"].active_tab, 1, "still in range");
+        assert!(app.info.as_deref().unwrap().contains("'api-main'"));
+        // A listing that still has it (in flight as it closed) doesn't bring
+        // the tab back…
+        listed_with(&mut app, &["web/main", "web/fix", "api/main"], true);
+        assert_eq!(tab_names(&app, "boxes/i-1"), ["web-main", "web-fix"]);
+        assert_eq!(
+            app.project("boxes/i-1").unwrap().claude_sessions.len(),
+            2,
+            "nor its sidebar row"
+        );
+        // …and the last tab can go too: a listed project may have none.
+        app.close_active_tab();
+        app.close_active_tab();
+        assert!(app.sessions["boxes/i-1"].tabs.is_empty());
+        assert_eq!(app.sessions["boxes/i-1"].active_tab, 0);
+        app.close_active_tab(); // nothing left: a no-op
+        app.refresh_sidebar();
+    }
+
+    #[test]
+    fn closing_a_listed_markdown_tab_just_closes_it() {
+        let mut app = empty_app();
+        listed_with(&mut app, &["web/main"], true);
+        app.open_project("boxes/i-1", Some(0), Rect::new(0, 0, 120, 40));
+        let session = app.sessions.get_mut("boxes/i-1").unwrap();
+        session.tabs.push(md_tab("notes"));
+        session.active_tab = 1;
+        app.close_active_tab();
+        assert_eq!(tab_names(&app, "boxes/i-1"), ["web-main"]);
+        assert_eq!(app.project("boxes/i-1").unwrap().claude_sessions.len(), 1);
     }
 
     /// Send `request` as if over the socket; the other end of its connection.

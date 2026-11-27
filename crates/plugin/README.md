@@ -116,6 +116,7 @@ capabilities you advertise in `hello`.
 | `projects` | sends `list_projects` and shows your projects as a sidebar group of their own | only projects in `projects.toml` name your plugin |
 | `create` | offers a creation form in your group (`create_form`, then `create`) | your group offers no way to create |
 | `remove` | lets `d` remove one of your listed projects or sessions, with a form you describe (`remove_form`, then `remove`) | `d` on them says to remove them in your plugin |
+| `close_listed` | closing one of your listed tabs (`Alt+w`) sends `close` and drops the tab: you end the session | closing a listed tab only detaches its pane, and the tab stays |
 
 wrk asks **once per daemon**: it caches the answer until the socket stops
 answering (a restarted daemon is asked again). **A `hello` reply wrk can't parse
@@ -197,7 +198,7 @@ informational. Picking an entry sends `attach` with that `id` as `session_id`.
 If the request fails, the picker shows your error and still offers "New
 session".
 
-### `close` — a tab was closed (`close` capability)
+### `close` — a tab was closed (`close` or `close_listed` capability)
 
 ```json
 {"method":"close","project":{"name":"svc","path":"/home/me/svc"},"session_id":"s-41"}
@@ -211,6 +212,13 @@ so a session you created for a tab that no longer exists can be cleaned up.
 Whether closing a tab should end the session is your decision. wrk's own
 behaviour for local tabs is to stop the process but keep the session
 resumable.
+
+For a tab of a project you list yourself (`projects`, below), `close` is sent
+only with `close_listed`, and there it does mean "end this session": wrk drops
+the tab at once and expects later listings to leave the session out. A
+listing that still has it within a minute (one already in flight as the tab
+closed, say) doesn't bring the tab back; after that, a session you still list
+is shown again. `close_listed` is enough on its own; it doesn't need `close`.
 
 ### `list_projects` — projects you list yourself (`projects` capability)
 
@@ -243,7 +251,8 @@ running). Only the tab on screen is attached, the first time it is shown, so a
 project with many sessions costs one pane until the person looks at more. The
 `attach` for a listed session sends its `id` as `session_id` and its project's
 `path` is the home directory (panes run locally). Closing such a tab
-(`Alt+w`) only detaches it, so wrk sends no `close`. A failed listing keeps
+(`Alt+w`) only detaches it, so wrk sends no `close`, unless you advertise
+`close_listed`: then it ends the session (see `close`). A failed listing keeps
 the last good one and shows `⚠ unavailable` on the group, with your error in
 the status bar.
 
@@ -331,6 +340,7 @@ no longer has it, and its tabs go with it.
 | opens an empty project for the first time | one agent `attach` with no `session_id` and `fresh: false` |
 | presses `Alt+n` (new tab) | `list_sessions` (with `list`), then the `attach` for the choice |
 | closes a tab (`Alt+w`) | `close` (with `close`) |
+| closes one of your listed tabs (`Alt+w`) | `close` (with `close_listed`, which ends the session); otherwise nothing, and the tab only detaches |
 | lets a pane's process exit | nothing. The tab shows "not running", and the next project open re-attaches it. |
 | restarts wrk | on project open, an `attach` per saved tab with its recorded `session_id`, a **new** `wrk_tab`, and a **new** `wrk_sock` |
 | starts wrk, waits 20 s, presses `r` (with `projects`) | `list_projects` |

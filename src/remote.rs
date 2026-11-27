@@ -27,6 +27,10 @@ use crate::store::{Project, RemoteMeta, SessionRef};
 pub const REFRESH_EVERY: Duration = Duration::from_secs(20);
 /// How long a just-created project or session is looked for in listings.
 const OPEN_WAIT: Duration = Duration::from_secs(10 * 60);
+/// How long a closed session is kept out of listings that still include it
+/// (one may have been in flight as it closed, or the plugin may take a moment
+/// to end it). It comes back as a tab after this if the plugin still lists it.
+const CLOSED_HOLD: Duration = Duration::from_secs(60);
 
 /// The unique project key (`Project.name`) of plugin `plugin`'s project `id`.
 pub fn key(plugin: &str, id: &str) -> String {
@@ -46,6 +50,8 @@ pub struct RemoteGroup {
     pub can_create: bool,
     /// The plugin advertises `remove`.
     pub can_remove: bool,
+    /// The plugin advertises `close_listed`: closing a tab ends its session.
+    pub can_close: bool,
     /// A listing has arrived at least once.
     pub listed: bool,
 }
@@ -68,6 +74,10 @@ pub struct Remote {
     /// Plugins that answered that they list no projects.
     not_listing: HashSet<String>,
     pub pending_open: Option<PendingOpen>,
+    /// Sessions closed from wrk, by (plugin, project key, session id), and
+    /// when: left out of listings until one no longer has them (or until
+    /// [`CLOSED_HOLD`]).
+    closed: HashMap<(String, String, String), Instant>,
 }
 
 impl Remote {
@@ -101,6 +111,20 @@ impl Remote {
         self.last_asked.clear();
     }
 
+    /// Session `session_id` of listed project `key` was closed from wrk: keep
+    /// it out of listings (and so out of the tabs) while the plugin ends it.
+    pub fn close_session(&mut self, key: &str, session_id: &str, now: Instant) {
+        let Some(project) = self.find_mut(key) else {
+            return;
+        };
+        let Some(plugin) = project.remote.as_ref().map(|m| m.plugin.clone()) else {
+            return;
+        };
+        drop_closed_session(project, session_id);
+        self.closed
+            .insert((plugin, key.to_string(), session_id.to_string()), now);
+    }
+
     /// Fold in a listing (or its failure). Returns the keys of projects that
     /// were listed before and aren't any more.
     pub fn apply(
@@ -108,6 +132,17 @@ impl Remote {
         plugin: &str,
         result: Result<Option<Listing>, String>,
         home: &Path,
+    ) -> Vec<String> {
+        self.apply_at(plugin, result, home, Instant::now())
+    }
+
+    /// [`apply`](Self::apply) as of `now` (for closed sessions' hold).
+    fn apply_at(
+        &mut self,
+        plugin: &str,
+        result: Result<Option<Listing>, String>,
+        home: &Path,
+        now: Instant,
     ) -> Vec<String> {
         self.in_flight.remove(plugin);
         let position = self.groups.iter().position(|g| g.plugin == plugin);
@@ -136,6 +171,7 @@ impl Remote {
                             error: None,
                             can_create: false,
                             can_remove: false,
+                            can_close: false,
                             listed: false,
                         });
                         self.groups.last_mut().expect("just pushed")
@@ -148,7 +184,7 @@ impl Remote {
                 let old: Vec<Project> = position
                     .map(|i| std::mem::take(&mut self.groups[i].projects))
                     .unwrap_or_default();
-                let projects: Vec<Project> = listing
+                let mut projects: Vec<Project> = listing
                     .projects
                     .projects
                     .iter()
@@ -157,6 +193,25 @@ impl Remote {
                         synthesize(plugin, rp, home, old.iter().find(|p| p.name == key))
                     })
                     .collect();
+                // A closed session stays closed until a listing drops it (then
+                // forget it), or until the hold runs out (the plugin kept it).
+                self.closed.retain(|(of, project_key, session_id), at| {
+                    if of != plugin {
+                        return true;
+                    }
+                    let Some(project) = projects.iter_mut().find(|p| &p.name == project_key) else {
+                        return false;
+                    };
+                    let listed = project
+                        .claude_sessions
+                        .iter()
+                        .any(|s| s.session_id.as_deref() == Some(session_id.as_str()));
+                    if !listed || now.duration_since(*at) >= CLOSED_HOLD {
+                        return false;
+                    }
+                    drop_closed_session(project, session_id);
+                    true
+                });
                 let vanished = old
                     .iter()
                     .filter(|o| !projects.iter().any(|p| p.name == o.name))
@@ -173,6 +228,7 @@ impl Remote {
                     error: None,
                     can_create: listing.can_create,
                     can_remove: listing.can_remove,
+                    can_close: listing.can_close,
                     listed: true,
                 };
                 match position {
@@ -287,6 +343,16 @@ pub fn synthesize(
     }
 }
 
+/// Take session `session_id` out of a listed project's tabs (and listing).
+fn drop_closed_session(project: &mut Project, session_id: &str) {
+    project
+        .claude_sessions
+        .retain(|s| s.session_id.as_deref() != Some(session_id));
+    if let Some(meta) = project.remote.as_mut() {
+        meta.sessions.retain(|s| s.id != session_id);
+    }
+}
+
 /// The listing's status for `project`'s session `session_id`.
 pub fn listed_status(project: &Project, session_id: Option<&str>) -> Option<AgentStatus> {
     let id = session_id?;
@@ -329,6 +395,7 @@ mod tests {
             },
             can_create: true,
             can_remove: true,
+            can_close: true,
         }))
     }
 
@@ -461,5 +528,88 @@ mod tests {
         remote.open_when_listed("boxes/nope".into(), None, now);
         assert_eq!(remote.take_ready_open(now + OPEN_WAIT), None);
         assert!(remote.pending_open.is_none(), "gave up");
+    }
+
+    #[test]
+    fn a_closed_session_stays_out_of_listings_until_the_plugin_ends_it() {
+        let mut remote = Remote::default();
+        let home = Path::new("/h");
+        let t0 = Instant::now();
+        let both = || {
+            listing(vec![sdk_research(vec![
+                session("p1/main", "a", None),
+                session("p1/fix", "b", None),
+            ])])
+        };
+        let tabs = |remote: &Remote| -> Vec<String> {
+            let p = remote.find("boxes/i-1").unwrap();
+            assert_eq!(
+                p.claude_sessions.len(),
+                p.remote.as_ref().unwrap().sessions.len(),
+                "the tabs and the listing's sessions agree"
+            );
+            p.claude_sessions
+                .iter()
+                .filter_map(|s| s.session_id.clone())
+                .collect()
+        };
+        remote.apply_at("boxes", both(), home, t0);
+        assert!(remote.group("boxes").unwrap().can_close);
+
+        remote.close_session("boxes/i-1", "p1/fix", t0);
+        assert_eq!(tabs(&remote), ["p1/main"], "gone at once");
+        // A listing that was in flight as it closed still has it: held out.
+        remote.apply_at("boxes", both(), home, t0 + Duration::from_secs(1));
+        assert_eq!(tabs(&remote), ["p1/main"]);
+        // The plugin ended it: the hold is forgotten…
+        remote.apply_at(
+            "boxes",
+            listing(vec![sdk_research(vec![session("p1/main", "a", None)])]),
+            home,
+            t0 + Duration::from_secs(2),
+        );
+        assert!(remote.closed.is_empty());
+        // …so a session listed under that id later is a new tab.
+        remote.apply_at("boxes", both(), home, t0 + Duration::from_secs(3));
+        assert_eq!(tabs(&remote), ["p1/main", "p1/fix"]);
+    }
+
+    #[test]
+    fn a_closed_session_the_plugin_keeps_comes_back_after_the_hold() {
+        let mut remote = Remote::default();
+        let home = Path::new("/h");
+        let t0 = Instant::now();
+        let one = || listing(vec![sdk_research(vec![session("p1/main", "a", None)])]);
+        remote.apply_at("boxes", one(), home, t0);
+        remote.close_session("boxes/i-1", "p1/main", t0);
+        remote.apply_at("boxes", one(), home, t0 + CLOSED_HOLD / 2);
+        assert!(remote.find("boxes/i-1").unwrap().claude_sessions.is_empty());
+        remote.apply_at("boxes", one(), home, t0 + CLOSED_HOLD);
+        assert_eq!(remote.find("boxes/i-1").unwrap().claude_sessions.len(), 1);
+        assert!(remote.closed.is_empty());
+    }
+
+    #[test]
+    fn closed_sessions_of_other_plugins_and_vanished_projects() {
+        let mut remote = Remote::default();
+        let home = Path::new("/h");
+        let t0 = Instant::now();
+        let one = || listing(vec![sdk_research(vec![session("p1/main", "a", None)])]);
+        remote.close_session("boxes/nope", "s", t0);
+        assert!(remote.closed.is_empty(), "nothing listed to close");
+        remote.apply_at("other", one(), home, t0);
+        remote.apply_at("boxes", one(), home, t0);
+        remote.close_session("other/i-1", "p1/main", t0);
+        remote.close_session("boxes/i-1", "p1/main", t0);
+        remote.apply_at("boxes", listing(vec![]), home, t0);
+        assert_eq!(
+            remote
+                .closed
+                .keys()
+                .map(|(plugin, key, _)| (plugin.as_str(), key.as_str()))
+                .collect::<Vec<_>>(),
+            [("other", "other/i-1")],
+            "a project that's gone takes its holds with it; another plugin's stay"
+        );
     }
 }
