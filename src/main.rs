@@ -362,12 +362,14 @@ fn cmd_review(action: ReviewAction) -> Result<()> {
     let sock = std::env::var("WRK_SOCK").ok().filter(|s| !s.is_empty());
     match action {
         ReviewAction::Start { target } => {
+            let target = target.unwrap_or_default();
+            let target = target.trim();
+            // Refuse a bad target (e.g. one starting with `-`, which would
+            // reach git as an option) before touching the running wrk (#95).
+            let parsed = review::diff::DiffTarget::parse(target)?;
             let sock = sock.ok_or_else(|| {
                 anyhow!("`wrk review` must be run inside a wrk-managed pane (no WRK_SOCK)")
             })?;
-            let target = target.unwrap_or_default();
-            let target = target.trim();
-            let parsed = review::diff::DiffTarget::parse(target);
             // Send the directory `wrk review start` ran in so the TUI diffs the
             // git repo enclosing it — the project dir may be a non-git container
             // of clones/worktrees, so its own cwd can't be assumed (#94).
@@ -2073,6 +2075,17 @@ impl App {
     fn handle_review_request(&mut self, req: ipc::ReviewRequest) {
         match req.kind {
             ipc::ReviewKind::Start { target } => {
+                // Validate before any git runs: a revision starting with `-`
+                // would reach git as an option (#95). The CLI checks too, but
+                // anything can write to the socket.
+                let target = match review::diff::DiffTarget::parse(target.as_deref().unwrap_or(""))
+                {
+                    Ok(target) => target,
+                    Err(e) => {
+                        push_error(&mut self.error, format!("wrk review: {e}"));
+                        return;
+                    }
+                };
                 let project = req.project.or_else(|| self.active_project_name.clone());
                 let Some(project) = project else {
                     push_error(&mut self.error, "wrk review: no active project".into());
@@ -2106,7 +2119,6 @@ impl App {
                         return;
                     }
                 };
-                let target = review::diff::DiffTarget::parse(target.as_deref().unwrap_or(""));
                 match review::diff::build_review(&repo_root, &target) {
                     Ok(files) => {
                         let session = review::ReviewSession::new(project, req.tab, target, files);
@@ -5265,6 +5277,46 @@ mod tests {
         assert!(md.starts_with("## Review comments (1)"));
         assert!(md.contains("- `src/main.rs:42` (after): this can panic"));
         assert!(md.contains("> x.unwrap()"));
+    }
+
+    /// #95: a target git would read as an option never reaches git, even when
+    /// it arrives straight over the socket (the CLI's own check is bypassed).
+    #[test]
+    fn a_review_target_that_looks_like_an_option_is_refused() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return; // no git here; nothing would run anyway
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let ok = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git init");
+        let mut app = empty_app();
+        app.store.projects.push(Project {
+            path: repo.to_path_buf(),
+            ..bare_project("p", &[])
+        });
+        let written = repo.join("written-by-git");
+        app.handle_review_request(ipc::ReviewRequest {
+            tab: None,
+            project: Some("p".into()),
+            cwd: Some(repo.to_string_lossy().into_owned()),
+            kind: ipc::ReviewKind::Start {
+                target: Some(format!("--output={}", written.display())),
+            },
+        });
+        assert!(app.review.is_none(), "no review opened");
+        assert!(!written.exists(), "git never ran with the option");
+        let err = app.error.as_deref().unwrap_or_default();
+        assert!(err.contains("can't start with '-'"), "{err}");
     }
 
     #[test]
