@@ -229,6 +229,46 @@ impl PtyPane {
         self.pty.child.try_wait().ok().flatten()
     }
 
+    /// Whether everything the program wrote has reached the grid: the reader
+    /// hit end of file, or — a lingering descendant can hold the PTY open —
+    /// nothing has arrived for a moment. Check this after the child exits and
+    /// before reading what it printed last, which the reader may not have
+    /// parsed yet when the exit is first seen.
+    pub fn output_settled(&self) -> bool {
+        const QUIET: Duration = Duration::from_millis(250);
+        self.reader_thread.as_ref().is_none_or(|h| h.is_finished()) || self.idle_for() > QUIET
+    }
+
+    /// The live screen's text (not the scrolled viewport), one line per row
+    /// with trailing blanks trimmed. A row the terminal soft-wrapped is joined
+    /// to the next, so a message longer than the pane is wide reads whole.
+    pub fn screen_text(&self) -> String {
+        let Ok(term) = self.term.lock() else {
+            return String::new();
+        };
+        let grid = term.grid();
+        let cols = term.columns();
+        let mut out = String::new();
+        for row in 0..term.screen_lines() {
+            let line = Line(row as i32);
+            let mut text: String = (0..cols)
+                .map(|c| grid[Point::new(line, Column(c))].c)
+                .collect();
+            let wrapped = cols > 0
+                && grid[Point::new(line, Column(cols - 1))]
+                    .flags
+                    .contains(Flags::WRAPLINE);
+            if wrapped {
+                out.push_str(&text);
+            } else {
+                text.truncate(text.trim_end().len());
+                out.push_str(&text);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
     /// True when the embedded program has switched the terminal into
     /// "application cursor key" mode (DECCKM). When set, arrow keys and
     /// Home/End must be sent as `ESC O X` instead of `ESC [ X`.
@@ -757,6 +797,25 @@ mod tests {
             ]
         );
         assert!(pane.take_copied().is_empty(), "each copy is taken once");
+    }
+
+    /// A line longer than the pane wraps across rows on screen but reads back
+    /// whole, while separate lines stay separate.
+    #[test]
+    fn screen_text_rejoins_a_wrapped_line() {
+        let script = "printf 'first\\nabcdefghij0123456789wrapped\\n'; exec cat";
+        let cmd = ["sh", "-c", script].map(String::from);
+        let pane = PtyPane::spawn(&cmd, Path::new("/"), 6, 10, &[]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut text = pane.screen_text();
+        while !text.contains("wrapped") && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+            text = pane.screen_text();
+        }
+        assert!(
+            text.starts_with("first\nabcdefghij0123456789wrapped\n"),
+            "{text:?}"
+        );
     }
 
     #[test]

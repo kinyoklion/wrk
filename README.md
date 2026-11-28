@@ -35,7 +35,12 @@ project. Linux-only, native rendering (via your terminal), built on
   written straight back to `projects.toml`. wrk does **not** use `claude
   --continue`, nor does it guess the ID from the filesystem after the fact —
   both would non-deterministically attach to whatever session was newest in the
-  directory, which is wrong when multiple projects share a path.
+  directory, which is wrong when multiple projects share a path. If Claude no
+  longer has a tab's session (it deletes transcripts unused for longer than
+  its `cleanupPeriodDays` setting, 30 days by default), the tab starts a new
+  session in its place and the status bar says so. A tab whose agent exits for
+  any other reason keeps its last screen up, with the exit status on its
+  border, until you reopen the project.
 - **Multiple projects per directory**: project names are unique; paths need
   not be, so you can have `wrk-feature` and `wrk-bugfix` both pointing at the
   same directory with separate Claude sessions each. Each project resumes its

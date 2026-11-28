@@ -694,6 +694,7 @@ pub(crate) mod tests {
             status_id: status_id.into(),
             status: crate::status::TabStatus::default(),
             pane: Some(cat_pane(dir)),
+            exited: None,
             plugin_attach: PluginAttach::Idle,
             attach_when_shown: false,
         })

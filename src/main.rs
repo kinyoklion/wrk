@@ -610,6 +610,11 @@ pub struct ClaudeTab {
     /// event yet", at which point the UI falls back to the idle-time heuristic.
     pub status: status::TabStatus,
     pub pane: Option<PtyPane>,
+    /// Transient: the terminal of this tab's agent after its process exited
+    /// (an internal project's tab; see [`App::reap_agent_tabs`]), drawn in
+    /// place of the "not running" placeholder so whatever it printed last — an
+    /// error, a usage message — stays readable. Cleared when the tab respawns.
+    pub exited: Option<ExitedAgent>,
     /// Transient: where this tab's plugin attach stands, for a plugin-backed
     /// project (always `Idle` for an internal one). Drives the pane placeholder
     /// while the command is resolved off the UI thread, and stops a second
@@ -632,6 +637,38 @@ pub enum PluginAttach {
     Pending,
     /// The last attach failed; the reason is shown in the pane.
     Failed(String),
+}
+
+/// An agent tab's terminal after its process exited (see
+/// [`ClaudeTab::exited`]).
+pub struct ExitedAgent {
+    pub pane: PtyPane,
+    /// How it ended, for the line beneath it: "exited with status 1".
+    pub how: String,
+}
+
+/// Claude's answer to `--resume <id>` when it has no conversation with that
+/// id — typically because it deleted the transcript (Claude removes ones
+/// unused past its `cleanupPeriodDays`).
+const NO_SUCH_SESSION: &str = "No conversation found with session ID:";
+
+/// Whether `screen` — what a Claude tab's terminal showed when its process
+/// exited — is Claude refusing to resume `session_id` because that
+/// conversation no longer exists. Matching the id as well keeps any other
+/// mention of the phrase from counting.
+fn claude_found_no_session(screen: &str, session_id: &str) -> bool {
+    screen.contains(&format!("{NO_SUCH_SESSION} {session_id}"))
+}
+
+/// "exited with status N" (or "was killed by …") for an exited agent.
+fn describe_exit(status: Option<portable_pty::ExitStatus>) -> String {
+    match status {
+        Some(s) => match s.signal() {
+            Some(signal) => format!("was killed by {signal}"),
+            None => format!("exited with status {}", s.exit_code()),
+        },
+        None => "exited".to_string(),
+    }
 }
 
 static TAB_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1072,6 +1109,9 @@ impl App {
         self.layout_mode = project.layout_mode.unwrap_or_default();
         self.shell_passthrough = project.shell_passthrough.unwrap_or(false);
         self.error = None;
+        // A tab whose agent exited while the project was in the background:
+        // learn whether its session is gone before respawning it below.
+        self.reap_agent_tabs(&project.name);
 
         let layout = compute_layout(body, self);
         let claude_inner = layout.claude_inner();
@@ -1103,6 +1143,7 @@ impl App {
                     status_id: new_status_id(),
                     status: status::TabStatus::default(),
                     pane: None,
+                    exited: None,
                     plugin_attach: PluginAttach::Idle,
                     attach_when_shown: false,
                 }));
@@ -1118,6 +1159,7 @@ impl App {
                         status_id: new_status_id(),
                         status: status::TabStatus::default(),
                         pane: None,
+                        exited: None,
                         plugin_attach: PluginAttach::Idle,
                         attach_when_shown: project.is_remote(),
                     }));
@@ -1139,21 +1181,16 @@ impl App {
             for tab in session.claude_tabs_mut() {
                 let dead = tab.pane.as_mut().is_some_and(|p| p.child_finished());
                 if tab.pane.is_none() || dead {
-                    let cmd = spawn_command_for_tab(&self.settings, tab, &mut assigned_new);
-                    tab.id_reported = false;
-                    let mut env = base_env.clone();
-                    env.push(("WRK_TAB".to_string(), tab.status_id.clone()));
-                    env.extend(self.settings.harness_pane_env(tab.harness));
-                    let spawned = PtyPane::spawn(
-                        &cmd,
+                    let spawned = spawn_agent_tab(
+                        &self.settings,
+                        tab,
                         &project.path,
-                        claude_content.height,
-                        claude_content.width,
-                        &env,
+                        &base_env,
+                        claude_content,
+                        &mut assigned_new,
                     );
-                    match spawned {
-                        Ok(p) => tab.pane = Some(p),
-                        Err(e) => push_error(&mut self.error, format!("claude spawn failed: {e}")),
+                    if let Err(e) = spawned {
+                        push_error(&mut self.error, format!("claude spawn failed: {e}"));
                     }
                 }
             }
@@ -1206,6 +1243,108 @@ impl App {
             self.request_plugin_panes(&project, plugin);
         }
         self.focus = Focus::Claude;
+    }
+
+    /// Collect the agent tabs of `project_name` whose process has exited (once
+    /// its last output is in). In an internal project each keeps its terminal
+    /// on screen ([`ClaudeTab::exited`]) — unless it is Claude saying the tab's
+    /// session no longer exists: then the tab forgets that id, so its next spawn
+    /// starts a new session, and its status id is returned for the caller to
+    /// respawn it. A plugin tab's pane is just dropped; its placeholder tells
+    /// where its attach stands.
+    fn reap_agent_tabs(&mut self, project_name: &str) -> Vec<String> {
+        let internal = self.project(project_name).is_some_and(Project::is_internal);
+        let Some(session) = self.sessions.get_mut(project_name) else {
+            return Vec::new();
+        };
+        let mut lost = Vec::new();
+        let mut notes = Vec::new();
+        for tab in session.claude_tabs_mut() {
+            let Some(mut pane) = tab
+                .pane
+                .take_if(|p| p.child_finished() && p.output_settled())
+            else {
+                continue;
+            };
+            if !internal {
+                continue;
+            }
+            let gone = tab.harness == HarnessKind::Claude
+                && tab
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|id| claude_found_no_session(&pane.screen_text(), id));
+            if gone {
+                let id = tab.session_id.take().unwrap_or_default();
+                let short: String = id.chars().take(8).collect();
+                notes.push(format!(
+                    "'{}': Claude no longer has its session {short}… — starting a new one",
+                    tab.name
+                ));
+                lost.push(tab.status_id.clone());
+            } else {
+                let how = describe_exit(pane.exit_status());
+                tab.exited = Some(ExitedAgent { pane, how });
+            }
+        }
+        if !notes.is_empty() {
+            self.info = Some(notes.join("; "));
+        }
+        lost
+    }
+
+    /// Spawn the agents of the active project's tabs listed in `status_ids` —
+    /// the ones [`App::reap_agent_tabs`] found had lost their session, which
+    /// now start new ones — and persist the ids they were given.
+    fn restart_agent_tabs(&mut self, status_ids: &[String], body: Rect) {
+        let Some(project) = self.active_project().cloned() else {
+            return;
+        };
+        let base_env = self.base_pty_env(&project.name);
+        let area = self
+            .active_primary_split(compute_layout(body, self).claude_inner())
+            .1;
+        let Some(session) = self.sessions.get_mut(&project.name) else {
+            return;
+        };
+        let mut assigned_new = false;
+        for tab in session.claude_tabs_mut() {
+            if tab.pane.is_some() || !status_ids.contains(&tab.status_id) {
+                continue;
+            }
+            let spawned = spawn_agent_tab(
+                &self.settings,
+                tab,
+                &project.path,
+                &base_env,
+                area,
+                &mut assigned_new,
+            );
+            if let Err(e) = spawned {
+                push_error(&mut self.error, format!("claude spawn failed: {e}"));
+            }
+        }
+        if assigned_new {
+            self.persist_claude_sessions(&project.name);
+        }
+    }
+
+    /// Each tick: reap the active project's exited agents and shell, so what
+    /// they left (or the placeholder) shows, and restart any agent whose
+    /// session Claude no longer has.
+    fn reap_active_session(&mut self, body: Rect) {
+        let Some(name) = self.active_project_name.clone() else {
+            return;
+        };
+        let lost = self.reap_agent_tabs(&name);
+        if !lost.is_empty() {
+            self.restart_agent_tabs(&lost, body);
+        }
+        if let Some(session) = self.sessions.get_mut(&name)
+            && session.shell.as_mut().is_some_and(|p| p.child_finished())
+        {
+            session.shell = None;
+        }
     }
 
     /// Opening a listed project attaches only the tab on screen (re-attaching
@@ -1631,6 +1770,7 @@ impl App {
             status_id,
             status: status::TabStatus::default(),
             pane,
+            exited: None,
             plugin_attach: PluginAttach::Idle,
             attach_when_shown: false,
         }));
@@ -1668,6 +1808,7 @@ impl App {
             status_id,
             status: status::TabStatus::default(),
             pane: None,
+            exited: None,
             plugin_attach: PluginAttach::Pending,
             attach_when_shown: false,
         }));
@@ -2491,6 +2632,7 @@ fn reconcile_remote_tabs(session: &mut ProjectSession, listed: &[SessionRef]) {
                 status_id: new_status_id(),
                 status: status::TabStatus::default(),
                 pane: None,
+                exited: None,
                 plugin_attach: PluginAttach::Idle,
                 attach_when_shown: true,
             },
@@ -2633,6 +2775,27 @@ fn spawn_command_for_tab(
     };
     tab.fresh = false;
     cmd
+}
+
+/// Spawn `tab`'s agent in `dir`, sized to `area`: resume its session, or start
+/// one (`*assigned_new` is set when a Claude id was minted, for the caller to
+/// persist). On success the pane replaces any exited terminal the tab showed.
+fn spawn_agent_tab(
+    settings: &Settings,
+    tab: &mut ClaudeTab,
+    dir: &Path,
+    base_env: &[(String, String)],
+    area: Rect,
+    assigned_new: &mut bool,
+) -> Result<()> {
+    let cmd = spawn_command_for_tab(settings, tab, assigned_new);
+    tab.id_reported = false;
+    let mut env = base_env.to_vec();
+    env.push(("WRK_TAB".to_string(), tab.status_id.clone()));
+    env.extend(settings.harness_pane_env(tab.harness));
+    tab.pane = Some(PtyPane::spawn(&cmd, dir, area.height, area.width, &env)?);
+    tab.exited = None;
+    Ok(())
 }
 
 /// Read a markdown file at an absolute `path` into a [`Tab`]. Rendering is
@@ -2919,19 +3082,7 @@ fn event_loop(
         // Before reaping, so a program that copies and exits still lands.
         forward_copied(app);
 
-        // Reap dead children on the active session so the placeholder shows.
-        if let Some(session) = app.active_session_mut() {
-            for tab in session.claude_tabs_mut() {
-                if tab.pane.as_mut().is_some_and(|p| p.child_finished()) {
-                    tab.pane = None;
-                }
-            }
-            if let Some(p) = session.shell.as_mut()
-                && p.child_finished()
-            {
-                session.shell = None;
-            }
-        }
+        app.reap_active_session(body);
     }
     Ok(())
 }
@@ -4742,9 +4893,10 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, ClaudeTab, Focus, HarnessKind, MarkdownTab, ModalState, PluginAttach, PluginFormModal,
-        Project, ProjectSession, ProjectStore, Settings, Tab, continue_agent_command, expand_tilde,
-        handle_modal_key, handle_projects_key, new_agent_command, new_session_id, normalize_paste,
+        App, ClaudeTab, Focus, HarnessKind, LayoutMode, MarkdownTab, ModalState, PluginAttach,
+        PluginFormModal, Project, ProjectSession, ProjectStore, Settings, Tab,
+        claude_found_no_session, continue_agent_command, expand_tilde, handle_modal_key,
+        handle_projects_key, new_agent_command, new_session_id, normalize_paste,
         resume_agent_command,
     };
     use crate::settings::HarnessConfig;
@@ -5044,6 +5196,7 @@ mod tests {
             status_id: String::new(),
             status: crate::status::TabStatus::default(),
             pane: None,
+            exited: None,
             plugin_attach: PluginAttach::Idle,
             attach_when_shown: false,
         };
@@ -5062,6 +5215,7 @@ mod tests {
             status_id: String::new(),
             status: crate::status::TabStatus::default(),
             pane: None,
+            exited: None,
             plugin_attach: PluginAttach::Idle,
             attach_when_shown: false,
         };
@@ -5086,6 +5240,7 @@ mod tests {
             status_id: String::new(),
             status: crate::status::TabStatus::default(),
             pane: None,
+            exited: None,
             plugin_attach: PluginAttach::Idle,
             attach_when_shown: false,
         };
@@ -5115,6 +5270,7 @@ mod tests {
             status_id: String::new(),
             status: crate::status::TabStatus::default(),
             pane: None,
+            exited: None,
             plugin_attach: PluginAttach::Idle,
             attach_when_shown: false,
         })
@@ -6158,5 +6314,142 @@ mod tests {
         crate::handle_mouse(&mut app, click(1, 20), area);
         assert!(app.widgets.shown.is_none());
         assert_eq!(app.widgets.instances.len(), 1, "still running");
+    }
+
+    /// An app over one internal, tabbed project `p` in `dir` whose single
+    /// Claude tab `main` is bound to `session_id`. `script` stands in for
+    /// Claude (`sh -c script claude <flags…>`, so `$1` is `--resume` or
+    /// `--session-id` and `$2` the id) and `cat` for the shell. Nothing has
+    /// spawned yet; `store::save` is a no-op under test.
+    fn agent_app(dir: &std::path::Path, script: &str, session_id: &str) -> App {
+        let settings = Settings {
+            claude_command: ["sh", "-c", script, "claude"].map(String::from).to_vec(),
+            shell_command: Some(["sh", "-c", "exec cat"].map(String::from).to_vec()),
+            ..Default::default()
+        };
+        let project = Project {
+            path: dir.to_path_buf(),
+            layout_mode: Some(LayoutMode::Tabbed),
+            claude_sessions: vec![crate::store::SessionRef {
+                name: "main".into(),
+                session_id: Some(session_id.into()),
+                harness: HarnessKind::Claude,
+            }],
+            ..bare_project("p", &[])
+        };
+        App::new(
+            ProjectStore {
+                projects: vec![project],
+            },
+            settings,
+        )
+    }
+
+    /// Run the event loop's reaper until `done`, for up to a few seconds.
+    fn reap_until(app: &mut App, done: impl Fn(&App) -> bool) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !done(app) && Instant::now() < deadline {
+            app.reap_active_session(crate::api::tests::BODY);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn shown_tab(app: &App) -> &ClaudeTab {
+        app.active_session().unwrap().active_claude_tab().unwrap()
+    }
+
+    #[test]
+    fn only_claude_refusing_the_tabs_own_session_counts_as_lost() {
+        let screen = "\nNo conversation found with session ID: aa1ff1a7-b9f7\n";
+        assert!(claude_found_no_session(screen, "aa1ff1a7-b9f7"));
+        assert!(!claude_found_no_session(screen, "another-id"));
+        assert!(!claude_found_no_session(
+            "error: bad flag\n",
+            "aa1ff1a7-b9f7"
+        ));
+    }
+
+    /// A tab whose session Claude no longer has (it deleted the transcript)
+    /// starts a new session in place, rather than dying on every open.
+    #[test]
+    fn a_tab_whose_session_claude_lost_starts_a_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = r#"if [ "$1" = --resume ]; then
+            echo "No conversation found with session ID: $2"; exit 1
+        fi
+        echo "new session $2"; exec cat"#;
+        let mut app = agent_app(dir.path(), script, "gone-id");
+        app.open_project("p", None, crate::api::tests::BODY);
+        reap_until(&mut app, |a| {
+            shown_tab(a).session_id.as_deref() != Some("gone-id")
+        });
+
+        let tab = shown_tab(&app);
+        let new_id = tab.session_id.clone().expect("a new session id");
+        assert!(uuid::Uuid::parse_str(&new_id).is_ok(), "{new_id}");
+        assert!(tab.exited.is_none());
+        let pane = tab.pane.as_ref().expect("restarted");
+        let screen = crate::api::tests::wait_for(pane, |s| s.contains("new session"));
+        assert!(
+            screen.contains(&format!("new session {new_id}")),
+            "{screen}"
+        );
+        assert_eq!(
+            app.store.projects[0].claude_sessions[0]
+                .session_id
+                .as_deref(),
+            Some(new_id.as_str()),
+            "the new id is persisted"
+        );
+        let info = app.info.as_deref().unwrap_or_default();
+        assert!(
+            info.contains("'main': Claude no longer has its session gone-id"),
+            "{info}"
+        );
+    }
+
+    /// An agent that exits for any other reason leaves its last screen up,
+    /// with how it ended on the pane's border, until the project is reopened.
+    #[test]
+    fn an_exited_agent_keeps_its_last_screen_on_view() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = agent_app(dir.path(), "echo 'boom: bad flag'; exit 3", "kept-id");
+        app.open_project("p", None, crate::api::tests::BODY);
+        reap_until(&mut app, |a| shown_tab(a).exited.is_some());
+
+        let tab = shown_tab(&app);
+        assert!(tab.pane.is_none());
+        assert_eq!(
+            tab.session_id.as_deref(),
+            Some("kept-id"),
+            "the session stands"
+        );
+        let how = tab.exited.as_ref().map(|e| e.how.as_str());
+        assert_eq!(how, Some("exited with status 3"));
+
+        let area = crate::Rect::new(0, 0, 120, 41);
+        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let text: String = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(text.contains("boom: bad flag"), "{text}");
+        assert!(
+            text.contains("claude exited with status 3 · reopen"),
+            "{text}"
+        );
+        assert!(!text.contains("is not running"), "{text}");
+
+        // Reopening respawns it, replacing what it left.
+        app.open_project("p", None, crate::api::tests::BODY);
+        let tab = shown_tab(&app);
+        assert!(tab.pane.is_some() && tab.exited.is_none());
     }
 }

@@ -317,7 +317,20 @@ fn draw_primary_pane(frame: &mut Frame, area: Rect, focused: bool, app: &mut App
     } else {
         theme.border_unfocused
     });
-    let block = bordered(theme).title(" claude ").border_style(border_style);
+    let mut block = bordered(theme).title(" claude ").border_style(border_style);
+    // An agent that exited leaves its last screen up (drawn below); the border
+    // says how it ended and how to bring it back. Left-aligned, so a narrow
+    // pane clips the hint rather than the exit status.
+    if let Some((tab, exited)) = shown_exited_agent(app) {
+        block = block.title_bottom(Line::styled(
+            format!(
+                " {} {} · reopen the project to restart it ",
+                tab.harness.id(),
+                exited.how
+            ),
+            Style::default().fg(theme.error),
+        ));
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -372,7 +385,8 @@ fn draw_primary_pane(frame: &mut Frame, area: Rect, focused: bool, app: &mut App
             }
         }
     } else {
-        match app.active_claude() {
+        let exited = shown_exited_agent(app).map(|(_, e)| &e.pane);
+        match app.active_claude().or(exited) {
             Some(p) => frame.render_widget(PtyPaneWidget(p), content_area),
             // An agent tab exists but its PTY isn't running (spawn failed, or the
             // process exited — e.g. a bad launch command). Say so, rather than the
@@ -508,6 +522,16 @@ fn tab_label(label: &str, active: bool, theme: &Theme) -> Paragraph<'static> {
     Paragraph::new(format!(" {label} "))
         .style(style)
         .alignment(ratatui::layout::Alignment::Center)
+}
+
+/// The shown agent tab and the terminal it left, when its process has exited
+/// and that terminal is kept ([`ClaudeTab::exited`]).
+fn shown_exited_agent(app: &App) -> Option<(&ClaudeTab, &crate::ExitedAgent)> {
+    let tab = app.active_session()?.active_claude_tab()?;
+    if tab.pane.is_some() {
+        return None;
+    }
+    Some((tab, tab.exited.as_ref()?))
 }
 
 /// What an agent tab without a running PTY shows: for a plugin tab, where its
