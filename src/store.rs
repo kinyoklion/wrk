@@ -193,6 +193,11 @@ pub fn load_from(path: &Path) -> Result<ProjectStore> {
 }
 
 pub fn save(store: &ProjectStore) -> Result<()> {
+    // Under test, an `App` that persists (a newly minted session id, a layout
+    // change) must never overwrite the real config; assert on `App.store`.
+    if cfg!(test) {
+        return Ok(());
+    }
     let path = config_path()?;
     save_to(store, &path)
 }
